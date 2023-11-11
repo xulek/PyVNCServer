@@ -1,56 +1,48 @@
-# VNC Server in Python (Incomplete Implementation)
+# Python VNC Server (Simplified Implementation)
 
-This is a Python VNC (Virtual Network Computing) server implementation. This server is a basic implementation that supports selected VNC features but may not work correctly in certain cases.
+This Python script provides a simplified implementation of a VNC (Virtual Network Computing) server. It is a minimal example that supports a subset of VNC features.
 
 ## Getting Started
 
-To run this VNC server, follow these steps:
+To run the server:
 
-1. Clone the repository:
-   ```
-   git clone <repository-url>
-   ```
+1. Ensure Python 3.x is installed on your system.
+2. Install the required Python package:
 
-2. Navigate to the project directory:
-   ```
-   cd <repository-directory>
-   ```
+`pip install -r requirements.txt`
 
-3. Install the required dependencies:
-   ```
-   pip install Pillow
-   ```
+3. Run the server script:
 
-4. Start the VNC server:
-   ```
-   python vnc_server.py
-   ```
+`python vnc_server.py`
 
-The server will listen on `0.0.0.0:5900` by default. You can customize the host and port settings in the `main()` function of the `vnc_server.py` file.
+By default, the server listens on all interfaces at port 5900 (`0.0.0.0:5900`). You can modify the `main()` function in `vnc_server.py` to change these settings.
 
-## Supported Features
+## Features
 
-This VNC server implementation supports the following features:
+The server supports:
 
-- Handshake and protocol version negotiation.
-- VNC Authentication with a default password (you can customize it in the code).
-- SetPixelFormat message.
-- SetEncodings message with support for Raw and CopyRect encodings.
-- FrameBufferUpdate to send screen updates to the client.
-- CursorPseudoEncoding to send cursor updates.
-- DesktopSizePseudoEncoding to handle changes in desktop size.
-- KeyEvent, PointerEvent, and ClientCutText for keyboard and mouse input and clipboard synchronization.
+- Basic RFB protocol version negotiation.
+- VNC Authentication (with a static password for demonstration purposes).
+- Handling of `SetPixelFormat` and `SetEncodings` messages.
+- Sending `FramebufferUpdate` messages with Raw and CopyRect encodings.
+- Handling of `KeyEvent`, `PointerEvent`, and `ClientCutText` messages.
 
-## Issues with Screen Updates
+Note: The server's capabilities are rudimentary and may not perform optimally.
 
-It's worth noting that this VNC server implementation may have issues with correctly sending screen updates, which could result in client reconnections. This is a limitation of the implementation and may require further development and improvement.
+## Compatibility and Limitations
 
-## Extending the Server
+- The server has been tested with UltraVNC clients.
+- Connections are established, but visual artifacts may appear on the screen.
+- Mouse movement and click functionality are operational.
 
-You can extend this server to support additional VNC features or enhance its security. However, please keep in mind that this is a basic implementation and may not be suitable for production environments without additional security measures.
+Due to its limited functionality, the current implementation may not correctly handle all aspects of screen updates and input events, potentially leading to incomplete functionality or the need for client reconnections.
 
-## License
+## Extending and Securing the Server
 
-This VNC server is provided under the [MIT License](LICENSE). Feel free to modify and use it according to your needs.
+This server is intended for educational and testing purposes and is not secure for production use. You may extend it with additional features and implement proper authentication and encryption for real-world applications.
 
-Please be aware of the security implications of running a VNC server with a default password. In a production environment, it's essential to implement proper authentication and encryption mechanisms to secure remote desktop access.
+## Licensing
+
+This server is released under the MIT License, which is included in the repository. Modify and use it as needed, keeping in mind the security considerations mentioned above.
+
+**Always use secure practices when deploying servers like this in a production environment.**

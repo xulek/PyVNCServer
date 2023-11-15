@@ -46,13 +46,12 @@ last_screenshot = None  # Variable to store the previous screenshot
 
 def capture_screen_from_desktop():
     """
-    Capture a screenshot and convert it to RGB format.
-
-    :return: A tuple containing the screenshot, its data, and its MD5 hash.
+    Capture a screenshot and convert it to RGBA format.
     """
     screenshot = ImageGrab.grab()
-    screenshot_rgb = screenshot.convert('RGB')
-    return screenshot, screenshot_rgb.tobytes(), hashlib.md5(screenshot_rgb.tobytes()).digest()
+    screenshot_rgba = screenshot.convert('RGBA')
+    return screenshot, screenshot_rgba.tobytes(), hashlib.md5(screenshot_rgba.tobytes()).digest()
+
 
 def calculate_position_difference(old_position, new_position):
     """
@@ -388,9 +387,11 @@ def handle_client(client_socket, addr):
     last_screen_checksum = None  # Store the previous checksum here
     
     try:
+        # Get the screen dimensions
+        screen_width, screen_height = pyautogui.size()
         # Initialize framebuffer dimensions
-        framebuffer_width = 800
-        framebuffer_height = 600
+        framebuffer_width = screen_width
+        framebuffer_height = screen_height
         # Initialize full dimensions (to be captured from the screen)
         full_width, full_height = framebuffer_width, framebuffer_height
 
@@ -424,26 +425,27 @@ def handle_client(client_socket, addr):
 
         # 4. ServerInit
         pixel_format = struct.pack(
-            ">BBBBHHHBBB3x", 
-            32,  # bits-per-pixel
-            24,  # depth
+            ">BBBBHHHBBB3x",  # Format zgodny z RGBA i dodatkowy padding
+            32,  # bits-per-pixel (32 dla RGBA)
+            24,  # depth (24, ponieważ RGBA używa 24 bitów na kolor)
             0,   # big-endian-flag
             1,   # true-colour-flag
             255, # red-max
             255, # green-max
             255, # blue-max
-            16,  # red-shift
-            8,   # green-shift
-            0    # blue-shift
-        )
+            16,  # red-shift (przesunięcie dla czerwonego koloru)
+            8,   # green-shift (przesunięcie dla zielonego)
+            0    # blue-shift (przesunięcie dla niebieskiego)
+        )  # Dodatkowy padding '3x' na końcu
+
         name_length = len("Python VNC Server")
         server_init_msg = struct.pack(
             ">HH16sI", 
-            framebuffer_width,
-            framebuffer_height,
-            pixel_format,
-            name_length
-        ) + b"Python VNC Server"
+            framebuffer_width,  # Szerokość ramki
+            framebuffer_height, # Wysokość ramki
+            pixel_format,       # Zdefiniowany wyżej format piksela
+            name_length         # Długość nazwy serwera
+        ) + b"Python VNC Server"  # Nazwa serwera
 
         client_socket.sendall(server_init_msg)
 

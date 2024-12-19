@@ -27,7 +27,7 @@ The server supports:
 -   **RFB Protocol Version Negotiation:** Correct handling of the VNC protocol handshake.
 -   **VNC Authentication:** Client authentication (using a simple password for demonstration purposes).
 -   **Pixel Format Handling:** Correct configuration and transmission of the **BGRA** pixel format for accurate color display.
--   **Encoding Support:** Sending screen updates using `Raw` and `CopyRect` encodings, with an emphasis on performance and compatibility.
+-   **Encoding Support:** Sending screen updates using `Raw`.
 -   **Message Handling:** Proper handling of `SetPixelFormat`, `SetEncodings`, `FramebufferUpdate`, and events like `KeyEvent`, `PointerEvent`, and `ClientCutText`.
 -   **Pseudo-Encodings:** Support for pseudo-encodings `Cursor` (for sending cursor updates) and `DesktopSize` (for sending screen size information).
 -   **Frame Rate Control:** Limiting the frame transmission rate to a specific frequency (30 FPS by default) to avoid overloading resources.

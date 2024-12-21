@@ -1,64 +1,88 @@
 # Python VNC Server (Simplified Implementation)
 
-This Python script provides a simplified implementation of a VNC (Virtual Network Computing) server. It is a minimal example that supports a subset of VNC features.
+This Python script is a **simplified** VNC (Virtual Network Computing) server example. It implements only the essential parts of the VNC protocol and uses **Raw** encoding for sending screen updates. While it is functional for basic remote desktop access, it is **not** intended for secure production use.
 
 ## Getting Started
 
-To run the server:
+1. **Install Python 3.x**  
+   Make sure Python 3 is installed on your machine.
 
-1.  Ensure you have Python 3.x installed on your system.
-2.  Install the required Python packages:
+2. **Install Dependencies**  
+   From within the same directory as `requirements.txt`, run:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-    ```bash
-    pip install -r requirements.txt
-    ```
-3.  Run the server script:
+3. **Create or Edit `config.json`** (Optional)  
+   You can customize server settings in a JSON file named `config.json`. For example:
+   ```json
+   {
+     "host": "0.0.0.0",
+     "port": 5900,
+     "password": "",
+     "frame_rate": 10,
+     "log_level": "DEBUG",
+     "scale_factor": 0.5,
+     "chunk_size": 65536
+   }
+   ```
+   - **host / port**: Where the server listens for incoming VNC connections.  
+   - **password**: Simple password authentication (RFB 003.003).  
+   - **frame_rate**: Target frames per second (1–60).  
+   - **log_level**: Logging verbosity (e.g., INFO, DEBUG).  
+   - **scale_factor**: Resize the captured screen before sending. `1.0` means no scaling, `0.5` means 50% reduction, etc.  
+   - **chunk_size**: How many bytes to send in one chunk (for Raw encoding).  
 
-    ```bash
-    python vnc_server.py
-    ```
-
-By default, the server listens on all interfaces at port 5900 (`0.0.0.0:5900`). You can modify the `VNCServer` constructor in `vnc_server.py` to change these settings.
+4. **Run the Server**  
+   ```bash
+   python vnc_server.py
+   ```
+   The server will load settings from `config.json` (if present) or use defaults.
 
 ## Features
 
-The server supports:
+- **RFB Protocol Handshake**: Basic support for RFB 003.003 version negotiation.
+- **Optional Password**: A simple, “fake” VNC password mechanism for demonstration (no real encryption).
+- **Raw Encoding Only**: Screen updates use Raw encoding. (Other encodings like CopyRect or Hextile are **commented out** or not implemented.)
+- **Screen Capture & Optional Rescaling**: Captures the local screen via `PIL.ImageGrab`, optionally resizes it if `scale_factor` is set below 1.0.
+- **Chunk-based Sending**: Large screen data is split into user-configurable chunks (e.g., 64 KB) to reduce the number of send() calls.
+- **DesktopSize Pseudo-encoding**: Allows the client to request a change in screen dimensions (though in practice, it depends on the actual monitor size).
+- **Frame Rate Control**: Throttles updates to avoid saturating the network or CPU (default 10 FPS, adjustable via config).
+- **Mouse & Keyboard Events**: Basic pointer (mouse move/click) and key event handling (no special key mapping beyond that).
 
--   **RFB Protocol Version Negotiation:** Correct handling of the VNC protocol handshake.
--   **VNC Authentication:** Client authentication (using a simple password for demonstration purposes).
--   **Pixel Format Handling:** Correct configuration and transmission of the **BGRA** pixel format for accurate color display.
--   **Encoding Support:** Sending screen updates using `Raw`.
--   **Message Handling:** Proper handling of `SetPixelFormat`, `SetEncodings`, `FramebufferUpdate`, and events like `KeyEvent`, `PointerEvent`, and `ClientCutText`.
--   **Pseudo-Encodings:** Support for pseudo-encodings `Cursor` (for sending cursor updates) and `DesktopSize` (for sending screen size information).
--   **Frame Rate Control:** Limiting the frame transmission rate to a specific frequency (30 FPS by default) to avoid overloading resources.
--   **Logging:** Detailed logging of events, errors, and server messages for easier diagnostics.
--   **Mouse Event Handling:** Proper transmission and interpretation of mouse movements and clicks.
--   **Error Handling:** Protection against crashes and unexpected errors through `try...except` blocks.
+## Limitations
 
-## Compatibility and Limitations
+- **No CopyRect or Other Advanced Encodings**: Only Raw is currently active. Support for CopyRect is commented out in the code.
+- **No Real Encryption**: This is for demonstration; data travels unencrypted.
+- **Basic Delta Checking**: If the screen’s MD5 checksum is unchanged and `incremental=1`, the server sends zero rectangles (no update).
+- **No Production Hardening**: The code is not secured for public internet exposure.
+- **Limited Compatibility**: Most modern VNC clients can still connect via Raw encoding, but advanced features (like compression) are not present.
 
--   The server has been tested with various VNC clients (including TightVNC, RealVNC, UltraVNC).
--   Improved pixel format handling (BGRA) eliminates the issue of incorrect colors (red and blue swapped).
--   Improved `CopyRect` handling.
--   Greater stability, compatibility, and performance compared to previous implementations.
--   Smooth operation and higher image quality.
--   Support for dynamic screen updates.
--   Support for dynamic resizing of the VNC window.
--   Support for cursor movement and mouse clicks.
--   However, due to its simplified nature, some aspects (e.g., advanced encodings) may not be supported.
+## Configuration
 
-## Extending and Securing the Server
+All adjustable parameters are designed to be loaded from `config.json`. If you omit the file, default values are used. You can also edit them directly in the source code if desired. Examples of config parameters:
 
-This server is intended for educational and testing purposes and is not secure for production use. You can extend it with additional features and implement proper authentication and encryption for real-world applications:
+- **host** (default `0.0.0.0`)
+- **port** (default `5900`)
+- **password** (empty by default)
+- **frame_rate** (1–60)
+- **log_level** (`INFO` or `DEBUG` typically)
+- **scale_factor** (e.g., `1.0` for no scaling, `0.5` for half size)
+- **chunk_size** (default `65536`)
 
-*   **Encryption:** Add connection encryption (e.g., TLS) to protect transmitted data.
-*   **Password Verification:** Instead of a static password, use a more advanced verification method, such as from a configuration file or database.
-*   **Encoding Support:** Implement support for additional encodings for further performance optimization.
-*   **Change Detection:** Add logic to detect changes on the screen for more efficient image updates and reduced network load.
-*   **Configuration:** Allow configuration (port, password, options) from a configuration file or command-line arguments.
+## Extending and Securing
 
-## Licensing
+This example is **not secure** and only demonstrates a minimal approach. For real-world usage:
 
-This server is released under the MIT License, which is included in the repository. You can modify and use it as needed, keeping in mind the security considerations mentioned above.
+- **Encryption**: Add TLS or SSH tunneling to protect data in transit.
+- **Robust Password Auth**: Replace the simple password check with a real credential store or advanced method.
+- **More Encodings**: Implement or uncomment advanced encodings (e.g., CopyRect, Hextile, Tight) for better bandwidth efficiency.
+- **Delta-based Updates**: Incorporate partial updates or advanced difference detection for improved performance.
+- **Production Hardening**: Improve error handling, logging, and concurrency if used beyond local testing.
 
-**Always use secure practices when deploying servers like this in a production environment.**
+## License
+
+This code is released under the [MIT License](LICENSE). You are free to modify and distribute it, but **please note** it is **not** intended for secure production use without significant enhancements (encryption, authentication, robust error handling, etc.).
+
+---
+**Warning**: Operating any server carries security risks. Use secure practices and additional protections if this server is accessible on an untrusted network.

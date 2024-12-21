@@ -1,8 +1,9 @@
 {
-    "host": "0.0.0.0",
-    "port": 5900,
-    "password": "",
-    "frame_rate": 30,
-    "use_zlib": false,
-    "log_level": "DEBUG"
-  }
+  "host": "0.0.0.0",
+  "port": 5900,
+  "password": "",
+  "frame_rate": 30,
+  "log_level": "INFO",
+  "scale_factor": 0.5,
+  "chunk_size": 65536
+}

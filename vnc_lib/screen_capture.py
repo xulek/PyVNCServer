@@ -6,6 +6,7 @@ Enhanced with Python 3.13 features
 
 import hashlib
 import logging
+import struct
 import time
 from typing import NamedTuple, TYPE_CHECKING, Any
 
@@ -229,44 +230,67 @@ class ScreenCapture:
 
     def _convert_to_32bit_true_color(self, image: Any,
                                      pixel_format: dict, big_endian: bool) -> bytes:
-        """Convert to 32-bit true color format"""
-        # Get RGB data
+        """Convert to 32-bit true color format - ULTRA OPTIMIZED VERSION"""
+        # Get RGB data as bytes (MUCH faster than pixel-by-pixel access)
         rgb_image = image.convert("RGB")
         width, height = rgb_image.size
-        pixels = rgb_image.load()
+        rgb_bytes = rgb_image.tobytes()  # Fast: R,G,B,R,G,B,R,G,B,...
 
         # Extract shift values
         red_shift = pixel_format['red_shift']
         green_shift = pixel_format['green_shift']
         blue_shift = pixel_format['blue_shift']
 
-        # Build pixel data
-        data = bytearray(width * height * 4)
-        offset = 0
+        num_pixels = width * height
 
-        for y in range(height):
-            for x in range(width):
-                r, g, b = pixels[x, y]
+        # Ultra fast path for standard RGB0 format (most common)
+        if not big_endian and red_shift == 0 and green_shift == 8 and blue_shift == 16:
+            # Standard RGB0 format - use array slicing (ultra fast)
+            data = bytearray(num_pixels * 4)
+            # Use slicing to copy RGB channels efficiently
+            data[0::4] = rgb_bytes[0::3]  # R channel
+            data[1::4] = rgb_bytes[1::3]  # G channel
+            data[2::4] = rgb_bytes[2::3]  # B channel
+            # data[3::4] already initialized to 0 (padding)
+            return bytes(data)
 
-                # Pack according to shift values
-                pixel_value = (r << red_shift) | (g << green_shift) | (b << blue_shift)
+        # Ultra fast path for BGR0 format
+        elif not big_endian and red_shift == 16 and green_shift == 8 and blue_shift == 0:
+            # Standard BGR0 format - use array slicing (ultra fast)
+            data = bytearray(num_pixels * 4)
+            # Use slicing to copy BGR channels efficiently
+            data[0::4] = rgb_bytes[2::3]  # B channel (from R in source)
+            data[1::4] = rgb_bytes[1::3]  # G channel
+            data[2::4] = rgb_bytes[0::3]  # R channel (from B in source)
+            # data[3::4] already initialized to 0 (padding)
+            return bytes(data)
 
-                # Write as 32-bit value
-                if big_endian:
-                    data[offset:offset+4] = pixel_value.to_bytes(4, byteorder='big')
-                else:
-                    data[offset:offset+4] = pixel_value.to_bytes(4, byteorder='little')
+        # Generic path for non-standard formats (still much faster than before)
+        byteorder = 'big' if big_endian else 'little'
+        data = bytearray(num_pixels * 4)
 
-                offset += 4
+        for i in range(num_pixels):
+            offset = i * 3
+            r = rgb_bytes[offset]
+            g = rgb_bytes[offset + 1]
+            b = rgb_bytes[offset + 2]
+
+            # Pack according to shift values
+            pixel_value = (r << red_shift) | (g << green_shift) | (b << blue_shift)
+
+            # Write as 32-bit value
+            struct.pack_into('I' if byteorder == 'little' else '>I',
+                           data, i * 4, pixel_value)
 
         return bytes(data)
 
     def _convert_to_16bit_true_color(self, image: Any,
                                      pixel_format: dict, big_endian: bool) -> bytes:
-        """Convert to 16-bit true color format (e.g., RGB565)"""
+        """Convert to 16-bit true color format (e.g., RGB565) - OPTIMIZED VERSION"""
+        # Get RGB data as bytes (MUCH faster than pixel-by-pixel access)
         rgb_image = image.convert("RGB")
         width, height = rgb_image.size
-        pixels = rgb_image.load()
+        rgb_bytes = rgb_image.tobytes()  # Fast: R,G,B,R,G,B,R,G,B,...
 
         red_shift = pixel_format['red_shift']
         green_shift = pixel_format['green_shift']
@@ -275,36 +299,36 @@ class ScreenCapture:
         green_max = pixel_format['green_max']
         blue_max = pixel_format['blue_max']
 
-        data = bytearray(width * height * 2)
-        offset = 0
+        num_pixels = width * height
+        byteorder = 'big' if big_endian else 'little'
+        data = bytearray(num_pixels * 2)
 
-        for y in range(height):
-            for x in range(width):
-                r, g, b = pixels[x, y]
+        for i in range(num_pixels):
+            offset = i * 3
+            r = rgb_bytes[offset]
+            g = rgb_bytes[offset + 1]
+            b = rgb_bytes[offset + 2]
 
-                # Scale to max values
-                r = (r * red_max) // 255
-                g = (g * green_max) // 255
-                b = (b * blue_max) // 255
+            # Scale to max values
+            r = (r * red_max) // 255
+            g = (g * green_max) // 255
+            b = (b * blue_max) // 255
 
-                # Pack according to shift values
-                pixel_value = (r << red_shift) | (g << green_shift) | (b << blue_shift)
+            # Pack according to shift values
+            pixel_value = (r << red_shift) | (g << green_shift) | (b << blue_shift)
 
-                # Write as 16-bit value
-                if big_endian:
-                    data[offset:offset+2] = pixel_value.to_bytes(2, byteorder='big')
-                else:
-                    data[offset:offset+2] = pixel_value.to_bytes(2, byteorder='little')
-
-                offset += 2
+            # Write as 16-bit value
+            struct.pack_into('H' if byteorder == 'little' else '>H',
+                           data, i * 2, pixel_value)
 
         return bytes(data)
 
     def _convert_to_8bit_true_color(self, image: Any, pixel_format: dict) -> bytes:
-        """Convert to 8-bit true color format (e.g., RGB332)"""
+        """Convert to 8-bit true color format (e.g., RGB332) - OPTIMIZED VERSION"""
+        # Get RGB data as bytes (MUCH faster than pixel-by-pixel access)
         rgb_image = image.convert("RGB")
         width, height = rgb_image.size
-        pixels = rgb_image.load()
+        rgb_bytes = rgb_image.tobytes()  # Fast: R,G,B,R,G,B,R,G,B,...
 
         red_shift = pixel_format['red_shift']
         green_shift = pixel_format['green_shift']
@@ -313,23 +337,24 @@ class ScreenCapture:
         green_max = pixel_format['green_max']
         blue_max = pixel_format['blue_max']
 
-        data = bytearray(width * height)
-        offset = 0
+        num_pixels = width * height
+        data = bytearray(num_pixels)
 
-        for y in range(height):
-            for x in range(width):
-                r, g, b = pixels[x, y]
+        for i in range(num_pixels):
+            offset = i * 3
+            r = rgb_bytes[offset]
+            g = rgb_bytes[offset + 1]
+            b = rgb_bytes[offset + 2]
 
-                # Scale to max values
-                r = (r * red_max) // 255
-                g = (g * green_max) // 255
-                b = (b * blue_max) // 255
+            # Scale to max values
+            r = (r * red_max) // 255
+            g = (g * green_max) // 255
+            b = (b * blue_max) // 255
 
-                # Pack according to shift values
-                pixel_value = (r << red_shift) | (g << green_shift) | (b << blue_shift)
+            # Pack according to shift values
+            pixel_value = (r << red_shift) | (g << green_shift) | (b << blue_shift)
 
-                data[offset] = pixel_value & 0xFF
-                offset += 1
+            data[i] = pixel_value & 0xFF
 
         return bytes(data)
 

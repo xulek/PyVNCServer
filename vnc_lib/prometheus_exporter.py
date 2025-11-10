@@ -436,6 +436,8 @@ class PrometheusExporter:
             return
 
         self._server = HTTPServer((self._host, self._port), PrometheusHandler)
+        # Set socket timeout so handle_request doesn't block forever
+        self._server.socket.settimeout(1.0)
         self._running = True
 
         # Start server in background thread
@@ -448,14 +450,21 @@ class PrometheusExporter:
             return
 
         while self._running:
-            self._server.handle_request()
+            try:
+                self._server.handle_request()
+            except Exception:
+                # Timeout or other errors - continue if still running
+                pass
 
     def stop(self) -> None:
         """Stop the Prometheus metrics HTTP server."""
         self._running = False
 
         if self._server:
-            self._server.shutdown()
+            try:
+                self._server.server_close()
+            except Exception:
+                pass
             self._server = None
 
         if self._thread:

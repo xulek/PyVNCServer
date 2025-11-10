@@ -377,19 +377,21 @@ class TestPrometheusExporter:
         exporter = PrometheusExporter(host='127.0.0.1', port=0)
 
         exporter.start()
-        time.sleep(0.1)  # Give server time to start
+        time.sleep(0.2)  # Give server time to start
         assert exporter.is_running
 
         exporter.stop()
+        time.sleep(0.2)  # Give server time to stop
         assert not exporter.is_running
 
     def test_exporter_context_manager(self):
         """Test exporter context manager."""
         with PrometheusExporter(host='127.0.0.1', port=0) as exporter:
-            time.sleep(0.1)
+            time.sleep(0.2)
             assert exporter.is_running
 
         # Should be stopped after exiting context
+        time.sleep(0.2)
         assert not exporter.is_running
 
     def test_url_property(self):

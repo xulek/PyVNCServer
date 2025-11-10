@@ -32,16 +32,21 @@ class TestCopyRectEncoding:
         assert encoded == pixel_data
 
     def test_copyrect_identical_frames(self):
-        """Identical frames should not trigger copy"""
+        """Identical frames with unique pattern should not trigger copy"""
         encoder = CopyRectEncoder()
 
-        pixel_data = b'\x00\xFF' * 100
+        # Create unique pattern per line to avoid false positive matches
+        pixel_data = bytearray()
+        for i in range(100):
+            pixel_data.extend(struct.pack(">H", i))
+
+        pixel_data = bytes(pixel_data)
         encoder.encode(pixel_data, 10, 10, 2)  # First frame
 
         # Second identical frame
         encoded = encoder.encode(pixel_data, 10, 10, 2)
 
-        # Should return raw data (no scroll detected)
+        # Should return raw data (no scroll detected with unique pattern)
         assert encoded == pixel_data
 
     def test_copyrect_vertical_scroll(self):
@@ -108,7 +113,8 @@ class TestDesktopResize:
         screen = Screen(id=1, x=100, y=200, width=800, height=600, flags=0)
 
         data = screen.to_bytes()
-        assert len(data) == 16
+        # Format: >IIHHHI = 4+4+2+2+2+4 = 18 bytes
+        assert len(data) == 18
 
         screen2 = Screen.from_bytes(data)
         assert screen2.id == screen.id

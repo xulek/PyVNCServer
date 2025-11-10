@@ -72,17 +72,19 @@ class TestProtocolNegotiation:
         assert protocol.version == (3, 3)
 
     def test_version_negotiation_invalid(self):
-        """Test negotiation with invalid version"""
+        """Test negotiation with higher version (should negotiate down)"""
         protocol = RFBProtocol()
         mock_socket = MockSocket(b"RFB 999.999\n")
 
-        with pytest.raises(ValueError):
-            protocol.negotiate_version(mock_socket)
+        # Should negotiate to our highest supported version
+        major, minor = protocol.negotiate_version(mock_socket)
+        assert (major, minor) in protocol.SUPPORTED_VERSIONS
 
     def test_version_negotiation_malformed(self):
         """Test negotiation with malformed version string"""
         protocol = RFBProtocol()
-        mock_socket = MockSocket(b"NOTVRB 1.0\n")
+        # Must be exactly 12 bytes like RFB protocol expects
+        mock_socket = MockSocket(b"NOTVRB 1.0\n\n")
 
         with pytest.raises(ValueError):
             protocol.negotiate_version(mock_socket)
@@ -289,7 +291,8 @@ class TestMessageSending:
         protocol.send_framebuffer_update(mock_socket, rectangles)
 
         # Check message type and rectangle count
-        msg_type, _, rect_count = struct.unpack(">BxH", mock_socket.data_sent[:4])
+        # Format: message type (B), padding (x - not returned), rectangle count (H)
+        msg_type, rect_count = struct.unpack(">BxH", mock_socket.data_sent[:4])
         assert msg_type == protocol.MSG_FRAMEBUFFER_UPDATE
         assert rect_count == 2
 

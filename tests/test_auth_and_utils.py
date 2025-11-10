@@ -93,14 +93,11 @@ class TestVNCAuth:
         password = "testpass"
         auth = VNCAuth(password)
 
-        # Wrong response
+        # Mock socket that sends wrong response
         wrong_response = b'\xFF' * 16
         mock_socket = MockSocket(wrong_response)
-        auth.challenge = b'\x00' * 16
 
-        auth._recv_exact = lambda sock, n: mock_socket.recv(n)
-
-        result = auth._verify_response(mock_socket)
+        result = auth.authenticate(mock_socket)
 
         assert result is False
 
@@ -109,16 +106,31 @@ class TestVNCAuth:
         long_password = "verylongpassword12345"
         auth = VNCAuth(long_password)
 
-        key = auth._prepare_key(long_password)
-        assert len(key) == 8
+        # Password should be stored as-is, but only first 8 chars used in encryption
+        assert auth.password == long_password
+
+        # Test that encryption uses only first 8 characters
+        challenge = b'\x00' * 16
+        encrypted1 = auth._encrypt_challenge(challenge)
+
+        # Create auth with just first 8 chars
+        auth2 = VNCAuth(long_password[:8])
+        encrypted2 = auth2._encrypt_challenge(challenge)
+
+        # Should produce same result
+        assert encrypted1 == encrypted2
 
     def test_password_padding(self):
-        """Test that short password is padded"""
+        """Test that short password is padded correctly"""
         short_password = "abc"
         auth = VNCAuth(short_password)
 
-        key = auth._prepare_key(short_password)
-        assert len(key) == 8
+        # Should not raise an error
+        challenge = b'\x00' * 16
+        encrypted = auth._encrypt_challenge(challenge)
+
+        # Should produce 16 bytes (same as challenge)
+        assert len(encrypted) == 16
 
     def test_recv_exact_helper(self):
         """Test _recv_exact helper method"""
@@ -216,8 +228,8 @@ class TestHealthChecker:
         checker = HealthChecker(check_interval=1.0)
 
         assert checker.check_interval == 1.0
-        assert not checker.running
-        assert len(checker.checks) == 0
+        assert not checker._running
+        assert len(checker.health_checks) == 0
 
     def test_register_check(self):
         """Test registering health check"""
@@ -228,7 +240,7 @@ class TestHealthChecker:
 
         checker.register_check("test_check", check_func)
 
-        assert "test_check" in checker.checks
+        assert "test_check" in checker.health_checks
 
     def test_run_checks_all_healthy(self):
         """Test running checks when all healthy"""
@@ -237,10 +249,11 @@ class TestHealthChecker:
         checker.register_check("check1", lambda: True)
         checker.register_check("check2", lambda: True)
 
-        status = checker.run_checks()
+        # Use get_status method which runs checks
+        status = checker.get_status(uptime=10.0, active_conns=1, total_conns=5)
 
-        assert status.overall_health
-        assert len(status.failed_checks) == 0
+        assert status.is_healthy
+        assert status.uptime_seconds == 10.0
 
     def test_run_checks_some_failed(self):
         """Test running checks with failures"""
@@ -250,10 +263,9 @@ class TestHealthChecker:
         checker.register_check("check2", lambda: False)
         checker.register_check("check3", lambda: True)
 
-        status = checker.run_checks()
+        status = checker.get_status(uptime=10.0, active_conns=1, total_conns=5)
 
-        assert not status.overall_health
-        assert "check2" in status.failed_checks
+        assert not status.is_healthy
 
     def test_run_checks_exception_handling(self):
         """Test health check exception handling"""
@@ -265,10 +277,9 @@ class TestHealthChecker:
         checker.register_check("failing", failing_check)
         checker.register_check("passing", lambda: True)
 
-        status = checker.run_checks()
+        status = checker.get_status(uptime=10.0, active_conns=1, total_conns=5)
 
-        assert "failing" in status.failed_checks
-        assert not status.overall_health
+        assert not status.is_healthy
 
     def test_start_stop(self):
         """Test starting and stopping health checker"""
@@ -277,11 +288,11 @@ class TestHealthChecker:
         checker.register_check("test", lambda: True)
         checker.start()
 
-        assert checker.running
+        assert checker._running
         time.sleep(0.2)  # Let it run once
 
         checker.stop()
-        assert not checker.running
+        assert not checker._running
 
 
 class TestConnectionPool:
@@ -421,25 +432,30 @@ class TestHealthStatus:
     def test_health_status_creation(self):
         """Test creating HealthStatus"""
         status = HealthStatus(
-            overall_health=True,
-            failed_checks=[],
-            timestamp=time.time()
+            is_healthy=True,
+            uptime_seconds=100.0,
+            active_connections=5,
+            total_connections=10
         )
 
-        assert status.overall_health
-        assert len(status.failed_checks) == 0
+        assert status.is_healthy
+        assert status.uptime_seconds == 100.0
+        assert status.active_connections == 5
 
     def test_health_status_with_failures(self):
         """Test HealthStatus with failures"""
         status = HealthStatus(
-            overall_health=False,
-            failed_checks=["check1", "check2"],
-            timestamp=time.time()
+            is_healthy=False,
+            uptime_seconds=100.0,
+            active_connections=5,
+            total_connections=10,
+            last_error="Connection failed",
+            error_count=2
         )
 
-        assert not status.overall_health
-        assert len(status.failed_checks) == 2
-        assert "check1" in status.failed_checks
+        assert not status.is_healthy
+        assert status.error_count == 2
+        assert status.last_error == "Connection failed"
 
 
 if __name__ == '__main__':

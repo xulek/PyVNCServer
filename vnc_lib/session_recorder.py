@@ -201,7 +201,8 @@ class SessionRecorder:
         """Record framebuffer update."""
         rects_data = struct.pack('!H', len(rectangles))
         for rect in rectangles:
-            rects_data += struct.pack('!HHHH', rect.x, rect.y, rect.width, rect.height)
+            # Rectangle is a tuple (x, y, width, height)
+            rects_data += struct.pack('!HHHH', rect[0], rect[1], rect[2], rect[3])
 
         self.record_event(
             EventType.FRAMEBUFFER_UPDATE,

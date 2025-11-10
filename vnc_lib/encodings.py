@@ -38,6 +38,135 @@ class RawEncoder:
         return pixel_data
 
 
+class CopyRectEncoder:
+    """
+    CopyRect encoding - RFC 6143 Section 7.6.2
+    Efficiently copies a rectangle from one screen position to another
+    Perfect for scrolling, window movement, and drag operations
+
+    Note: CopyRect data is just (src_x, src_y) - 4 bytes total
+    The client copies the rectangle from (src_x, src_y) to the target position
+    """
+
+    ENCODING_TYPE = 1
+
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.previous_frame: PixelData | None = None
+        self.frame_width: int = 0
+        self.frame_height: int = 0
+
+    def encode(self, pixel_data: PixelData, width: int, height: int,
+               bytes_per_pixel: int) -> EncodedData:
+        """
+        CopyRect encoding - finds matching rectangles from previous frame
+
+        Returns: struct.pack(">HH", src_x, src_y) if match found, else pixel_data
+        """
+        # Store current frame for next comparison
+        if self.previous_frame is None or width != self.frame_width or height != self.frame_height:
+            self.previous_frame = pixel_data
+            self.frame_width = width
+            self.frame_height = height
+            # First frame - no copy possible
+            return pixel_data
+
+        # Try to find matching rectangle in previous frame
+        match = self._find_matching_region(
+            pixel_data, self.previous_frame, width, height, bytes_per_pixel
+        )
+
+        # Update previous frame
+        self.previous_frame = pixel_data
+
+        if match:
+            src_x, src_y = match
+            self.logger.debug(f"CopyRect: source ({src_x}, {src_y})")
+            return struct.pack(">HH", src_x, src_y)
+
+        # No match found, fallback to raw
+        return pixel_data
+
+    def _find_matching_region(self, current: PixelData, previous: PixelData,
+                              width: int, height: int, bpp: int,
+                              min_match_size: int = 64) -> tuple[int, int] | None:
+        """
+        Find matching region in previous frame
+
+        Returns: (src_x, src_y) if match found with sufficient size
+        """
+        # Simple implementation: check if entire image shifted
+        # A full implementation would check multiple regions
+
+        # Check for vertical scroll (most common case)
+        for dy in [-10, -5, -3, -2, -1, 1, 2, 3, 5, 10]:
+            if self._is_vertical_shift(current, previous, width, height, bpp, dy):
+                # Determine source position based on shift direction
+                src_y = max(0, -dy) if dy < 0 else 0
+                return (0, src_y)
+
+        # Check for horizontal scroll
+        for dx in [-10, -5, -3, -2, -1, 1, 2, 3, 5, 10]:
+            if self._is_horizontal_shift(current, previous, width, height, bpp, dx):
+                src_x = max(0, -dx) if dx < 0 else 0
+                return (src_x, 0)
+
+        return None
+
+    def _is_vertical_shift(self, current: PixelData, previous: PixelData,
+                          width: int, height: int, bpp: int, dy: int) -> bool:
+        """Check if image shifted vertically by dy pixels"""
+        if abs(dy) >= height:
+            return False
+
+        # Check if lines match after shift
+        matches = 0
+        check_lines = min(10, height - abs(dy))  # Check 10 lines
+
+        for y in range(check_lines):
+            curr_y = y if dy > 0 else y + abs(dy)
+            prev_y = y + dy if dy > 0 else y
+
+            if 0 <= curr_y < height and 0 <= prev_y < height:
+                curr_offset = curr_y * width * bpp
+                prev_offset = prev_y * width * bpp
+                line_size = width * bpp
+
+                if current[curr_offset:curr_offset + line_size] == previous[prev_offset:prev_offset + line_size]:
+                    matches += 1
+
+        return matches >= check_lines * 0.8  # 80% match threshold
+
+    def _is_horizontal_shift(self, current: PixelData, previous: PixelData,
+                            width: int, height: int, bpp: int, dx: int) -> bool:
+        """Check if image shifted horizontally by dx pixels"""
+        if abs(dx) >= width:
+            return False
+
+        # Check if columns match after shift (sample-based)
+        matches = 0
+        check_cols = min(10, width - abs(dx))
+
+        for x in range(check_cols):
+            curr_x = x if dx > 0 else x + abs(dx)
+            prev_x = x + dx if dx > 0 else x
+
+            if 0 <= curr_x < width and 0 <= prev_x < width:
+                # Check a few pixels in this column
+                match_count = 0
+                for y in range(0, height, max(1, height // 10)):
+                    curr_offset = (y * width + curr_x) * bpp
+                    prev_offset = (y * width + prev_x) * bpp
+
+                    if current[curr_offset:curr_offset + bpp] == previous[prev_offset:prev_offset + bpp]:
+                        match_count += 1
+
+                if match_count >= 8:  # At least 8/10 pixels match
+                    matches += 1
+
+        return matches >= check_cols * 0.8  # 80% match threshold
+
+
 class RREEncoder:
     """
     RRE (Rise-and-Run-length Encoding) - RFC 6143 Section 7.6.4
@@ -326,6 +455,7 @@ class EncoderManager:
     def __init__(self):
         self.encoders: dict[int, Encoder] = {
             0: RawEncoder(),
+            1: CopyRectEncoder(),  # CopyRect for scrolling/movement
             2: RREEncoder(),
             5: HextileEncoder(),
             16: ZRLEEncoder(),
@@ -339,26 +469,30 @@ class EncoderManager:
 
         Args:
             client_encodings: Set of encoding types supported by client
-            content_type: Type of content ("static", "dynamic", "default")
+            content_type: Type of content ("static", "dynamic", "scrolling", "default")
 
         Returns:
             (encoding_type, encoder) tuple
         """
-        # Preferred order based on content type
-        if content_type == "static":
-            # For static content, prefer compression
-            preference_order = [16, 5, 2, 0]  # ZRLE, Hextile, RRE, Raw
-        elif content_type == "dynamic":
-            # For dynamic content, prefer speed
-            preference_order = [5, 2, 0, 16]  # Hextile, RRE, Raw, ZRLE
-        else:
-            # Default: balanced
-            preference_order = [16, 5, 2, 0]
+        # Preferred order based on content type using pattern matching (Python 3.13)
+        match content_type:
+            case "static":
+                # For static content, prefer compression
+                preference_order = [16, 5, 2, 0]  # ZRLE, Hextile, RRE, Raw
+            case "dynamic":
+                # For dynamic content, prefer speed
+                preference_order = [5, 2, 0, 16]  # Hextile, RRE, Raw, ZRLE
+            case "scrolling":
+                # For scrolling, try CopyRect first
+                preference_order = [1, 5, 2, 16, 0]  # CopyRect, Hextile, RRE, ZRLE, Raw
+            case _:
+                # Default: balanced
+                preference_order = [16, 5, 2, 1, 0]
 
         # Find first available encoder
         for enc_type in preference_order:
             if enc_type in client_encodings and enc_type in self.encoders:
-                self.logger.debug(f"Selected encoding: {enc_type}")
+                self.logger.debug(f"Selected encoding: {enc_type} for content type: {content_type}")
                 return enc_type, self.encoders[enc_type]
 
         # Fallback to raw

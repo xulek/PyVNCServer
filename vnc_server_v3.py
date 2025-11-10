@@ -22,6 +22,10 @@ from vnc_lib.metrics import ServerMetrics, ConnectionMetrics, PerformanceMonitor
 from vnc_lib.server_utils import (
     GracefulShutdown, HealthChecker, ConnectionPool, PerformanceThrottler
 )
+from vnc_lib.exceptions import (
+    VNCError, ProtocolError, AuthenticationError, ConnectionError,
+    MultiClientError, ExceptionCollector, categorize_exceptions
+)
 
 
 class VNCServerV3:
@@ -338,121 +342,170 @@ class VNCServerV3:
 
                 msg_type = msg_type_data[0]
 
-                # Handle different message types
-                if msg_type == protocol.MSG_SET_PIXEL_FORMAT:
-                    new_format = protocol.parse_set_pixel_format(client_socket)
-                    current_pixel_format.update(new_format)
-                    self.logger.info(f"Pixel format updated: {new_format}")
+                # Handle different message types using Python 3.13 pattern matching
+                match msg_type:
+                    case protocol.MSG_SET_PIXEL_FORMAT:
+                        new_format = protocol.parse_set_pixel_format(client_socket)
+                        current_pixel_format.update(new_format)
+                        self.logger.info(f"Pixel format updated: {new_format}")
 
-                elif msg_type == protocol.MSG_SET_ENCODINGS:
-                    encodings = protocol.parse_set_encodings(client_socket)
-                    client_encodings.clear()
-                    client_encodings.update(encodings)
-                    self.logger.info(f"Client encodings: {client_encodings}")
+                    case protocol.MSG_SET_ENCODINGS:
+                        encodings = protocol.parse_set_encodings(client_socket)
+                        client_encodings.clear()
+                        client_encodings.update(encodings)
+                        self.logger.info(f"Client encodings: {client_encodings}")
 
-                elif msg_type == protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
-                    request = protocol.parse_framebuffer_update_request(client_socket)
+                    case protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
+                        request = protocol.parse_framebuffer_update_request(client_socket)
 
-                    # Throttle frame rate
-                    throttler.throttle()
+                        # Throttle frame rate
+                        throttler.throttle()
 
-                    # Capture screen
-                    start_time = time.perf_counter()
-                    result = screen_capture.capture_fast(current_pixel_format)
+                        # Capture screen
+                        start_time = time.perf_counter()
+                        result = screen_capture.capture_fast(current_pixel_format)
 
-                    if result.pixel_data is None:
-                        continue
-
-                    # Handle dimension changes
-                    if result.width != fb_width or result.height != fb_height:
-                        fb_width, fb_height = result.width, result.height
-                        self.logger.info(f"Framebuffer size changed to {fb_width}x{fb_height}")
-
-                        if change_detector:
-                            change_detector.resize(fb_width, fb_height)
-
-                        # Send DesktopSize if supported
-                        if protocol.ENCODING_DESKTOP_SIZE in client_encodings:
-                            protocol.send_framebuffer_update(client_socket, [
-                                (0, 0, fb_width, fb_height, protocol.ENCODING_DESKTOP_SIZE, None)
-                            ])
+                        if result.pixel_data is None:
                             continue
 
-                    # Check for changes (incremental update)
-                    if request['incremental'] and change_detector:
-                        changed_regions = change_detector.detect_changes(
-                            result.pixel_data,
-                            current_pixel_format['bits_per_pixel'] // 8
+                        # Handle dimension changes
+                        if result.width != fb_width or result.height != fb_height:
+                            fb_width, fb_height = result.width, result.height
+                            self.logger.info(f"Framebuffer size changed to {fb_width}x{fb_height}")
+
+                            if change_detector:
+                                change_detector.resize(fb_width, fb_height)
+
+                            # Send DesktopSize if supported
+                            if protocol.ENCODING_DESKTOP_SIZE in client_encodings:
+                                protocol.send_framebuffer_update(client_socket, [
+                                    (0, 0, fb_width, fb_height, protocol.ENCODING_DESKTOP_SIZE, None)
+                                ])
+                                continue
+
+                        # Check for changes (incremental update)
+                        if request['incremental'] and change_detector:
+                            changed_regions = change_detector.detect_changes(
+                                result.pixel_data,
+                                current_pixel_format['bits_per_pixel'] // 8
+                            )
+
+                            if changed_regions is not None and len(changed_regions) == 0:
+                                # No changes
+                                protocol.send_framebuffer_update(client_socket, [])
+                                continue
+
+                            # Send region updates if available
+                            if changed_regions is not None and len(changed_regions) < 10:
+                                # TODO: Implement region-based encoding
+                                pass
+
+                        # Select best encoding
+                        encoding_type, encoder = encoder_manager.get_best_encoder(
+                            client_encodings, content_type="dynamic"
                         )
 
-                        if changed_regions is not None and len(changed_regions) == 0:
-                            # No changes
-                            protocol.send_framebuffer_update(client_socket, [])
-                            continue
-
-                        # Send region updates if available
-                        if changed_regions is not None and len(changed_regions) < 10:
-                            # TODO: Implement region-based encoding
-                            pass
-
-                    # Select best encoding
-                    encoding_type, encoder = encoder_manager.get_best_encoder(
-                        client_encodings, content_type="dynamic"
-                    )
-
-                    # Encode pixel data
-                    bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
-                    encoded_data = encoder.encode(
-                        result.pixel_data, fb_width, fb_height, bytes_per_pixel
-                    )
-
-                    # Send framebuffer update
-                    rectangles = [
-                        (0, 0, fb_width, fb_height, encoding_type, encoded_data)
-                    ]
-                    protocol.send_framebuffer_update(client_socket, rectangles)
-
-                    # Record metrics
-                    if conn_metrics:
-                        encoding_time = time.perf_counter() - start_time
-                        conn_metrics.record_frame(
-                            len(encoded_data), encoding_time, len(result.pixel_data)
+                        # Encode pixel data
+                        bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
+                        encoded_data = encoder.encode(
+                            result.pixel_data, fb_width, fb_height, bytes_per_pixel
                         )
 
-                    last_frame_time = time.time()
+                        # Send framebuffer update
+                        rectangles = [
+                            (0, 0, fb_width, fb_height, encoding_type, encoded_data)
+                        ]
+                        protocol.send_framebuffer_update(client_socket, rectangles)
 
-                elif msg_type == protocol.MSG_KEY_EVENT:
-                    key_event = protocol.parse_key_event(client_socket)
-                    input_handler.handle_key_event(
-                        key_event['down_flag'],
-                        key_event['key']
-                    )
-                    if conn_metrics:
-                        conn_metrics.record_input('key')
+                        # Record metrics
+                        if conn_metrics:
+                            encoding_time = time.perf_counter() - start_time
+                            conn_metrics.record_frame(
+                                len(encoded_data), encoding_time, len(result.pixel_data)
+                            )
 
-                elif msg_type == protocol.MSG_POINTER_EVENT:
-                    pointer_event = protocol.parse_pointer_event(client_socket)
-                    input_handler.handle_pointer_event(
-                        pointer_event['button_mask'],
-                        pointer_event['x'],
-                        pointer_event['y']
-                    )
-                    if conn_metrics:
-                        conn_metrics.record_input('pointer')
+                        last_frame_time = time.time()
 
-                elif msg_type == protocol.MSG_CLIENT_CUT_TEXT:
-                    text = protocol.parse_client_cut_text(client_socket)
-                    self.logger.info(f"Client cut text: {text[:50]}...")
+                    case protocol.MSG_KEY_EVENT:
+                        key_event = protocol.parse_key_event(client_socket)
+                        input_handler.handle_key_event(
+                            key_event['down_flag'],
+                            key_event['key']
+                        )
+                        if conn_metrics:
+                            conn_metrics.record_input('key')
 
-                else:
-                    self.logger.warning(f"Unknown message type: {msg_type}")
-                    break
+                    case protocol.MSG_POINTER_EVENT:
+                        pointer_event = protocol.parse_pointer_event(client_socket)
+                        input_handler.handle_pointer_event(
+                            pointer_event['button_mask'],
+                            pointer_event['x'],
+                            pointer_event['y']
+                        )
+                        if conn_metrics:
+                            conn_metrics.record_input('pointer')
+
+                    case protocol.MSG_CLIENT_CUT_TEXT:
+                        text = protocol.parse_client_cut_text(client_socket)
+                        self.logger.info(f"Client cut text: {text[:50]}...")
+
+                    case _:
+                        self.logger.warning(f"Unknown message type: {msg_type}")
+                        break
+
+            except VNCError as e:
+                # Specific VNC errors - log and continue or break based on type
+                match e:
+                    case ProtocolError():
+                        self.logger.error(f"Protocol error: {e}")
+                        break  # Protocol errors are fatal
+                    case AuthenticationError():
+                        self.logger.warning(f"Auth error: {e}")
+                        break
+                    case ConnectionError():
+                        self.logger.warning(f"Connection error: {e}")
+                        break
+                    case _:
+                        self.logger.error(f"VNC error: {e}", exc_info=True)
+                        if conn_metrics:
+                            conn_metrics.record_error()
+                        break
 
             except Exception as e:
-                self.logger.error(f"Error in message loop: {e}", exc_info=True)
+                self.logger.error(f"Unexpected error in message loop: {e}", exc_info=True)
                 if conn_metrics:
                     conn_metrics.record_error()
                 break
+
+    def handle_multiple_clients_batch(self, client_data: list[tuple[socket.socket, tuple, str]]) -> None:
+        """
+        Handle multiple clients with exception group support (Python 3.13)
+
+        Args:
+            client_data: List of (socket, addr, client_id) tuples
+
+        This method demonstrates exception groups for batch client handling
+        """
+        with ExceptionCollector() as collector:
+            for client_socket, addr, client_id in client_data:
+                with collector.catch(f"client_{client_id}"):
+                    self.handle_client(client_socket, addr, client_id)
+
+        # Handle collected errors
+        if collector.has_exceptions():
+            exc_group = collector.create_exception_group("Multiple client errors")
+            if exc_group:
+                # Categorize by exception type
+                categories = categorize_exceptions(exc_group)
+
+                for exc_type, exceptions in categories.items():
+                    self.logger.error(f"{exc_type}: {len(exceptions)} occurrences")
+                    for exc in exceptions[:3]:  # Log first 3 of each type
+                        self.logger.error(f"  - {exc}")
+
+                # Re-raise if any critical errors
+                if "ProtocolError" in categories or "ConnectionError" in categories:
+                    raise exc_group
 
     def _cleanup(self):
         """Cleanup server resources"""

@@ -41,10 +41,10 @@ class Screen:
     @classmethod
     def from_bytes(cls, data: bytes) -> 'Screen':
         """Decode screen data from bytes"""
-        if len(data) < 16:
+        if len(data) < 18:
             raise ValueError(f"Invalid screen data length: {len(data)}")
 
-        screen_id, x, y, width, height, flags = struct.unpack(">IIHHHI", data[:16])
+        screen_id, x, y, width, height, flags = struct.unpack(">IIHHHI", data[:18])
         return cls(
             id=screen_id,
             x=x,

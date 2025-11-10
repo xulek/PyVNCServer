@@ -1,3 +1,8 @@
+# Core dependencies
 Pillow>=10.0.0
 pyautogui>=0.9.54
 pycryptodome>=3.19.0
+
+# Testing (optional)
+pytest>=7.4.0
+pytest-cov>=4.1.0

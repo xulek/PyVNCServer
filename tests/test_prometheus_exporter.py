@@ -2,8 +2,6 @@
 
 import pytest
 import time
-import requests
-from urllib.error import URLError
 
 from vnc_lib.prometheus_exporter import (
     MetricsRegistry, VNCMetricsCollector, PrometheusExporter,

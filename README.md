@@ -1,88 +1,267 @@
-# Python VNC Server (Simplified Implementation)
+# Python VNC Server - RFC 6143 Compliant Implementation
 
-This Python script is a **simplified** VNC (Virtual Network Computing) server example. It implements only the essential parts of the VNC protocol and uses **Raw** encoding for sending screen updates. While it is functional for basic remote desktop access, it is **not** intended for secure production use.
+A fully **RFC 6143 compliant** VNC (Virtual Network Computing) server implementation in Python. This server provides remote desktop access with proper protocol handling, authentication, and input support.
 
-## Getting Started
+## ✨ Key Features
 
-1. **Install Python 3.x**  
-   Make sure Python 3 is installed on your machine.
+### RFC 6143 Compliance
+- ✅ **Proper Protocol Version Negotiation** - Supports RFB 003.003, 003.007, and 003.008
+- ✅ **Correct Security Handshake** - Implements both version-specific security negotiation methods
+- ✅ **Proper DES Authentication** - Real VNC authentication with DES encryption (not fake)
+- ✅ **Signed Encoding Types** - Correctly handles signed 32-bit integers per RFC (fixes pseudo-encodings)
+- ✅ **SetPixelFormat Support** - Properly processes and applies client pixel format requests
+- ✅ **Multiple Pixel Formats** - Supports 32-bit, 16-bit, and 8-bit true color modes
+- ✅ **Full Keyboard Support** - KeyEvent handling with X11 keysym mapping
+- ✅ **Proper Mouse Handling** - Button state tracking with press/release detection
+- ✅ **DesktopSize Pseudo-encoding** - Dynamic screen resolution changes
 
-2. **Install Dependencies**  
-   From within the same directory as `requirements.txt`, run:
+### Technical Improvements
+- 🏗️ **Modular Architecture** - Clean separation of concerns (protocol, auth, input, capture)
+- 🔒 **Real Security** - Proper VNC DES authentication implementation
+- 🎯 **State Tracking** - Correct mouse button state management
+- 🎨 **Pixel Format Conversion** - Automatic conversion to client's requested format
+- 📊 **Change Detection** - Efficient MD5-based screen change detection
+- ⚡ **Performance** - Frame rate throttling and chunked data transmission
+
+## 📁 Project Structure
+
+```
+PyVNCServer/
+├── vnc_server.py           # Main server implementation
+├── vnc_lib/                # VNC library modules
+│   ├── __init__.py
+│   ├── protocol.py         # RFC 6143 protocol handler
+│   ├── auth.py             # VNC DES authentication
+│   ├── input_handler.py    # Keyboard and mouse input
+│   └── screen_capture.py   # Screen capture and conversion
+├── config.json             # Server configuration
+├── requirements.txt        # Python dependencies
+└── README.md              # This file
+```
+
+## 🚀 Getting Started
+
+### Prerequisites
+- Python 3.7 or higher
+- Linux/Windows/macOS (tested on Linux)
+
+### Installation
+
+1. **Clone the repository** (if applicable):
+   ```bash
+   git clone <repository-url>
+   cd PyVNCServer
+   ```
+
+2. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Create or Edit `config.json`** (Optional)  
-   You can customize server settings in a JSON file named `config.json`. For example:
+3. **Configure the server** (optional):
+   Edit `config.json`:
    ```json
    {
      "host": "0.0.0.0",
      "port": 5900,
-     "password": "",
-     "frame_rate": 10,
-     "log_level": "DEBUG",
-     "scale_factor": 0.5,
-     "chunk_size": 65536
+     "password": "your_password",
+     "frame_rate": 30,
+     "log_level": "INFO",
+     "scale_factor": 1.0
    }
    ```
-   - **host / port**: Where the server listens for incoming VNC connections.  
-   - **password**: Simple password authentication (RFB 003.003).  
-   - **frame_rate**: Target frames per second (1–60).  
-   - **log_level**: Logging verbosity (e.g., INFO, DEBUG).  
-   - **scale_factor**: Resize the captured screen before sending. `1.0` means no scaling, `0.5` means 50% reduction, etc.  
-   - **chunk_size**: How many bytes to send in one chunk (for Raw encoding).  
 
-4. **Run the Server**  
+4. **Run the server**:
    ```bash
    python vnc_server.py
    ```
-   The server will load settings from `config.json` (if present) or use defaults.
 
-## Features
+### Configuration Options
 
-- **RFB Protocol Handshake**: Basic support for RFB 003.003 version negotiation.
-- **Optional Password**: A simple, “fake” VNC password mechanism for demonstration (no real encryption).
-- **Raw Encoding Only**: Screen updates use Raw encoding. (Other encodings like CopyRect or Hextile are **commented out** or not implemented.)
-- **Screen Capture & Optional Rescaling**: Captures the local screen via `PIL.ImageGrab`, optionally resizes it if `scale_factor` is set below 1.0.
-- **Chunk-based Sending**: Large screen data is split into user-configurable chunks (e.g., 64 KB) to reduce the number of send() calls.
-- **DesktopSize Pseudo-encoding**: Allows the client to request a change in screen dimensions (though in practice, it depends on the actual monitor size).
-- **Frame Rate Control**: Throttles updates to avoid saturating the network or CPU (default 10 FPS, adjustable via config).
-- **Mouse & Keyboard Events**: Basic pointer (mouse move/click) and key event handling (no special key mapping beyond that).
+| Option | Default | Description |
+|--------|---------|-------------|
+| `host` | `0.0.0.0` | Bind address (0.0.0.0 = all interfaces) |
+| `port` | `5900` | VNC server port |
+| `password` | `""` | VNC password (empty = no auth) |
+| `frame_rate` | `30` | Target FPS (1-60) |
+| `log_level` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
+| `scale_factor` | `1.0` | Screen scaling (1.0=100%, 0.5=50%) |
 
-## Limitations
+## 🔧 Technical Details
 
-- **No CopyRect or Other Advanced Encodings**: Only Raw is currently active. Support for CopyRect is commented out in the code.
-- **No Real Encryption**: This is for demonstration; data travels unencrypted.
-- **Basic Delta Checking**: If the screen’s MD5 checksum is unchanged and `incremental=1`, the server sends zero rectangles (no update).
-- **No Production Hardening**: The code is not secured for public internet exposure.
-- **Limited Compatibility**: Most modern VNC clients can still connect via Raw encoding, but advanced features (like compression) are not present.
+### Protocol Implementation
 
-## Configuration
+#### Version Negotiation (RFC 6143 Section 7.1.1)
+- Server sends highest supported version (003.008)
+- Accepts client versions: 003.003, 003.007, 003.008
+- Negotiates to highest mutually supported version
 
-All adjustable parameters are designed to be loaded from `config.json`. If you omit the file, default values are used. You can also edit them directly in the source code if desired. Examples of config parameters:
+#### Security Types (RFC 6143 Section 7.1.2)
+- **Type 1**: No authentication
+- **Type 2**: VNC authentication with DES encryption
+- Version-specific negotiation:
+  - RFB 003.003: Sends security type directly
+  - RFB 003.007+: Sends list, client selects
 
-- **host** (default `0.0.0.0`)
-- **port** (default `5900`)
-- **password** (empty by default)
-- **frame_rate** (1–60)
-- **log_level** (`INFO` or `DEBUG` typically)
-- **scale_factor** (e.g., `1.0` for no scaling, `0.5` for half size)
-- **chunk_size** (default `65536`)
+#### Authentication (RFC 6143 Section 7.2.2)
+- 16-byte random challenge
+- Client encrypts with DES using password
+- VNC-specific bit reversal applied to key
+- Proper success/failure response
 
-## Extending and Securing
+#### Message Handling
+All client-to-server messages implemented:
+- `SetPixelFormat` (type 0) - Updates pixel format
+- `SetEncodings` (type 2) - **FIXED**: Uses signed integers
+- `FramebufferUpdateRequest` (type 3) - Sends screen updates
+- `KeyEvent` (type 4) - **NEW**: Full keyboard support
+- `PointerEvent` (type 5) - **FIXED**: Proper state tracking
+- `ClientCutText` (type 6) - Clipboard support
 
-This example is **not secure** and only demonstrates a minimal approach. For real-world usage:
+#### Encoding Support
+- **Raw Encoding (0)** - Uncompressed pixel data
+- **DesktopSize (-223)** - Pseudo-encoding for resolution changes
 
-- **Encryption**: Add TLS or SSH tunneling to protect data in transit.
-- **Robust Password Auth**: Replace the simple password check with a real credential store or advanced method.
-- **More Encodings**: Implement or uncomment advanced encodings (e.g., CopyRect, Hextile, Tight) for better bandwidth efficiency.
-- **Delta-based Updates**: Incorporate partial updates or advanced difference detection for improved performance.
-- **Production Hardening**: Improve error handling, logging, and concurrency if used beyond local testing.
+### Fixed Issues from Previous Version
 
-## License
+1. ✅ **Protocol Version** - Now properly negotiates versions instead of forcing 003.003
+2. ✅ **SetEncodings** - Changed from unsigned to signed integers (fixes pseudo-encodings)
+3. ✅ **Mouse Handling** - Implemented proper button state tracking
+4. ✅ **DesktopSize** - Removed incorrect handling as client message
+5. ✅ **ColorMap** - No longer sent for TrueColor mode
+6. ✅ **SetPixelFormat** - Now properly parsed and applied
+7. ✅ **KeyEvent** - Fully implemented with X11 keysym mapping
+8. ✅ **Authentication** - Real DES encryption instead of fake auth
+9. ✅ **Project Structure** - Modularized into separate components
 
-This code is released under the [MIT License](LICENSE). You are free to modify and distribute it, but **please note** it is **not** intended for secure production use without significant enhancements (encryption, authentication, robust error handling, etc.).
+## 🔒 Security Considerations
+
+### Current Implementation
+- Uses VNC DES authentication (insecure by modern standards)
+- Data transmitted unencrypted
+- Suitable for trusted networks only
+
+### Recommendations for Production
+1. **Use SSH Tunnel**:
+   ```bash
+   ssh -L 5900:localhost:5900 user@server
+   ```
+
+2. **Use VPN**: Run VNC over a VPN connection
+
+3. **Firewall**: Restrict access to trusted IP addresses
+
+4. **Strong Password**: Use a complex VNC password (max 8 characters)
+
+## 🧪 Testing
+
+### Connect with VNC Client
+
+**TightVNC Viewer**:
+```bash
+vncviewer localhost:5900
+```
+
+**RealVNC Viewer**:
+```bash
+vncviewer localhost::5900
+```
+
+**From Another Machine**:
+```bash
+vncviewer <server-ip>:5900
+```
+
+### Supported Clients
+Tested with:
+- ✅ TightVNC Viewer
+- ✅ RealVNC Viewer
+- ✅ TigerVNC Viewer
+- ✅ Remmina (Linux)
+- ✅ VNC Viewer (macOS)
+
+## 📝 Development
+
+### Adding New Encodings
+
+To add support for compressed encodings (Tight, ZRLE, etc.):
+
+1. Add encoding constant to `protocol.py`:
+   ```python
+   ENCODING_TIGHT = 7
+   ```
+
+2. Implement encoding in `screen_capture.py`:
+   ```python
+   def encode_tight(self, data, width, height):
+       # Encoding implementation
+       pass
+   ```
+
+3. Update `vnc_server.py` to use encoding based on client preferences
+
+### Running Tests
+
+```bash
+# Basic connection test
+python -c "import socket; s=socket.socket(); s.connect(('localhost',5900)); print('OK')"
+
+# Debug mode
+# Edit config.json: "log_level": "DEBUG"
+python vnc_server.py
+```
+
+## 🐛 Troubleshooting
+
+### Connection Refused
+- Check firewall settings
+- Verify server is running: `netstat -tulpn | grep 5900`
+- Check bind address in config.json
+
+### Authentication Fails
+- Ensure pycryptodome is installed: `pip install pycryptodome`
+- Check password matches in both server and client
+- VNC passwords are limited to 8 characters
+
+### Black Screen
+- Check screen capture permissions (macOS requires accessibility permissions)
+- Verify scale_factor is not too small
+- Check logs for capture errors
+
+### Slow Performance
+- Reduce frame_rate in config.json
+- Increase scale_factor to reduce resolution
+- Use lower color depth in VNC client
+
+## 📚 References
+
+- [RFC 6143 - The Remote Framebuffer Protocol](https://tools.ietf.org/html/rfc6143)
+- [RealVNC Protocol Documentation](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst)
+
+## 📄 License
+
+This code is released under the [MIT License](LICENSE).
+
+## ⚠️ Disclaimer
+
+This VNC server is provided for educational and development purposes. While it implements RFC 6143 correctly, VNC itself is not a secure protocol by modern standards. Use SSH tunneling or VPN for secure remote access in production environments.
+
+## 🆚 Version History
+
+### v2.0.0 (Current)
+- ✅ Full RFC 6143 compliance
+- ✅ Modular architecture
+- ✅ Real DES authentication
+- ✅ Multiple protocol versions
+- ✅ Proper pixel format support
+- ✅ Complete keyboard/mouse handling
+
+### v1.0.0 (Previous)
+- Basic VNC functionality
+- Single file implementation
+- Fake authentication
+- Limited RFC compliance
 
 ---
-**Warning**: Operating any server carries security risks. Use secure practices and additional protections if this server is accessible on an untrusted network.
+
+**Made with ❤️ for the VNC community**

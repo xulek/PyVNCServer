@@ -4,7 +4,7 @@ Handles keyboard and mouse events with proper state tracking
 """
 
 import logging
-import pyautogui
+import os
 from typing import Dict, Optional
 
 
@@ -34,10 +34,35 @@ class InputHandler:
         # Mouse safety margin (prevent clicks near screen edges)
         self.safe_margin = 10
 
-        # Disable pyautogui fail-safe
-        pyautogui.FAILSAFE = False
+        # Lazy load pyautogui (only when needed and display is available)
+        self._pyautogui = None
+        self._pyautogui_available = self._check_display()
+
+        if self._pyautogui_available:
+            try:
+                import pyautogui
+                self._pyautogui = pyautogui
+                # Disable pyautogui fail-safe
+                pyautogui.FAILSAFE = False
+            except Exception as e:
+                self.logger.warning(f"pyautogui not available: {e}")
+                self._pyautogui_available = False
 
         self.logger.info("InputHandler initialized")
+
+    def _check_display(self) -> bool:
+        """Check if DISPLAY environment variable is set (for Linux/X11)"""
+        return 'DISPLAY' in os.environ or os.name != 'posix'
+
+    def _ensure_pyautogui(self):
+        """Ensure pyautogui is available, raise error if not"""
+        if not self._pyautogui_available or self._pyautogui is None:
+            raise RuntimeError(
+                "pyautogui is not available. This likely means:\n"
+                "1. DISPLAY environment variable is not set (headless environment)\n"
+                "2. pyautogui failed to import\n"
+                "InputHandler requires a graphical environment to function."
+            )
 
     def handle_pointer_event(self, button_mask: int, x: int, y: int):
         """
@@ -50,12 +75,14 @@ class InputHandler:
         This method properly tracks button state changes.
         """
         try:
+            self._ensure_pyautogui()
+
             # Translate coordinates according to scale factor
             actual_x = int(x / self.scale_factor)
             actual_y = int(y / self.scale_factor)
 
             # Get screen dimensions
-            screen_width, screen_height = pyautogui.size()
+            screen_width, screen_height = self._pyautogui.size()
 
             # Safety check - don't move cursor near edges
             if (actual_x < self.safe_margin or
@@ -66,7 +93,7 @@ class InputHandler:
                 return
 
             # Move mouse to position
-            pyautogui.moveTo(actual_x, actual_y, duration=0)
+            self._pyautogui.moveTo(actual_x, actual_y, duration=0)
 
             # Handle button state changes
             self._handle_button_changes(button_mask)
@@ -91,11 +118,11 @@ class InputHandler:
 
         # Handle scroll events
         if button_mask & self.BUTTON_SCROLL_UP and not (self.prev_button_mask & self.BUTTON_SCROLL_UP):
-            pyautogui.scroll(1)
+            self._pyautogui.scroll(1)
             self.logger.debug("Scroll up")
 
         if button_mask & self.BUTTON_SCROLL_DOWN and not (self.prev_button_mask & self.BUTTON_SCROLL_DOWN):
-            pyautogui.scroll(-1)
+            self._pyautogui.scroll(-1)
             self.logger.debug("Scroll down")
 
     def _handle_button(self, button_bit: int, button_mask: int, button_name: str):
@@ -105,11 +132,11 @@ class InputHandler:
 
         if is_pressed and not was_pressed:
             # Button pressed
-            pyautogui.mouseDown(button=button_name)
+            self._pyautogui.mouseDown(button=button_name)
             self.logger.debug(f"Mouse {button_name} down")
         elif not is_pressed and was_pressed:
             # Button released
-            pyautogui.mouseUp(button=button_name)
+            self._pyautogui.mouseUp(button=button_name)
             self.logger.debug(f"Mouse {button_name} up")
 
     def handle_key_event(self, down_flag: int, key: int):
@@ -124,15 +151,17 @@ class InputHandler:
         Full X11 keysym mapping would be more extensive.
         """
         try:
+            self._ensure_pyautogui()
+
             # Convert X11 keysym to pyautogui key name
             key_name = self._keysym_to_key(key)
 
             if key_name:
                 if down_flag:
-                    pyautogui.keyDown(key_name)
+                    self._pyautogui.keyDown(key_name)
                     self.logger.debug(f"Key down: {key_name} (keysym: 0x{key:08x})")
                 else:
-                    pyautogui.keyUp(key_name)
+                    self._pyautogui.keyUp(key_name)
                     self.logger.debug(f"Key up: {key_name} (keysym: 0x{key:08x})")
             else:
                 self.logger.debug(f"Unmapped keysym: 0x{key:08x}")

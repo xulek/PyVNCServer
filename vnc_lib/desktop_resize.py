@@ -7,12 +7,12 @@ Python 3.13 compatible
 import struct
 import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 
-# Type aliases (Python 3.13)
-type ScreenID = int
-type ResizeReason = int
+# Type aliases (Python 3.12+ would use 'type' statement)
+ScreenID: TypeAlias = int
+ResizeReason: TypeAlias = int
 
 
 @dataclass

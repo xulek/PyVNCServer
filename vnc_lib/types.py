@@ -3,59 +3,59 @@ Type Aliases and Type Definitions for VNC Server
 Python 3.13 with enhanced type syntax (PEP 695)
 """
 
-from typing import Protocol, Callable, TypedDict
+from typing import Protocol, Callable, TypedDict, TypeAlias, Generic, TypeVar
 from collections.abc import Sequence
 
 
 # ============================================================================
-# Basic Types (Python 3.13 type statement)
+# Basic Types (Python 3.12+ would use 'type' statement)
 # ============================================================================
 
 # Binary data types
-type PixelData = bytes
-type EncodedData = bytes
-type AuthChallenge = bytes
-type AuthResponse = bytes
+PixelData: TypeAlias = bytes
+EncodedData: TypeAlias = bytes
+AuthChallenge: TypeAlias = bytes
+AuthResponse: TypeAlias = bytes
 
 # Network types
-type IPAddress = str
-type Port = int
-type ClientID = str
-type SocketAddress = tuple[IPAddress, Port]
+IPAddress: TypeAlias = str
+Port: TypeAlias = int
+ClientID: TypeAlias = str
+SocketAddress: TypeAlias = tuple[IPAddress, Port]
 
 # Dimensions and coordinates
-type Width = int
-type Height = int
-type XCoordinate = int
-type YCoordinate = int
-type Dimension = tuple[Width, Height]
-type Position = tuple[XCoordinate, YCoordinate]
-type Rectangle = tuple[XCoordinate, YCoordinate, Width, Height]
+Width: TypeAlias = int
+Height: TypeAlias = int
+XCoordinate: TypeAlias = int
+YCoordinate: TypeAlias = int
+Dimension: TypeAlias = tuple[Width, Height]
+Position: TypeAlias = tuple[XCoordinate, YCoordinate]
+Rectangle: TypeAlias = tuple[XCoordinate, YCoordinate, Width, Height]
 
 # Time and performance
-type Timestamp = float
-type Duration = float  # in seconds
-type Milliseconds = float
-type FPS = float
-type CompressionRatio = float
+Timestamp: TypeAlias = float
+Duration: TypeAlias = float  # in seconds
+Milliseconds: TypeAlias = float
+FPS: TypeAlias = float
+CompressionRatio: TypeAlias = float
 
 # Protocol types
-type ProtocolVersion = tuple[int, int]  # (major, minor)
-type SecurityType = int
-type EncodingType = int
-type MessageType = int
+ProtocolVersion: TypeAlias = tuple[int, int]  # (major, minor)
+SecurityType: TypeAlias = int
+EncodingType: TypeAlias = int
+MessageType: TypeAlias = int
 
 # Color and pixel format
-type RGB = tuple[int, int, int]
-type RGBA = tuple[int, int, int, int]
-type PixelValue = int
-type ColorDepth = int
-type BitsPerPixel = int
-type BytesPerPixel = int
+RGB: TypeAlias = tuple[int, int, int]
+RGBA: TypeAlias = tuple[int, int, int, int]
+PixelValue: TypeAlias = int
+ColorDepth: TypeAlias = int
+BitsPerPixel: TypeAlias = int
+BytesPerPixel: TypeAlias = int
 
 # Configuration
-type ConfigValue = str | int | float | bool
-type ConfigDict = dict[str, ConfigValue]
+ConfigValue: TypeAlias = str | int | float | bool
+ConfigDict: TypeAlias = dict[str, ConfigValue]
 
 
 # ============================================================================
@@ -159,33 +159,39 @@ class AuthHandler(Protocol):
 # Callback Types
 # ============================================================================
 
-type ErrorCallback = Callable[[Exception], None]
-type ClientCallback = Callable[[ClientID], None]
-type FrameCallback = Callable[[PixelData, Width, Height], None]
-type ResizeCallback = Callable[[Width, Height], None]
-type LogCallback = Callable[[str, str], None]  # (level, message)
+ErrorCallback: TypeAlias = Callable[[Exception], None]
+ClientCallback: TypeAlias = Callable[[ClientID], None]
+FrameCallback: TypeAlias = Callable[[PixelData, Width, Height], None]
+ResizeCallback: TypeAlias = Callable[[Width, Height], None]
+LogCallback: TypeAlias = Callable[[str, str], None]  # (level, message)
 
 # Health check callback
-type HealthCheckFunc = Callable[[], bool]
+HealthCheckFunc: TypeAlias = Callable[[], bool]
 
 
 # ============================================================================
 # Generic Bounded Types (Python 3.13)
 # ============================================================================
 
-type Numeric = int | float
-type MetricValue[T: Numeric] = T
-type WindowSize = int
+Numeric: TypeAlias = int | float
+# MetricValue is unused and requires Python 3.12+ generic syntax
+# type MetricValue[T: Numeric] = T
+WindowSize: TypeAlias = int
 
 
 # ============================================================================
 # Result Types (for error handling)
 # ============================================================================
 
-class Result[T, E]:
+# Type variables for Result class
+T = TypeVar('T')
+E = TypeVar('E')
+
+
+class Result(Generic[T, E]):
     """
     Result type for operations that can fail
-    Python 3.13 generic class with type parameters
+    Generic class compatible with Python 3.9+
 
     Example:
         >>> def divide(a: float, b: float) -> Result[float, str]:
@@ -235,12 +241,12 @@ class Result[T, E]:
 
 
 # Convenience constructors
-def Ok[T, E](value: T) -> Result[T, E]:
+def Ok(value: T) -> Result[T, E]:
     """Create successful result"""
     return Result.ok(value)
 
 
-def Err[T, E](error: E) -> Result[T, E]:
+def Err(error: E) -> Result[T, E]:
     """Create error result"""
     return Result.err(error)
 
@@ -249,42 +255,42 @@ def Err[T, E](error: E) -> Result[T, E]:
 # Encoding-specific types
 # ============================================================================
 
-type RawData = bytes
-type CompressedData = bytes
-type RLEData = bytes
-type TileData = bytes
-type SubrectangleData = bytes
+RawData: TypeAlias = bytes
+CompressedData: TypeAlias = bytes
+RLEData: TypeAlias = bytes
+TileData: TypeAlias = bytes
+SubrectangleData: TypeAlias = bytes
 
 # CopyRect
-type SourcePosition = tuple[XCoordinate, YCoordinate]
+SourcePosition: TypeAlias = tuple[XCoordinate, YCoordinate]
 
 # Hextile
-type SubencodingMask = int
-type TileIndex = tuple[int, int]
+SubencodingMask: TypeAlias = int
+TileIndex: TypeAlias = tuple[int, int]
 
 # ZRLE
-type CPIXELData = bytes
-type CompressionLevel = int
+CPIXELData: TypeAlias = bytes
+CompressionLevel: TypeAlias = int
 
 
 # ============================================================================
 # Change detection types
 # ============================================================================
 
-type TileChecksum = bytes
-type TileCoordinate = tuple[int, int]
-type ChangeScore = float
-type RegionList = list[Rectangle]
+TileChecksum: TypeAlias = bytes
+TileCoordinate: TypeAlias = tuple[int, int]
+ChangeScore: TypeAlias = float
+RegionList: TypeAlias = list[Rectangle]
 
 
 # ============================================================================
 # Cursor types
 # ============================================================================
 
-type CursorPixelData = bytes
-type CursorBitmask = bytes
-type HotspotX = int
-type HotspotY = int
+CursorPixelData: TypeAlias = bytes
+CursorBitmask: TypeAlias = bytes
+HotspotX: TypeAlias = int
+HotspotY: TypeAlias = int
 
 
 # ============================================================================

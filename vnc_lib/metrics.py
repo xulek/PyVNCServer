@@ -9,17 +9,20 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from collections import deque
-from typing import ClassVar
+from typing import ClassVar, TypeAlias, Generic, TypeVar
 
-# Python 3.13 type aliases
-type Numeric = int | float
-type Timestamp = float
+# Type aliases (Python 3.12+ would use 'type' statement)
+Numeric: TypeAlias = int | float
+Timestamp: TypeAlias = float
+
+# Generic type variable
+T = TypeVar('T', int, float)
 
 
-class SlidingWindow[T: Numeric]:
+class SlidingWindow(Generic[T]):
     """
     Generic sliding window for tracking numeric values
-    Uses Python 3.13 generic type parameter syntax (PEP 695)
+    Uses generic type parameter (compatible with Python 3.9+)
 
     Example:
         fps_window: SlidingWindow[float] = SlidingWindow(maxlen=100)

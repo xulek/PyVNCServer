@@ -6,13 +6,14 @@ Supports various RFB encodings for efficient data transmission
 import struct
 import zlib
 import logging
-from typing import Protocol
+from typing import Protocol, TypeAlias
 from collections.abc import Callable
 
 
-type PixelData = bytes
-type EncodedData = bytes
-type Rectangle = tuple[int, int, int, int]  # x, y, width, height
+# Type aliases (Python 3.12+ would use 'type' statement)
+PixelData: TypeAlias = bytes
+EncodedData: TypeAlias = bytes
+Rectangle: TypeAlias = tuple[int, int, int, int]  # x, y, width, height
 
 
 class Encoder(Protocol):

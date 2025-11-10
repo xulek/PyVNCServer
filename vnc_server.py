@@ -1,518 +1,316 @@
-import hashlib
-import os
+#!/usr/bin/env python3
+"""
+RFC 6143 Compliant VNC Server
+A fully RFC-compliant VNC server implementation in Python
+"""
+
 import socket
-import struct
 import threading
 import time
-import pyautogui
-from PIL import ImageGrab, Image
 import logging
 import json
+from typing import Optional, Dict, Set
 
-def clamp(val, min_val, max_val):
-    """Helper function to clamp a value between min_val and max_val."""
-    return max(min_val, min(max_val, val))
+from vnc_lib.protocol import RFBProtocol
+from vnc_lib.auth import VNCAuth, NoAuth
+from vnc_lib.input_handler import InputHandler
+from vnc_lib.screen_capture import ScreenCapture
+
 
 class VNCServer:
-    SUPPORTED_ENCODINGS = {
-        0: "Raw",
-        # 1: "CopyRect",  # commented out
-        -223: "DesktopSize"
-    }
+    """RFC 6143 compliant VNC Server"""
 
-    # Default fallback constants
     DEFAULT_PORT = 5900
-    DEFAULT_CHUNK_SIZE = 65536
-    FRAME_RATE = 30
-    COLOR_MAP_SIZE = 256
+    DEFAULT_HOST = '0.0.0.0'
+    DEFAULT_FRAME_RATE = 30
+    DEFAULT_SCALE_FACTOR = 1.0
 
-    def __init__(self, host='0.0.0.0', port=DEFAULT_PORT, config_file="config.json"):
-        # Basic defaults
-        self.load_config(config_file)
+    def __init__(self, config_file: str = "config.json"):
+        """Initialize VNC Server with configuration"""
+        self.logger = logging.getLogger(__name__)
 
-        # 32-bit RGBA
-        self.bytes_per_pixel = 4
-        self.current_pixel_format = {
-            'bits_per_pixel': 32,
-            'depth': 24,
-            'big_endian_flag': 0,
-            'true_colour_flag': 1,
-            'red_max': 255,
-            'green_max': 255,
-            'blue_max': 255,
-            'red_shift': 0,
-            'green_shift': 8,
-            'blue_shift': 16
-        }
+        # Load configuration
+        self.config = self._load_config(config_file)
 
-        # Create the server socket
+        # Setup logging
+        log_level = self.config.get('log_level', 'INFO').upper()
+        try:
+            logging.getLogger().setLevel(getattr(logging, log_level))
+        except AttributeError:
+            logging.getLogger().setLevel(logging.INFO)
+            self.logger.warning(f"Invalid log level '{log_level}', using INFO")
+
+        # Server configuration
+        self.host = self.config.get('host', self.DEFAULT_HOST)
+        self.port = self.config.get('port', self.DEFAULT_PORT)
+        self.password = self.config.get('password', '')
+        self.frame_rate = max(1, min(60, self.config.get('frame_rate', self.DEFAULT_FRAME_RATE)))
+        self.scale_factor = self.config.get('scale_factor', self.DEFAULT_SCALE_FACTOR)
+
+        # Create server socket
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((host, port))
+        self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(5)
-        logging.info(f"Listening on {host}:{port}...")
 
-        # Initialize other fields
-        self.last_screenshot = None
-        self.color_map = self.generate_default_color_map()
-        self.color_map_entries_sent = False
+        self.logger.info(f"VNC Server listening on {self.host}:{self.port}")
+        self.logger.info(f"Frame rate: {self.frame_rate} FPS, Scale factor: {self.scale_factor}")
 
-        # If user set a password in config
-        self.password = getattr(self, "password", None)
-
-    def load_config(self, config_file):
-        """
-        Loads configuration from JSON.
-        Potential keys:
-          - host (str)
-          - port (int)
-          - password (str)
-          - frame_rate (int)
-          - log_level (str, e.g. "DEBUG")
-          - scale_factor (float, e.g. 1.0 or 0.5)
-          - chunk_size (int, how big the send chunks are)
-        """
-        # Defaults
-        self.host = '0.0.0.0'
-        self.port = self.DEFAULT_PORT
-        self.password = ""
-        self.frame_rate = self.FRAME_RATE
-        self.scale_factor = 1.0
-        self.chunk_size = self.DEFAULT_CHUNK_SIZE  # can be overridden by config
-
+    def _load_config(self, config_file: str) -> Dict:
+        """Load configuration from JSON file"""
         try:
             with open(config_file, 'r') as f:
                 config = json.load(f)
-                # Load stuff from config if present
-                self.host = config.get("host", self.host)
-                self.port = config.get("port", self.port)
-                self.password = config.get("password", self.password)
-                self.frame_rate = config.get("frame_rate", self.frame_rate)
-                log_level_str = config.get("log_level", "INFO").upper()
-                self.scale_factor = config.get("scale_factor", self.scale_factor)
-                self.chunk_size = config.get("chunk_size", self.chunk_size)
-
-                # clamp frame_rate if it's too large or negative
-                if self.frame_rate < 1:
-                    logging.warning("frame_rate < 1 in config, clamping to 1")
-                    self.frame_rate = 1
-                if self.frame_rate > 60:
-                    logging.warning("frame_rate > 60 in config, clamping to 60")
-                    self.frame_rate = 60
-
-                try:
-                    log_level = getattr(logging, log_level_str)
-                    logging.getLogger().setLevel(log_level)
-                    logging.info(f"Log level set to: {log_level_str}")
-                except AttributeError:
-                    logging.warning(f"Invalid log level '{log_level_str}' in config. Using INFO.")
-                    logging.getLogger().setLevel(logging.INFO)
-
                 logging.info(f"Configuration loaded from {config_file}")
+                return config
         except FileNotFoundError:
-            logging.warning(f"Configuration file {config_file} not found. Using default values.")
+            logging.warning(f"Configuration file {config_file} not found, using defaults")
+            return {}
         except Exception as e:
-            logging.error(f"Error loading configuration: {e}. Using default values.")
-
-    def generate_default_color_map(self):
-        """
-        Creates a default grayscale color map, 256 entries
-        """
-        color_map = []
-        for i in range(self.COLOR_MAP_SIZE):
-            gray = int(i * 255 / (self.COLOR_MAP_SIZE - 1))
-            color_map.append((gray, gray, gray))
-        return color_map
+            logging.error(f"Error loading configuration: {e}, using defaults")
+            return {}
 
     def start(self):
-        """
-        Main accept loop
-        """
+        """Start accepting client connections"""
+        self.logger.info("VNC Server started")
         try:
             while True:
                 client_socket, addr = self.server_socket.accept()
-                threading.Thread(target=self.handle_client, args=(client_socket, addr)).start()
+                self.logger.info(f"New connection from {addr}")
+                thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket, addr),
+                    daemon=True
+                )
+                thread.start()
         except KeyboardInterrupt:
-            logging.info("Server shutting down via KeyboardInterrupt.")
+            self.logger.info("Server shutting down...")
         finally:
             self.server_socket.close()
-            logging.info("Server closed.")
+            self.logger.info("Server stopped")
 
-    def handle_client(self, client_socket, addr):
-        """
-        Main per-client logic
-        """
-        client_encodings = set()
-        last_screen_checksum = None
-        last_frame_time = time.time()
-
+    def handle_client(self, client_socket: socket.socket, addr):
+        """Handle a single client connection"""
         try:
-            screen_width, screen_height = pyautogui.size()
-            # We'll do an optional scale for sending
-            framebuffer_width = int(screen_width * self.scale_factor)
-            framebuffer_height = int(screen_height * self.scale_factor)
+            # Initialize protocol handler
+            protocol = RFBProtocol()
 
-            # Basic handshake
-            server_version = b"RFB 003.003\n"
-            client_socket.sendall(server_version)
-            client_version_data = client_socket.recv(12)
-            if client_version_data != server_version:
-                logging.warning(f"Client version mismatch: {client_version_data.decode().strip()} vs 003.003")
+            # Step 1: Protocol Version Handshake (RFC 6143 Section 7.1.1)
+            protocol.negotiate_version(client_socket)
 
-            # Security (don't change)
-            security_type = 2 if self.password else 1
-            client_socket.sendall(struct.pack(">I", security_type))
-            if security_type == 2:
-                if not self.vnc_authenticate(client_socket):
-                    logging.warning("Client authentication failed")
+            # Step 2: Security Handshake (RFC 6143 Section 7.1.2)
+            security_type, needs_auth = protocol.negotiate_security(
+                client_socket, self.password
+            )
+
+            # Step 3: Authentication (if required)
+            if needs_auth:
+                auth_handler = VNCAuth(self.password)
+                auth_success = auth_handler.authenticate(client_socket)
+                protocol.send_security_result(client_socket, auth_success)
+
+                if not auth_success:
+                    self.logger.warning(f"Client {addr} authentication failed")
                     client_socket.close()
                     return
             else:
-                logging.info("No authentication needed.")
+                # For RFB 003.008+, send security result even for "None" security
+                if protocol.version >= (3, 8):
+                    protocol.send_security_result(client_socket, True)
 
-            # ClientInitialization
-            _ = client_socket.recv(1)  # shared_flag
+            self.logger.info(f"Client {addr} authenticated successfully")
 
-            # ServerInitialization
-            pixel_format = struct.pack(
-                ">BBBBHHHBBB3x",
-                self.current_pixel_format['bits_per_pixel'],
-                self.current_pixel_format['depth'],
-                self.current_pixel_format['big_endian_flag'],
-                self.current_pixel_format['true_colour_flag'],
-                self.current_pixel_format['red_max'],
-                self.current_pixel_format['green_max'],
-                self.current_pixel_format['blue_max'],
-                self.current_pixel_format['red_shift'],
-                self.current_pixel_format['green_shift'],
-                self.current_pixel_format['blue_shift']
+            # Step 4: ClientInit (RFC 6143 Section 7.3.1)
+            shared_flag = protocol.receive_client_init(client_socket)
+            self.logger.debug(f"Client shared flag: {shared_flag}")
+
+            # Step 5: ServerInit (RFC 6143 Section 7.3.2)
+            # Initialize screen capture and input handler
+            screen_capture = ScreenCapture(scale_factor=self.scale_factor)
+            input_handler = InputHandler(scale_factor=self.scale_factor)
+
+            # Get initial screen dimensions
+            initial_capture, _, width, height = screen_capture.capture({
+                'bits_per_pixel': 32,
+                'depth': 24,
+                'big_endian_flag': 0,
+                'true_colour_flag': 1,
+                'red_max': 255,
+                'green_max': 255,
+                'blue_max': 255,
+                'red_shift': 0,
+                'green_shift': 8,
+                'blue_shift': 16
+            })
+
+            # Default pixel format (32-bit RGBA)
+            current_pixel_format = {
+                'bits_per_pixel': 32,
+                'depth': 24,
+                'big_endian_flag': 0,
+                'true_colour_flag': 1,
+                'red_max': 255,
+                'green_max': 255,
+                'blue_max': 255,
+                'red_shift': 0,
+                'green_shift': 8,
+                'blue_shift': 16
+            }
+
+            protocol.send_server_init(
+                client_socket, width, height,
+                current_pixel_format, "Python VNC Server"
             )
-            name_length = len("Python VNC Server")
-            server_init_msg = struct.pack(
-                ">HH16sI",
-                framebuffer_width,
-                framebuffer_height,
-                pixel_format,
-                name_length
-            ) + b"Python VNC Server"
-            client_socket.sendall(server_init_msg)
-            last_screen_checksum = b""
 
-            # Send color map once
-            if not self.color_map_entries_sent:
-                self.send_set_color_map_entries(client_socket, 0, self.color_map)
-                self.color_map_entries_sent = True
+            # Track client encodings
+            client_encodings: Set[int] = set()
 
-            # Send first frame in Raw
-            screenshot, screen_data, screen_checksum = self.capture_screen_from_desktop()
-            if screen_data:
-                self.send_framebuffer_update(
-                    client_socket, screen_data,
-                    0, 0,
-                    framebuffer_width, framebuffer_height,
-                    framebuffer_width, framebuffer_height,
-                    0
-                )
-                self.last_screenshot = screenshot
-                last_screen_checksum = screen_checksum
-
-            # Main loop
-            while True:
-                message_type, message_data = self.handle_client_messages(client_socket, client_encodings)
-                if not message_type:
-                    logging.warning("No valid message from client, closing connection.")
-                    break
-
-                if message_type == 'SetEncodings':
-                    pass  # Already processed
-
-                elif message_type == 'DesktopSize':
-                    # Client requests desktop size change
-                    framebuffer_width = message_data['width']
-                    framebuffer_height = message_data['height']
-                    self.send_desktop_size_update(client_socket, framebuffer_width, framebuffer_height)
-                    screenshot, screen_data, screen_checksum = self.capture_screen_from_desktop()
-                    if screen_data:
-                        self.send_framebuffer_update(
-                            client_socket, screen_data,
-                            0, 0,
-                            framebuffer_width, framebuffer_height,
-                            framebuffer_width, framebuffer_height,
-                            0
-                        )
-                        self.last_screenshot = screenshot
-                        last_screen_checksum = screen_checksum
-
-                elif message_type == 'FrameBufferUpdate':
-                    incremental = message_data['incremental']
-                    current_time = time.time()
-                    time_elapsed = current_time - last_frame_time
-                    if time_elapsed < 1 / self.frame_rate:
-                        time.sleep(1 / self.frame_rate - time_elapsed)
-
-                    screenshot, screen_data, screen_checksum = self.capture_screen_from_desktop()
-                    if not screen_data:
-                        continue
-
-                    # If nothing changed
-                    if incremental and screen_checksum == last_screen_checksum:
-                        logging.debug("No changes detected. Sending 0 rectangles.")
-                        client_socket.sendall(struct.pack(">BxH", 0, 0))
-                        continue
-
-                    # In any case, we send raw
-                    logging.debug("Sending full Raw frame.")
-                    self.send_framebuffer_update(
-                        client_socket,
-                        screen_data,
-                        message_data['x_position'],
-                        message_data['y_position'],
-                        framebuffer_width,
-                        framebuffer_height,
-                        framebuffer_width,
-                        framebuffer_height,
-                        0
-                    )
-
-                    self.last_screenshot = screenshot
-                    last_screen_checksum = screen_checksum
-                    last_frame_time = time.time()
-
-                else:
-                    pass
+            # Main message loop
+            self._client_message_loop(
+                client_socket, protocol, screen_capture,
+                input_handler, current_pixel_format,
+                client_encodings, width, height
+            )
 
         except Exception as e:
-            logging.error(f"Error while communicating with client {addr}: {e}")
+            self.logger.error(f"Error handling client {addr}: {e}", exc_info=True)
         finally:
             client_socket.close()
+            self.logger.info(f"Client {addr} disconnected")
 
-    def capture_screen_from_desktop(self):
-        """
-        1) Grab screen
-        2) Resize if scale_factor != 1.0
-        3) Convert to RGBA
-        4) Return data + checksum
-        """
-        try:
-            start_time = time.time()
-            screenshot = ImageGrab.grab()
-            screen_width, screen_height = screenshot.size
-            new_width = int(screen_width * self.scale_factor)
-            new_height = int(screen_height * self.scale_factor)
+    def _client_message_loop(self, client_socket: socket.socket,
+                            protocol: RFBProtocol,
+                            screen_capture: ScreenCapture,
+                            input_handler: InputHandler,
+                            current_pixel_format: Dict,
+                            client_encodings: Set[int],
+                            fb_width: int, fb_height: int):
+        """Main client message handling loop"""
+        last_frame_time = time.time()
 
-            if new_width < 1 or new_height < 1:
-                logging.warning("Scale factor too small, skipping capture.")
-                return None, None, None
+        while True:
+            try:
+                # Receive message type
+                msg_type_data = protocol._recv_exact(client_socket, 1)
+                if not msg_type_data:
+                    break
 
-            if self.scale_factor != 1.0:
-                screenshot = screenshot.resize((new_width, new_height), Image.Resampling.BILINEAR)
+                msg_type = msg_type_data[0]
 
-            screenshot_rgba = screenshot.convert("RGBA")
-            data = screenshot_rgba.tobytes()
-            checksum = hashlib.md5(data).digest()
+                # Handle different message types
+                if msg_type == protocol.MSG_SET_PIXEL_FORMAT:
+                    # SetPixelFormat (RFC 6143 Section 7.5.1)
+                    new_format = protocol.parse_set_pixel_format(client_socket)
+                    current_pixel_format.update(new_format)
+                    self.logger.info(f"Pixel format updated: {new_format}")
 
-            total_time = time.time() - start_time
-            logging.debug(f"capture_screen_from_desktop took {total_time:.4f} s")
-            return screenshot_rgba, data, checksum
-        except Exception as e:
-            logging.error(f"capture_screen_from_desktop error: {e}")
-            return None, None, None
+                elif msg_type == protocol.MSG_SET_ENCODINGS:
+                    # SetEncodings (RFC 6143 Section 7.5.2)
+                    encodings = protocol.parse_set_encodings(client_socket)
+                    client_encodings.clear()
+                    client_encodings.update(encodings)
+                    self.logger.info(f"Client encodings: {client_encodings}")
 
-    def handle_client_messages(self, client_socket, client_encodings):
-        """
-        Handles a single client message: SetEncodings, FramebufferUpdateRequest, etc.
-        """
-        try:
-            hdr = self.recv_exact(client_socket, 1)
-            if not hdr:
-                return None, {}
-            msg_type = struct.unpack(">B", hdr)[0]
-        except Exception as e:
-            logging.error(f"handle_client_messages error: {e}")
-            return None, {}
+                elif msg_type == protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
+                    # FramebufferUpdateRequest (RFC 6143 Section 7.5.3)
+                    request = protocol.parse_framebuffer_update_request(client_socket)
 
-        try:
-            if msg_type == 0:  # SetPixelFormat
-                self.recv_exact(client_socket, 3)  # padding
-                self.recv_exact(client_socket, 16) # ignore pixel format
-                return 'SetPixelFormat', {}
+                    # Throttle frame rate
+                    current_time = time.time()
+                    time_elapsed = current_time - last_frame_time
+                    if time_elapsed < 1.0 / self.frame_rate:
+                        time.sleep(1.0 / self.frame_rate - time_elapsed)
 
-            elif msg_type == 2:  # SetEncodings
-                subhdr = self.recv_exact(client_socket, 3)
-                if not subhdr:
-                    return None, {}
-                _, n_enc = struct.unpack(">BH", subhdr)
-                enc_data = self.recv_exact(client_socket, 4 * n_enc)
-                if not enc_data:
-                    return None, {}
-                enc_list = struct.unpack(">" + "I" * n_enc, enc_data)
+                    # Capture screen
+                    pixel_data, checksum, cap_width, cap_height = screen_capture.capture(
+                        current_pixel_format
+                    )
 
-                client_encodings.clear()
-                for enc in enc_list:
-                    if enc in self.SUPPORTED_ENCODINGS:
-                        client_encodings.add(enc)
-                enc_names = [self.SUPPORTED_ENCODINGS[e] for e in client_encodings]
-                logging.info(f"Client encodings updated: {enc_names}")
-                return 'SetEncodings', {}
+                    if pixel_data is None:
+                        continue
 
-            elif msg_type == 3:  # FramebufferUpdateRequest
-                fb_req = self.recv_exact(client_socket, 9)
-                if not fb_req:
-                    return None, {}
-                incremental, x, y, w, h = struct.unpack(">BHHHH", fb_req)
-                logging.debug(f"FramebufferUpdate request: x={x}, y={y}, w={w}, h={h}, incremental={incremental}")
-                return 'FrameBufferUpdate', {
-                    'incremental': incremental,
-                    'x_position': x,
-                    'y_position': y,
-                    'width': w,
-                    'height': h
-                }
+                    # Check if screen changed (for incremental updates)
+                    if request['incremental'] and not screen_capture.has_changed(checksum):
+                        # No change, send empty update
+                        protocol.send_framebuffer_update(client_socket, [])
+                        continue
 
-            elif msg_type == 4:  # KeyEvent
-                self.recv_exact(client_socket, 7)  # ignore
-                return 'KeyEvent', {}
+                    screen_capture.update_checksum(checksum)
 
-            elif msg_type == 5:  # PointerEvent
-                ptr_data = self.recv_exact(client_socket, 5)
-                if not ptr_data:
-                    return None, {}
-                button_mask, px, py = struct.unpack(">BHH", ptr_data)
-                self.handle_pointer_event(button_mask, px, py)
-                return 'PointerEvent', {}
+                    # Update dimensions if they changed
+                    if cap_width != fb_width or cap_height != fb_height:
+                        fb_width, fb_height = cap_width, cap_height
+                        self.logger.info(f"Framebuffer size changed to {fb_width}x{fb_height}")
 
-            elif msg_type == 6:  # ClientCutText
-                _ = self.recv_exact(client_socket, 3)  # padding
-                length_data = self.recv_exact(client_socket, 4)
-                if not length_data:
-                    return None, {}
-                length, = struct.unpack(">I", length_data)
-                text_data = self.recv_exact(client_socket, length)
-                if text_data is None:
-                    return None, {}
-                return 'ClientCutText', text_data.decode("latin-1")
+                        # Send DesktopSize pseudo-encoding if supported
+                        if protocol.ENCODING_DESKTOP_SIZE in client_encodings:
+                            protocol.send_framebuffer_update(client_socket, [
+                                (0, 0, fb_width, fb_height, protocol.ENCODING_DESKTOP_SIZE, None)
+                            ])
+                            continue
 
-            elif msg_type == -223:  # DesktopSize
-                ds_data = self.recv_exact(client_socket, 4)
-                if ds_data is None:
-                    return None, {}
-                w, h = struct.unpack(">HH", ds_data)
-                logging.info(f"Client requested DesktopSize: w={w}, h={h}")
-                return 'DesktopSize', {'width': w, 'height': h}
+                    # Send framebuffer update (Raw encoding)
+                    # Note: We only support Raw encoding for now
+                    bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
+                    expected_size = fb_width * fb_height * bytes_per_pixel
 
-            else:
-                logging.warning(f"Unknown message type: {msg_type}")
-                return None, {}
-        except Exception as e:
-            logging.error(f"Error processing message {msg_type}: {e}")
-            return None, {}
+                    # Ensure we have the right amount of data
+                    if len(pixel_data) >= expected_size:
+                        pixel_data = pixel_data[:expected_size]
+                    else:
+                        self.logger.warning(f"Pixel data size mismatch: {len(pixel_data)} < {expected_size}")
+                        continue
 
-    def recv_exact(self, sock, n):
-        """
-        Normal instance method (not @staticmethod).
-        Reads exactly n bytes from the socket, or returns None if fails.
-        """
-        buf = b''
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("Failed to receive all data")
-            buf += chunk
-        return buf
+                    rectangles = [
+                        (0, 0, fb_width, fb_height, protocol.ENCODING_RAW, pixel_data)
+                    ]
+                    protocol.send_framebuffer_update(client_socket, rectangles)
 
-    def send_framebuffer_update(self, client_socket, screen_data,
-                                x_position, y_position,
-                                width, height,
-                                full_width, full_height,
-                                encoding_type=0):
-        """
-        Sends a single rectangle update (Raw).
-        """
-        try:
-            num_rectangles = 1
-            client_socket.sendall(struct.pack(">BxH", 0, num_rectangles))
-            client_socket.sendall(struct.pack(">HHHHI", x_position, y_position, width, height, encoding_type))
+                    last_frame_time = time.time()
 
-            rectangle_size = width * height * self.bytes_per_pixel
-            self.send_large_data(client_socket, screen_data[:rectangle_size])
-        except Exception as e:
-            logging.error(f"send_framebuffer_update error: {e}")
+                elif msg_type == protocol.MSG_KEY_EVENT:
+                    # KeyEvent (RFC 6143 Section 7.5.4)
+                    key_event = protocol.parse_key_event(client_socket)
+                    input_handler.handle_key_event(
+                        key_event['down_flag'],
+                        key_event['key']
+                    )
 
-    def send_set_color_map_entries(self, client_socket, first_color, colors):
-        """
-        Sends the color map once (grayscale).
-        """
-        client_socket.sendall(struct.pack(">BxHH", 1, first_color, len(colors)))
-        for color in colors:
-            red, green, blue = color
-            client_socket.sendall(struct.pack(">HHH", red, green, blue))
+                elif msg_type == protocol.MSG_POINTER_EVENT:
+                    # PointerEvent (RFC 6143 Section 7.5.5)
+                    pointer_event = protocol.parse_pointer_event(client_socket)
+                    input_handler.handle_pointer_event(
+                        pointer_event['button_mask'],
+                        pointer_event['x'],
+                        pointer_event['y']
+                    )
 
-    def send_desktop_size_update(self, client_socket, width, height):
-        """
-        DesktopSizeUpdate pseudo-encoding
-        """
-        try:
-            client_socket.sendall(struct.pack(">BxH", 0, 1))
-            client_socket.sendall(struct.pack(">HHHHI", 0, 0, width, height, -223))
-        except Exception as e:
-            logging.error(f"send_desktop_size_update error: {e}")
+                elif msg_type == protocol.MSG_CLIENT_CUT_TEXT:
+                    # ClientCutText (RFC 6143 Section 7.5.6)
+                    text = protocol.parse_client_cut_text(client_socket)
+                    self.logger.info(f"Client cut text: {text[:50]}...")
 
-    def send_large_data(self, client_socket, data):
-        """
-        Sends big data in self.chunk_size chunks.
-        """
-        total_sent = 0
-        data_len = len(data)
-        start_time = time.time()
-        while total_sent < data_len:
-            end = min(total_sent + self.chunk_size, data_len)
-            sent = client_socket.send(data[total_sent:end])
-            if sent == 0:
-                raise RuntimeError("Connection lost during send")
-            total_sent += sent
-        elapsed = time.time() - start_time
-        logging.debug(f"send_large_data: sent {data_len} bytes in {elapsed:.4f} s")
+                else:
+                    self.logger.warning(f"Unknown message type: {msg_type}")
+                    break
 
-    @staticmethod
-    def handle_pointer_event(button_mask, x_position, y_position):
-        """
-        Moves the mouse pointer accordingly. This can remain @staticmethod,
-        because it's not calling 'self'.
-        """
-        safe_margin = 10
-        screen_width, screen_height = pyautogui.size()
-        if (x_position < safe_margin or x_position > screen_width - safe_margin or
-                y_position < safe_margin or y_position > screen_height - safe_margin):
-            logging.warning("Pointer event near screen edge, ignoring for safety.")
-            return
-        current_x, current_y = pyautogui.position()
-        dx = x_position - current_x
-        dy = y_position - current_y
-        try:
-            pyautogui.move(dx, dy)
-        except Exception as e:
-            logging.error(f"Error moving cursor: {e}")
-            return
-        # handle mouse clicks
-        try:
-            if button_mask & 1:
-                pyautogui.mouseDown(button='left') if button_mask & 1 else pyautogui.mouseUp(button='left')
-            if button_mask & 2:
-                pyautogui.mouseDown(button='middle') if button_mask & 2 else pyautogui.mouseUp(button='middle')
-            if button_mask & 4:
-                pyautogui.mouseDown(button='right') if button_mask & 4 else pyautogui.mouseUp(button='right')
-        except Exception as e:
-            logging.error(f"Error handling mouse clicks: {e}")
+            except Exception as e:
+                self.logger.error(f"Error in message loop: {e}")
+                break
 
-    def vnc_authenticate(self, client_socket):
-        """Simple 'fake' RFB 003.003 authentication. (Do not change)"""
-        challenge = os.urandom(16)
-        client_socket.sendall(challenge)
-        _ = client_socket.recv(16)
-        client_socket.sendall(struct.pack(">I", 0))
-        return True
 
-if __name__ == '__main__':
-    logging.getLogger().setLevel(logging.DEBUG)
+def main():
+    """Main entry point"""
+    # Setup basic logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Create and start server
     server = VNCServer()
     server.start()
+
+
+if __name__ == '__main__':
+    main()

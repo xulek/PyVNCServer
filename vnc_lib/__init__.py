@@ -1,6 +1,15 @@
 """
 VNC Server Library - RFC 6143 compliant implementation
-Enhanced Version 3.0 with Python 3.13 features
+Enhanced Version 3.1 with Python 3.13 features
+
+New in v3.1:
+- Session recording and playback for audit trails
+- Clipboard synchronization support
+- Prometheus metrics HTTP endpoint
+- Structured logging with context
+- Advanced connection pooling
+- Performance monitoring and profiling
+- Enhanced exception handling
 
 New in v3.0:
 - Pattern matching (match/case) for message handling
@@ -12,7 +21,7 @@ New in v3.0:
 - Enhanced metrics with SlidingWindow
 """
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 # Core modules
 from .protocol import RFBProtocol
@@ -45,6 +54,30 @@ from .exceptions import (
 from .desktop_resize import (
     Screen, DesktopSizeHandler,
     create_single_screen_layout, create_dual_screen_layout
+)
+
+# v3.1 New Features
+from .session_recorder import (
+    SessionRecorder, SessionPlayer, SessionEvent, EventType
+)
+from .clipboard import (
+    ClipboardManager, ClipboardData, ClipboardHistory,
+    sanitize_clipboard_text
+)
+from .prometheus_exporter import (
+    PrometheusExporter, MetricsRegistry, VNCMetricsCollector
+)
+from .structured_logging import (
+    StructuredLogger, LogContext, CorrelationContext,
+    PerformanceLogger, AuditLogger, configure_logging, get_logger
+)
+from .connection_pool import (
+    ConnectionPool as AdvancedConnectionPool,
+    ConnectionPoolManager, PooledConnection, ConnectionMetrics as ConnMetrics
+)
+from .performance_monitor import (
+    PerformanceMonitor as PerfMonitor, PerformanceTimer,
+    ResourceMonitor, MemoryProfiler, get_global_monitor, time_function
 )
 
 # Type system (optional import for type checking)
@@ -115,4 +148,45 @@ __all__ = [
     'DesktopSizeHandler',
     'create_single_screen_layout',
     'create_dual_screen_layout',
+
+    # v3.1 New Features
+    # Session Recording
+    'SessionRecorder',
+    'SessionPlayer',
+    'SessionEvent',
+    'EventType',
+
+    # Clipboard
+    'ClipboardManager',
+    'ClipboardData',
+    'ClipboardHistory',
+    'sanitize_clipboard_text',
+
+    # Prometheus Metrics
+    'PrometheusExporter',
+    'MetricsRegistry',
+    'VNCMetricsCollector',
+
+    # Structured Logging
+    'StructuredLogger',
+    'LogContext',
+    'CorrelationContext',
+    'PerformanceLogger',
+    'AuditLogger',
+    'configure_logging',
+    'get_logger',
+
+    # Advanced Connection Pooling
+    'AdvancedConnectionPool',
+    'ConnectionPoolManager',
+    'PooledConnection',
+    'ConnMetrics',
+
+    # Performance Monitoring
+    'PerfMonitor',
+    'PerformanceTimer',
+    'ResourceMonitor',
+    'MemoryProfiler',
+    'get_global_monitor',
+    'time_function',
 ]

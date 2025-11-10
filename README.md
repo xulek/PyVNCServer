@@ -16,13 +16,21 @@ A modern, RFC 6143 compliant VNC server implementation in pure Python 3.13, show
 - ✅ **Input Events**: Keyboard and pointer (mouse)
 - ✅ **Clipboard**: Client cut text support
 
-### Advanced Features
+### Advanced Features (v3.0)
 - 🚀 **CopyRect Encoding**: 10-100x bandwidth reduction for scrolling operations
 - 📐 **Desktop Resize**: Dynamic screen resolution changes (ExtendedDesktopSize)
 - 📊 **Performance Metrics**: Real-time FPS, bandwidth, and compression statistics
 - 🔄 **Adaptive Change Detection**: Region-based updates for optimal performance
 - 🎯 **Smart Encoding Selection**: Content-aware encoding (static vs dynamic)
 - 🔌 **Graceful Shutdown**: Clean resource cleanup and connection handling
+
+### New in v3.1 (Pure Python)
+- 📹 **Session Recording**: Record and playback VNC sessions for audit trails
+- 📋 **Clipboard Sync**: Full bidirectional clipboard synchronization
+- 📈 **Prometheus Metrics**: HTTP endpoint for Prometheus monitoring
+- 📝 **Structured Logging**: Context-aware logging with JSON support
+- 🔌 **Advanced Pooling**: Connection pooling with health checks
+- ⚡ **Performance Monitoring**: Real-time performance profiling and analysis
 
 ### Python 3.13 Enhancements
 - 🎭 **Pattern Matching**: Message handling with `match`/`case` statements (PEP 634)
@@ -253,7 +261,20 @@ except ExceptionGroup as eg:
         ...
 ```
 
-See [PYTHON313_FEATURES.md](PYTHON313_FEATURES.md) for comprehensive examples and best practices.
+See [PYTHON313_FEATURES.md](PYTHON313_FEATURES.md) for comprehensive Python 3.13 examples and best practices.
+
+## Documentation
+
+- **[FEATURES_V3.1.md](FEATURES_V3.1.md)** - Complete guide to v3.1 features
+  - Session Recording and Playback
+  - Clipboard Synchronization
+  - Prometheus Metrics Export
+  - Structured Logging
+  - Advanced Connection Pooling
+  - Performance Monitoring
+
+- **[PYTHON313_FEATURES.md](PYTHON313_FEATURES.md)** - Python 3.13 features guide
+- **[examples/advanced_features_demo.py](examples/advanced_features_demo.py)** - Working examples
 
 ## Configuration Options
 

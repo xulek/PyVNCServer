@@ -1,9 +1,27 @@
 {
+  "_comment": "VNC Server v3.0 Configuration",
+
   "host": "0.0.0.0",
   "port": 5900,
   "password": "",
+
   "frame_rate": 30,
+  "scale_factor": 1.0,
+  "max_connections": 10,
+
+  "enable_region_detection": true,
+  "enable_cursor_encoding": false,
+  "enable_metrics": true,
+
   "log_level": "INFO",
-  "scale_factor": 0.5,
-  "chunk_size": 65536
+  "log_file": null,
+
+  "_performance_notes": {
+    "frame_rate": "1-60 FPS, higher = smoother but more CPU/bandwidth",
+    "scale_factor": "0.1-2.0, lower = smaller resolution, less bandwidth",
+    "enable_region_detection": "Reduces bandwidth for incremental updates",
+    "enable_metrics": "Enables performance monitoring and statistics"
+  },
+
+  "_encoding_priority": "ZRLE > Hextile > RRE > Raw (auto-selected based on client)"
 }

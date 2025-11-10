@@ -1,30 +1,50 @@
 """
 Screen Capture Module
 Handles screen grabbing and pixel format conversion
+Enhanced with Python 3.13 features
 """
 
 import hashlib
 import logging
 import time
-from typing import Tuple, Optional, Dict
+from typing import NamedTuple
 from PIL import ImageGrab, Image
 
 
-class ScreenCapture:
-    """Handles screen capture and format conversion"""
+class CaptureResult(NamedTuple):
+    """Screen capture result (Python 3.13 style)"""
+    pixel_data: bytes | None
+    checksum: bytes | None
+    width: int
+    height: int
+    capture_time: float
 
-    def __init__(self, scale_factor: float = 1.0):
+
+class ScreenCapture:
+    """
+    Handles screen capture and format conversion
+    Enhanced with better performance and caching
+    """
+
+    def __init__(self, scale_factor: float = 1.0, monitor: int = 0):
         """
         Initialize screen capture
 
         Args:
             scale_factor: Scale factor for resizing (1.0 = no scaling)
+            monitor: Monitor index for multi-monitor setups (0 = all monitors)
         """
         self.scale_factor = scale_factor
+        self.monitor = monitor
         self.logger = logging.getLogger(__name__)
-        self.last_checksum = None
+        self.last_checksum: bytes | None = None
 
-    def capture(self, pixel_format: Dict) -> Tuple[Optional[bytes], Optional[bytes], int, int]:
+        # Performance optimization: cache last screenshot
+        self._cached_screenshot: Image.Image | None = None
+        self._cache_time: float = 0.0
+        self._cache_ttl: float = 0.016  # ~60 FPS max
+
+    def capture(self, pixel_format: dict) -> tuple[bytes | None, bytes | None, int, int]:
         """
         Capture screen and convert to specified pixel format
 
@@ -34,22 +54,39 @@ class ScreenCapture:
         Returns:
             (pixel_data, checksum, width, height)
         """
+        result = self.capture_fast(pixel_format)
+        return result.pixel_data, result.checksum, result.width, result.height
+
+    def capture_fast(self, pixel_format: dict) -> CaptureResult:
+        """
+        Fast screen capture with caching
+        Returns CaptureResult with timing information
+
+        Args:
+            pixel_format: Client's requested pixel format
+
+        Returns:
+            CaptureResult with capture data and metadata
+        """
         try:
-            start_time = time.time()
+            start_time = time.perf_counter()
 
             # Grab screenshot
-            screenshot = ImageGrab.grab()
+            screenshot = self._grab_screen()
+            if screenshot is None:
+                return CaptureResult(None, None, 0, 0, 0.0)
+
             width, height = screenshot.size
 
             # Apply scaling if needed
-            scaled_width = int(width * self.scale_factor)
-            scaled_height = int(height * self.scale_factor)
-
-            if scaled_width < 1 or scaled_height < 1:
-                self.logger.warning("Scale factor too small")
-                return None, None, 0, 0
-
             if self.scale_factor != 1.0:
+                scaled_width = int(width * self.scale_factor)
+                scaled_height = int(height * self.scale_factor)
+
+                if scaled_width < 1 or scaled_height < 1:
+                    self.logger.warning("Scale factor too small")
+                    return CaptureResult(None, None, 0, 0, 0.0)
+
                 screenshot = screenshot.resize(
                     (scaled_width, scaled_height),
                     Image.Resampling.BILINEAR
@@ -62,16 +99,78 @@ class ScreenCapture:
             # Calculate checksum for change detection
             checksum = hashlib.md5(pixel_data).digest()
 
-            elapsed = time.time() - start_time
-            self.logger.debug(f"Screen capture took {elapsed:.4f}s, size={len(pixel_data)} bytes")
+            elapsed = time.perf_counter() - start_time
+            self.logger.debug(
+                f"Screen capture: {width}x{height}, "
+                f"{len(pixel_data)} bytes, {elapsed*1000:.2f}ms"
+            )
 
-            return pixel_data, checksum, width, height
+            return CaptureResult(pixel_data, checksum, width, height, elapsed)
 
         except Exception as e:
-            self.logger.error(f"Screen capture error: {e}")
-            return None, None, 0, 0
+            self.logger.error(f"Screen capture error: {e}", exc_info=True)
+            return CaptureResult(None, None, 0, 0, 0.0)
 
-    def _convert_to_pixel_format(self, image: Image.Image, pixel_format: Dict) -> bytes:
+    def _grab_screen(self) -> Image.Image | None:
+        """
+        Grab screenshot with caching for performance
+
+        Returns:
+            PIL Image or None on error
+        """
+        current_time = time.time()
+
+        # Use cached screenshot if available and fresh
+        if (self._cached_screenshot is not None and
+            current_time - self._cache_time < self._cache_ttl):
+            return self._cached_screenshot
+
+        # Capture new screenshot
+        try:
+            screenshot = ImageGrab.grab(all_screens=(self.monitor == 0))
+            self._cached_screenshot = screenshot
+            self._cache_time = current_time
+            return screenshot
+        except Exception as e:
+            self.logger.error(f"Failed to grab screen: {e}")
+            return None
+
+    def capture_region(self, x: int, y: int, width: int, height: int,
+                      pixel_format: dict) -> bytes | None:
+        """
+        Capture specific screen region (for region-based updates)
+
+        Args:
+            x, y: Region top-left corner
+            width, height: Region dimensions
+            pixel_format: Client's requested pixel format
+
+        Returns:
+            Pixel data for region or None on error
+        """
+        try:
+            # Grab specific region
+            bbox = (x, y, x + width, y + height)
+            screenshot = ImageGrab.grab(bbox=bbox)
+
+            # Apply scaling if needed
+            if self.scale_factor != 1.0:
+                scaled_width = int(width * self.scale_factor)
+                scaled_height = int(height * self.scale_factor)
+                screenshot = screenshot.resize(
+                    (scaled_width, scaled_height),
+                    Image.Resampling.BILINEAR
+                )
+
+            # Convert to pixel format
+            pixel_data = self._convert_to_pixel_format(screenshot, pixel_format)
+            return pixel_data
+
+        except Exception as e:
+            self.logger.error(f"Region capture error: {e}")
+            return None
+
+    def _convert_to_pixel_format(self, image: Image.Image, pixel_format: dict) -> bytes:
         """
         Convert image to client's requested pixel format
 

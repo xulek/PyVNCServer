@@ -137,9 +137,10 @@ class TestAdaptiveChangeDetector(unittest.TestCase):
 
         pixel_data = bytes([128, 128, 128, 255] * self.width * self.height)
 
-        # First call - everything is new
+        # First call - everything is new (returns None for full update)
         changes1 = detector.detect_changes(pixel_data, self.bpp)
-        self.assertIsNotNone(changes1)
+        # First call with all new data triggers full update
+        self.assertIsNone(changes1)
 
         # Second call - no changes
         changes2 = detector.detect_changes(pixel_data, self.bpp)

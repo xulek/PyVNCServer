@@ -7,8 +7,10 @@ Enhanced with Python 3.13 features
 import hashlib
 import logging
 import time
-from typing import NamedTuple
-from PIL import ImageGrab, Image
+from typing import NamedTuple, TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from PIL import ImageGrab, Image
 
 
 class CaptureResult(NamedTuple):
@@ -39,10 +41,37 @@ class ScreenCapture:
         self.logger = logging.getLogger(__name__)
         self.last_checksum: bytes | None = None
 
+        # Lazy load PIL (only when needed)
+        self._pil_available = False
+        self._ImageGrab = None
+        self._Image = None
+        self._lazy_load_pil()
+
         # Performance optimization: cache last screenshot
-        self._cached_screenshot: Image.Image | None = None
+        self._cached_screenshot: Any = None
         self._cache_time: float = 0.0
         self._cache_ttl: float = 0.016  # ~60 FPS max
+
+    def _lazy_load_pil(self):
+        """Lazy load PIL modules"""
+        if not self._pil_available:
+            try:
+                from PIL import ImageGrab, Image
+                self._ImageGrab = ImageGrab
+                self._Image = Image
+                self._pil_available = True
+            except ImportError as e:
+                self.logger.warning(f"PIL not available: {e}")
+                self._pil_available = False
+
+    def _ensure_pil(self):
+        """Ensure PIL is available, raise error if not"""
+        if not self._pil_available:
+            raise RuntimeError(
+                "PIL (Pillow) is not available. Please install it:\n"
+                "pip install Pillow\n"
+                "ScreenCapture requires PIL/Pillow to function."
+            )
 
     def capture(self, pixel_format: dict) -> tuple[bytes | None, bytes | None, int, int]:
         """
@@ -69,6 +98,7 @@ class ScreenCapture:
             CaptureResult with capture data and metadata
         """
         try:
+            self._ensure_pil()
             start_time = time.perf_counter()
 
             # Grab screenshot
@@ -89,7 +119,7 @@ class ScreenCapture:
 
                 screenshot = screenshot.resize(
                     (scaled_width, scaled_height),
-                    Image.Resampling.BILINEAR
+                    self._Image.Resampling.BILINEAR
                 )
                 width, height = scaled_width, scaled_height
 
@@ -111,7 +141,7 @@ class ScreenCapture:
             self.logger.error(f"Screen capture error: {e}", exc_info=True)
             return CaptureResult(None, None, 0, 0, 0.0)
 
-    def _grab_screen(self) -> Image.Image | None:
+    def _grab_screen(self) -> Any:
         """
         Grab screenshot with caching for performance
 
@@ -127,7 +157,7 @@ class ScreenCapture:
 
         # Capture new screenshot
         try:
-            screenshot = ImageGrab.grab(all_screens=(self.monitor == 0))
+            screenshot = self._ImageGrab.grab(all_screens=(self.monitor == 0))
             self._cached_screenshot = screenshot
             self._cache_time = current_time
             return screenshot
@@ -149,9 +179,10 @@ class ScreenCapture:
             Pixel data for region or None on error
         """
         try:
+            self._ensure_pil()
             # Grab specific region
             bbox = (x, y, x + width, y + height)
-            screenshot = ImageGrab.grab(bbox=bbox)
+            screenshot = self._ImageGrab.grab(bbox=bbox)
 
             # Apply scaling if needed
             if self.scale_factor != 1.0:
@@ -159,7 +190,7 @@ class ScreenCapture:
                 scaled_height = int(height * self.scale_factor)
                 screenshot = screenshot.resize(
                     (scaled_width, scaled_height),
-                    Image.Resampling.BILINEAR
+                    self._Image.Resampling.BILINEAR
                 )
 
             # Convert to pixel format
@@ -170,7 +201,7 @@ class ScreenCapture:
             self.logger.error(f"Region capture error: {e}")
             return None
 
-    def _convert_to_pixel_format(self, image: Image.Image, pixel_format: dict) -> bytes:
+    def _convert_to_pixel_format(self, image: Any, pixel_format: dict) -> bytes:
         """
         Convert image to client's requested pixel format
 
@@ -196,8 +227,8 @@ class ScreenCapture:
                               f"true_colour={true_colour}), using 32-bit RGBA")
             return image.convert("RGBA").tobytes()
 
-    def _convert_to_32bit_true_color(self, image: Image.Image,
-                                     pixel_format: Dict, big_endian: bool) -> bytes:
+    def _convert_to_32bit_true_color(self, image: Any,
+                                     pixel_format: dict, big_endian: bool) -> bytes:
         """Convert to 32-bit true color format"""
         # Get RGB data
         rgb_image = image.convert("RGB")
@@ -230,8 +261,8 @@ class ScreenCapture:
 
         return bytes(data)
 
-    def _convert_to_16bit_true_color(self, image: Image.Image,
-                                     pixel_format: Dict, big_endian: bool) -> bytes:
+    def _convert_to_16bit_true_color(self, image: Any,
+                                     pixel_format: dict, big_endian: bool) -> bytes:
         """Convert to 16-bit true color format (e.g., RGB565)"""
         rgb_image = image.convert("RGB")
         width, height = rgb_image.size
@@ -269,7 +300,7 @@ class ScreenCapture:
 
         return bytes(data)
 
-    def _convert_to_8bit_true_color(self, image: Image.Image, pixel_format: Dict) -> bytes:
+    def _convert_to_8bit_true_color(self, image: Any, pixel_format: dict) -> bytes:
         """Convert to 8-bit true color format (e.g., RGB332)"""
         rgb_image = image.convert("RGB")
         width, height = rgb_image.size

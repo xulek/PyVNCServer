@@ -1,6 +1,7 @@
 """
 Performance metrics and monitoring
 Tracks server performance and statistics
+Python 3.13 enhanced with generic type parameters
 """
 
 import time
@@ -8,7 +9,93 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from collections import deque
-from typing import ClassVar
+from typing import ClassVar, TypeAlias, Generic, TypeVar
+
+# Type aliases (Python 3.12+ would use 'type' statement)
+Numeric: TypeAlias = int | float
+Timestamp: TypeAlias = float
+
+# Generic type variable
+T = TypeVar('T', int, float)
+
+
+class SlidingWindow(Generic[T]):
+    """
+    Generic sliding window for tracking numeric values
+    Uses generic type parameter (compatible with Python 3.9+)
+
+    Example:
+        fps_window: SlidingWindow[float] = SlidingWindow(maxlen=100)
+        fps_window.add(60.0)
+        avg = fps_window.average()
+    """
+
+    def __init__(self, maxlen: int = 100):
+        """
+        Initialize sliding window
+
+        Args:
+            maxlen: Maximum number of values to store
+        """
+        self.window: deque[T] = deque(maxlen=maxlen)
+        self.maxlen = maxlen
+
+    def add(self, value: T) -> None:
+        """Add a value to the window"""
+        self.window.append(value)
+
+    def clear(self) -> None:
+        """Clear all values from the window"""
+        self.window.clear()
+
+    def average(self) -> float:
+        """Calculate average of all values in window"""
+        if not self.window:
+            return 0.0
+        return sum(self.window) / len(self.window)  # type: ignore
+
+    def min(self) -> T | None:
+        """Get minimum value in window"""
+        return min(self.window) if self.window else None
+
+    def max(self) -> T | None:
+        """Get maximum value in window"""
+        return max(self.window) if self.window else None
+
+    def median(self) -> float:
+        """Calculate median of values in window"""
+        if not self.window:
+            return 0.0
+        sorted_values = sorted(self.window)
+        n = len(sorted_values)
+        if n % 2 == 0:
+            return (sorted_values[n//2 - 1] + sorted_values[n//2]) / 2.0
+        return float(sorted_values[n//2])
+
+    def percentile(self, p: float) -> float:
+        """
+        Calculate percentile (0-100) of values in window
+
+        Args:
+            p: Percentile to calculate (0-100)
+        """
+        if not self.window:
+            return 0.0
+        sorted_values = sorted(self.window)
+        k = (len(sorted_values) - 1) * (p / 100.0)
+        f = int(k)
+        c = f + 1
+        if c >= len(sorted_values):
+            return float(sorted_values[-1])
+        return float(sorted_values[f] + (k - f) * (sorted_values[c] - sorted_values[f]))
+
+    def __len__(self) -> int:
+        """Get number of values in window"""
+        return len(self.window)
+
+    def __bool__(self) -> bool:
+        """Check if window has any values"""
+        return bool(self.window)
 
 
 @dataclass

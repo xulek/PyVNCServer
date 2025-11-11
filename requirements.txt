@@ -1,5 +1,6 @@
 # Core dependencies
-Pillow>=10.0.0
+mss>=9.0.0  # High-performance screen capture (recommended)
+Pillow>=10.0.0  # Fallback for screen capture and image processing
 pyautogui>=0.9.54
 pycryptodome>=3.19.0
 

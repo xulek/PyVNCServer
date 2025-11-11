@@ -1,7 +1,7 @@
 """
 Screen Capture Module
 Handles screen grabbing and pixel format conversion
-Enhanced with Python 3.13 features
+Enhanced with Python 3.13 features and high-performance mss backend
 """
 
 import hashlib
@@ -12,6 +12,7 @@ from typing import NamedTuple, TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from PIL import ImageGrab, Image
+    import mss
 
 
 class CaptureResult(NamedTuple):
@@ -42,19 +43,47 @@ class ScreenCapture:
         self.logger = logging.getLogger(__name__)
         self.last_checksum: bytes | None = None
 
-        # Lazy load PIL (only when needed)
+        # Try to load mss (high performance backend)
+        self._mss_available = False
+        self._mss = None
+        self._sct = None
+        self._lazy_load_mss()
+
+        # Fallback: Lazy load PIL (only when needed)
         self._pil_available = False
         self._ImageGrab = None
         self._Image = None
-        self._lazy_load_pil()
+        if not self._mss_available:
+            self._lazy_load_pil()
+
+        # Log which backend is being used
+        if self._mss_available:
+            self.logger.info("Using mss backend for high-performance screen capture")
+        elif self._pil_available:
+            self.logger.info("Using PIL backend for screen capture (fallback)")
+        else:
+            self.logger.warning("No screen capture backend available")
 
         # Performance optimization: cache last screenshot
         self._cached_screenshot: Any = None
+        self._cached_rgb_bytes: bytes | None = None
         self._cache_time: float = 0.0
         self._cache_ttl: float = 0.016  # ~60 FPS max
 
+    def _lazy_load_mss(self):
+        """Lazy load mss module (high-performance backend)"""
+        if not self._mss_available:
+            try:
+                import mss
+                self._mss = mss
+                self._sct = mss.mss()
+                self._mss_available = True
+            except ImportError as e:
+                self.logger.debug(f"mss not available: {e}")
+                self._mss_available = False
+
     def _lazy_load_pil(self):
-        """Lazy load PIL modules"""
+        """Lazy load PIL modules (fallback backend)"""
         if not self._pil_available:
             try:
                 from PIL import ImageGrab, Image
@@ -65,13 +94,13 @@ class ScreenCapture:
                 self.logger.warning(f"PIL not available: {e}")
                 self._pil_available = False
 
-    def _ensure_pil(self):
-        """Ensure PIL is available, raise error if not"""
-        if not self._pil_available:
+    def _ensure_capture_backend(self):
+        """Ensure at least one capture backend is available"""
+        if not self._mss_available and not self._pil_available:
             raise RuntimeError(
-                "PIL (Pillow) is not available. Please install it:\n"
-                "pip install Pillow\n"
-                "ScreenCapture requires PIL/Pillow to function."
+                "No screen capture backend available. Please install mss or Pillow:\n"
+                "pip install mss  # Recommended: high-performance\n"
+                "pip install Pillow  # Alternative: fallback backend\n"
             )
 
     def capture(self, pixel_format: dict) -> tuple[bytes | None, bytes | None, int, int]:
@@ -99,15 +128,13 @@ class ScreenCapture:
             CaptureResult with capture data and metadata
         """
         try:
-            self._ensure_pil()
+            self._ensure_capture_backend()
             start_time = time.perf_counter()
 
-            # Grab screenshot
-            screenshot = self._grab_screen()
-            if screenshot is None:
+            # Grab screenshot (with proper backend)
+            rgb_bytes, width, height = self._grab_screen_rgb()
+            if rgb_bytes is None:
                 return CaptureResult(None, None, 0, 0, 0.0)
-
-            width, height = screenshot.size
 
             # Apply scaling if needed
             if self.scale_factor != 1.0:
@@ -118,14 +145,24 @@ class ScreenCapture:
                     self.logger.warning("Scale factor too small")
                     return CaptureResult(None, None, 0, 0, 0.0)
 
-                screenshot = screenshot.resize(
-                    (scaled_width, scaled_height),
-                    self._Image.Resampling.BILINEAR
-                )
-                width, height = scaled_width, scaled_height
+                # For scaling, we need PIL
+                if self._mss_available and not self._pil_available:
+                    self._lazy_load_pil()
+
+                if self._pil_available:
+                    from PIL import Image
+                    img = Image.frombytes('RGB', (width, height), rgb_bytes)
+                    img = img.resize(
+                        (scaled_width, scaled_height),
+                        Image.Resampling.BILINEAR
+                    )
+                    rgb_bytes = img.tobytes()
+                    width, height = scaled_width, scaled_height
+                else:
+                    self.logger.warning("Cannot scale without PIL, using original size")
 
             # Convert to requested pixel format
-            pixel_data = self._convert_to_pixel_format(screenshot, pixel_format)
+            pixel_data = self._convert_rgb_to_pixel_format(rgb_bytes, width, height, pixel_format)
 
             # Calculate checksum for change detection
             checksum = hashlib.md5(pixel_data).digest()
@@ -142,9 +179,65 @@ class ScreenCapture:
             self.logger.error(f"Screen capture error: {e}", exc_info=True)
             return CaptureResult(None, None, 0, 0, 0.0)
 
+    def _grab_screen_rgb(self) -> tuple[bytes | None, int, int]:
+        """
+        Grab screenshot as RGB bytes with caching for performance
+        Uses mss backend (high-performance) or PIL fallback
+
+        Returns:
+            (rgb_bytes, width, height) or (None, 0, 0) on error
+        """
+        current_time = time.time()
+
+        # Use cached screenshot if available and fresh
+        if (self._cached_rgb_bytes is not None and
+            current_time - self._cache_time < self._cache_ttl):
+            # Return cached data with stored dimensions
+            return self._cached_rgb_bytes, self._cached_width, self._cached_height
+
+        # Capture new screenshot using mss (preferred) or PIL (fallback)
+        try:
+            if self._mss_available:
+                # High-performance mss backend
+                monitor = self._sct.monitors[self.monitor] if self.monitor < len(self._sct.monitors) else self._sct.monitors[0]
+                sct_img = self._sct.grab(monitor)
+
+                # mss returns BGRA, convert to RGB
+                width = sct_img.width
+                height = sct_img.height
+                bgra_bytes = bytes(sct_img.raw)
+
+                # Convert BGRA to RGB (ultra-fast slicing)
+                rgb_bytes = bytearray(width * height * 3)
+                rgb_bytes[0::3] = bgra_bytes[2::4]  # R from B
+                rgb_bytes[1::3] = bgra_bytes[1::4]  # G
+                rgb_bytes[2::3] = bgra_bytes[0::4]  # B from R
+                rgb_bytes = bytes(rgb_bytes)
+
+            elif self._pil_available:
+                # PIL fallback
+                screenshot = self._ImageGrab.grab(all_screens=(self.monitor == 0))
+                width, height = screenshot.size
+                rgb_bytes = screenshot.convert("RGB").tobytes()
+            else:
+                return None, 0, 0
+
+            # Cache the result
+            self._cached_rgb_bytes = rgb_bytes
+            self._cached_width = width
+            self._cached_height = height
+            self._cache_time = current_time
+
+            return rgb_bytes, width, height
+
+        except Exception as e:
+            self.logger.error(f"Failed to grab screen: {e}")
+            return None, 0, 0
+
     def _grab_screen(self) -> Any:
         """
-        Grab screenshot with caching for performance
+        Legacy method: Grab screenshot as PIL Image
+        Used for backward compatibility with region capture
 
         Returns:
             PIL Image or None on error
@@ -158,10 +251,25 @@ class ScreenCapture:
 
         # Capture new screenshot
         try:
-            screenshot = self._ImageGrab.grab(all_screens=(self.monitor == 0))
-            self._cached_screenshot = screenshot
-            self._cache_time = current_time
-            return screenshot
+            if self._pil_available:
+                screenshot = self._ImageGrab.grab(all_screens=(self.monitor == 0))
+                self._cached_screenshot = screenshot
+                self._cache_time = current_time
+                return screenshot
+            elif self._mss_available:
+                # Convert mss to PIL Image if needed
+                if not self._pil_available:
+                    self._lazy_load_pil()
+
+                if self._pil_available:
+                    from PIL import Image
+                    rgb_bytes, width, height = self._grab_screen_rgb()
+                    if rgb_bytes:
+                        screenshot = Image.frombytes('RGB', (width, height), rgb_bytes)
+                        self._cached_screenshot = screenshot
+                        self._cache_time = current_time
+                        return screenshot
+            return None
         except Exception as e:
             self.logger.error(f"Failed to grab screen: {e}")
             return None
@@ -202,9 +310,11 @@ class ScreenCapture:
             self.logger.error(f"Region capture error: {e}")
             return None
 
-    def _convert_to_pixel_format(self, image: Any, pixel_format: dict) -> bytes:
+    def _convert_rgb_to_pixel_format(self, rgb_bytes: bytes, width: int, height: int,
+                                     pixel_format: dict) -> bytes:
         """
-        Convert image to client's requested pixel format
+        Convert RGB bytes to client's requested pixel format
+        Direct conversion without PIL Image overhead
 
         Supports various pixel formats as per RFC 6143 Section 7.4
         """
@@ -215,27 +325,41 @@ class ScreenCapture:
 
         if true_colour and bpp == 32 and depth == 24:
             # 32-bit true color (most common)
-            return self._convert_to_32bit_true_color(image, pixel_format, big_endian)
+            return self._convert_rgb_to_32bit_true_color(rgb_bytes, width, height, pixel_format, big_endian)
         elif true_colour and bpp == 16:
             # 16-bit true color
-            return self._convert_to_16bit_true_color(image, pixel_format, big_endian)
+            return self._convert_rgb_to_16bit_true_color(rgb_bytes, width, height, pixel_format, big_endian)
         elif true_colour and bpp == 8:
             # 8-bit true color
-            return self._convert_to_8bit_true_color(image, pixel_format)
+            return self._convert_rgb_to_8bit_true_color(rgb_bytes, width, height, pixel_format)
         else:
             # Default fallback: 32-bit RGBA
             self.logger.warning(f"Unsupported pixel format (bpp={bpp}, depth={depth}, "
                               f"true_colour={true_colour}), using 32-bit RGBA")
-            return image.convert("RGBA").tobytes()
+            # Convert RGB to RGBA (add alpha channel)
+            num_pixels = width * height
+            rgba_bytes = bytearray(num_pixels * 4)
+            rgba_bytes[0::4] = rgb_bytes[0::3]  # R
+            rgba_bytes[1::4] = rgb_bytes[1::3]  # G
+            rgba_bytes[2::4] = rgb_bytes[2::3]  # B
+            rgba_bytes[3::4] = [255] * num_pixels  # A (opaque)
+            return bytes(rgba_bytes)
 
-    def _convert_to_32bit_true_color(self, image: Any,
-                                     pixel_format: dict, big_endian: bool) -> bytes:
-        """Convert to 32-bit true color format - ULTRA OPTIMIZED VERSION"""
-        # Get RGB data as bytes (MUCH faster than pixel-by-pixel access)
-        rgb_image = image.convert("RGB")
-        width, height = rgb_image.size
-        rgb_bytes = rgb_image.tobytes()  # Fast: R,G,B,R,G,B,R,G,B,...
+    def _convert_to_pixel_format(self, image: Any, pixel_format: dict) -> bytes:
+        """
+        Convert PIL Image to client's requested pixel format
+        Legacy method for backward compatibility with region capture
 
+        Supports various pixel formats as per RFC 6143 Section 7.4
+        """
+        # Get RGB bytes and use the new optimized method
+        rgb_bytes = image.convert("RGB").tobytes()
+        width, height = image.size
+        return self._convert_rgb_to_pixel_format(rgb_bytes, width, height, pixel_format)
+
+    def _convert_rgb_to_32bit_true_color(self, rgb_bytes: bytes, width: int, height: int,
+                                         pixel_format: dict, big_endian: bool) -> bytes:
+        """Convert RGB bytes to 32-bit true color format - ULTRA OPTIMIZED VERSION"""
         # Extract shift values
         red_shift = pixel_format['red_shift']
         green_shift = pixel_format['green_shift']
@@ -284,14 +408,18 @@ class ScreenCapture:
 
         return bytes(data)
 
-    def _convert_to_16bit_true_color(self, image: Any,
+    def _convert_to_32bit_true_color(self, image: Any,
                                      pixel_format: dict, big_endian: bool) -> bytes:
-        """Convert to 16-bit true color format (e.g., RGB565) - OPTIMIZED VERSION"""
-        # Get RGB data as bytes (MUCH faster than pixel-by-pixel access)
+        """Legacy: Convert PIL Image to 32-bit true color format"""
+        # Get RGB data as bytes and use optimized method
         rgb_image = image.convert("RGB")
         width, height = rgb_image.size
-        rgb_bytes = rgb_image.tobytes()  # Fast: R,G,B,R,G,B,R,G,B,...
+        rgb_bytes = rgb_image.tobytes()
+        return self._convert_rgb_to_32bit_true_color(rgb_bytes, width, height, pixel_format, big_endian)
 
+    def _convert_rgb_to_16bit_true_color(self, rgb_bytes: bytes, width: int, height: int,
+                                         pixel_format: dict, big_endian: bool) -> bytes:
+        """Convert RGB bytes to 16-bit true color format (e.g., RGB565) - OPTIMIZED VERSION"""
         red_shift = pixel_format['red_shift']
         green_shift = pixel_format['green_shift']
         blue_shift = pixel_format['blue_shift']
@@ -323,13 +451,17 @@ class ScreenCapture:
 
         return bytes(data)
 
-    def _convert_to_8bit_true_color(self, image: Any, pixel_format: dict) -> bytes:
-        """Convert to 8-bit true color format (e.g., RGB332) - OPTIMIZED VERSION"""
-        # Get RGB data as bytes (MUCH faster than pixel-by-pixel access)
+    def _convert_to_16bit_true_color(self, image: Any,
+                                     pixel_format: dict, big_endian: bool) -> bytes:
+        """Legacy: Convert PIL Image to 16-bit true color format"""
         rgb_image = image.convert("RGB")
         width, height = rgb_image.size
-        rgb_bytes = rgb_image.tobytes()  # Fast: R,G,B,R,G,B,R,G,B,...
+        rgb_bytes = rgb_image.tobytes()
+        return self._convert_rgb_to_16bit_true_color(rgb_bytes, width, height, pixel_format, big_endian)
 
+    def _convert_rgb_to_8bit_true_color(self, rgb_bytes: bytes, width: int, height: int,
+                                        pixel_format: dict) -> bytes:
+        """Convert RGB bytes to 8-bit true color format (e.g., RGB332) - OPTIMIZED VERSION"""
         red_shift = pixel_format['red_shift']
         green_shift = pixel_format['green_shift']
         blue_shift = pixel_format['blue_shift']
@@ -357,6 +489,13 @@ class ScreenCapture:
             data[i] = pixel_value & 0xFF
 
         return bytes(data)
+
+    def _convert_to_8bit_true_color(self, image: Any, pixel_format: dict) -> bytes:
+        """Legacy: Convert PIL Image to 8-bit true color format"""
+        rgb_image = image.convert("RGB")
+        width, height = rgb_image.size
+        rgb_bytes = rgb_image.tobytes()
+        return self._convert_rgb_to_8bit_true_color(rgb_bytes, width, height, pixel_format)
 
     def has_changed(self, checksum: bytes) -> bool:
         """Check if screen has changed since last capture"""

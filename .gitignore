@@ -159,5 +159,37 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# OS specific
+Thumbs.db
+.directory
+
 # Project specific
 vnc_server_old.py
+*.pid
+*.sock
+*.log
+logs/
+temp/
+tmp/
+test_logs/
+
+# VNC Server specific
+vnc_sessions/
+screen_recordings/
+metrics_data/
+performance_logs/
+session_recordings/
+captured_frames/
+connection_logs/
+
+.history

@@ -12,7 +12,7 @@ Uses Python 3.13 features:
 
 import time
 import threading
-import resource
+import sys
 import gc
 from dataclasses import dataclass, field
 from typing import Self, Any
@@ -20,6 +20,12 @@ from collections.abc import Callable
 from collections import deque
 from statistics import mean, median, stdev
 from contextvars import ContextVar
+
+# Conditional import for resource module (Unix/Linux only)
+if sys.platform != 'win32':
+    import resource
+else:
+    resource = None
 
 
 # Context variable for performance tracking
@@ -352,43 +358,70 @@ class ResourceMonitor:
     """
     Monitors system resource usage (CPU time, memory, etc.).
 
-    Uses the resource module for accurate resource tracking.
+    Uses the resource module for accurate resource tracking on Unix/Linux.
+    On Windows, provides basic fallback metrics using psutil or system time.
     """
 
-    __slots__ = ('_initial_usage', '_samples', '_lock')
+    __slots__ = ('_initial_usage', '_samples', '_lock', '_is_unix')
 
     def __init__(self):
-        self._initial_usage = resource.getrusage(resource.RUSAGE_SELF)
+        self._is_unix = resource is not None
+        if self._is_unix:
+            self._initial_usage = resource.getrusage(resource.RUSAGE_SELF)
+        else:
+            self._initial_usage = None
         self._samples: list[tuple[float, Any]] = []
         self._lock = threading.Lock()
 
     def get_current_usage(self) -> dict[str, float]:
         """Get current resource usage."""
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-
-        return {
-            'user_time': usage.ru_utime,
-            'system_time': usage.ru_stime,
-            'max_rss_kb': usage.ru_maxrss,
-            'page_faults': usage.ru_majflt,
-            'block_input': usage.ru_inblock,
-            'block_output': usage.ru_oublock,
-            'voluntary_context_switches': usage.ru_nvcsw,
-            'involuntary_context_switches': usage.ru_nivcsw
-        }
+        if self._is_unix and resource is not None:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            return {
+                'user_time': usage.ru_utime,
+                'system_time': usage.ru_stime,
+                'max_rss_kb': usage.ru_maxrss,
+                'page_faults': usage.ru_majflt,
+                'block_input': usage.ru_inblock,
+                'block_output': usage.ru_oublock,
+                'voluntary_context_switches': usage.ru_nvcsw,
+                'involuntary_context_switches': usage.ru_nivcsw
+            }
+        else:
+            # Windows fallback: return zeros or basic metrics
+            return {
+                'user_time': 0.0,
+                'system_time': 0.0,
+                'max_rss_kb': 0.0,
+                'page_faults': 0.0,
+                'block_input': 0.0,
+                'block_output': 0.0,
+                'voluntary_context_switches': 0.0,
+                'involuntary_context_switches': 0.0
+            }
 
     def get_delta_usage(self) -> dict[str, float]:
         """Get resource usage delta since initialization."""
-        current = resource.getrusage(resource.RUSAGE_SELF)
-
-        return {
-            'user_time': current.ru_utime - self._initial_usage.ru_utime,
-            'system_time': current.ru_stime - self._initial_usage.ru_stime,
-            'max_rss_kb': current.ru_maxrss - self._initial_usage.ru_maxrss,
-            'page_faults': current.ru_majflt - self._initial_usage.ru_majflt,
-            'block_input': current.ru_inblock - self._initial_usage.ru_inblock,
-            'block_output': current.ru_oublock - self._initial_usage.ru_oublock
-        }
+        if self._is_unix and resource is not None and self._initial_usage is not None:
+            current = resource.getrusage(resource.RUSAGE_SELF)
+            return {
+                'user_time': current.ru_utime - self._initial_usage.ru_utime,
+                'system_time': current.ru_stime - self._initial_usage.ru_stime,
+                'max_rss_kb': current.ru_maxrss - self._initial_usage.ru_maxrss,
+                'page_faults': current.ru_majflt - self._initial_usage.ru_majflt,
+                'block_input': current.ru_inblock - self._initial_usage.ru_inblock,
+                'block_output': current.ru_oublock - self._initial_usage.ru_oublock
+            }
+        else:
+            # Windows fallback: return zeros
+            return {
+                'user_time': 0.0,
+                'system_time': 0.0,
+                'max_rss_kb': 0.0,
+                'page_faults': 0.0,
+                'block_input': 0.0,
+                'block_output': 0.0
+            }
 
     def sample(self) -> None:
         """Take a snapshot of current resource usage."""

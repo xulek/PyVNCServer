@@ -8,12 +8,70 @@ import zlib
 import logging
 from typing import Protocol, TypeAlias
 from collections.abc import Callable
+from collections import deque
 
 
 # Type aliases (Python 3.12+ would use 'type' statement)
 PixelData: TypeAlias = bytes
 EncodedData: TypeAlias = bytes
 Rectangle: TypeAlias = tuple[int, int, int, int]  # x, y, width, height
+
+
+class BufferPool:
+    """
+    Simple buffer pool for reusing bytearrays across frames
+    Reduces GC pressure and allocation overhead
+    Pure Python, cross-platform implementation
+    """
+
+    def __init__(self, max_buffers: int = 10):
+        """
+        Initialize buffer pool
+
+        Args:
+            max_buffers: Maximum number of buffers to cache
+        """
+        self._pool: deque[bytearray] = deque(maxlen=max_buffers)
+        self._max_buffers = max_buffers
+
+    def get(self, size: int) -> bytearray:
+        """
+        Get a buffer from pool, or create new one if pool is empty
+
+        Args:
+            size: Minimum size needed
+
+        Returns:
+            bytearray of at least the requested size
+        """
+        # Try to find a buffer that's large enough
+        for _ in range(len(self._pool)):
+            buf = self._pool.popleft()
+            if len(buf) >= size:
+                # Clear the buffer (set length to 0 without deallocating)
+                del buf[:]
+                return buf
+            # Return undersized buffer to pool
+            self._pool.append(buf)
+
+        # No suitable buffer found, create new one
+        return bytearray(size)
+
+    def put(self, buffer: bytearray) -> None:
+        """
+        Return a buffer to the pool
+
+        Args:
+            buffer: bytearray to return to pool
+        """
+        if len(self._pool) < self._max_buffers:
+            # Clear buffer before returning to pool
+            del buffer[:]
+            self._pool.append(buffer)
+
+
+# Global buffer pool instance (thread-safe due to GIL)
+_buffer_pool = BufferPool(max_buffers=10)
 
 
 class Encoder(Protocol):
@@ -217,8 +275,11 @@ class RREEncoder:
             pixel_data, width, height, bytes_per_pixel, background
         )
 
-        # Build encoded data
-        result = bytearray()
+        # Build encoded data using buffer pool to reduce allocations
+        # Estimate size: header (4) + background (bpp) + subrects * (bpp + 8)
+        estimated_size = 4 + bytes_per_pixel + len(subrects) * (bytes_per_pixel + 8)
+        result = _buffer_pool.get(estimated_size)
+
         result.extend(struct.pack(">I", len(subrects)))  # Number of subrectangles
         result.extend(background)  # Background pixel value
 
@@ -229,9 +290,12 @@ class RREEncoder:
         # Only use RRE if it's more efficient
         if len(result) < len(pixel_data):
             self.logger.debug(f"RRE: {len(pixel_data)} -> {len(result)} bytes")
-            return bytes(result)
+            encoded = bytes(result)
+            _buffer_pool.put(result)  # Return buffer to pool
+            return encoded
         else:
             # Fallback to raw if RRE doesn't help
+            _buffer_pool.put(result)  # Return buffer to pool
             return pixel_data
 
     def _find_background(self, pixel_data: PixelData, bpp: int) -> bytes:
@@ -322,7 +386,11 @@ class HextileEncoder:
         Hextile encoding divides the framebuffer into 16x16 tiles
         and encodes each tile independently
         """
-        result = bytearray()
+        # Estimate size: worst case is raw encoding = original size + tile headers
+        tiles_x = (width + self.TILE_SIZE - 1) // self.TILE_SIZE
+        tiles_y = (height + self.TILE_SIZE - 1) // self.TILE_SIZE
+        estimated_size = len(pixel_data) + tiles_x * tiles_y
+        result = _buffer_pool.get(estimated_size)
 
         for tile_y in range(0, height, self.TILE_SIZE):
             for tile_x in range(0, width, self.TILE_SIZE):
@@ -339,7 +407,9 @@ class HextileEncoder:
                 )
                 result.extend(encoded_tile)
 
-        return bytes(result)
+        encoded = bytes(result)
+        _buffer_pool.put(result)  # Return buffer to pool
+        return encoded
 
     def _extract_tile(self, pixel_data: PixelData, fb_width: int,
                      tile_x: int, tile_y: int, tile_width: int,
@@ -416,21 +486,25 @@ class ZRLEEncoder:
         """
         Convert to CPIXEL format
         For 32-bit pixels, use 3 bytes (RGB) instead of 4 (RGBA)
-        Optimized with memoryview
+        Optimized with pre-allocation and buffer pool
         """
         if bpp != 4:
             return pixel_data
 
-        # Convert RGBA to RGB
-        result = bytearray()
+        # Convert RGBA to RGB with pre-allocated buffer
+        num_pixels = len(pixel_data) // 4
+        result = _buffer_pool.get(num_pixels * 3)
 
         # Use memoryview for faster access
         src_view = memoryview(pixel_data)
+        dst_offset = 0
 
         for i in range(0, len(pixel_data), 4):
             result.extend(src_view[i:i+3])  # Skip alpha channel
 
-        return bytes(result)
+        encoded = bytes(result)
+        _buffer_pool.put(result)
+        return encoded
 
     def _apply_rle(self, pixel_data: PixelData, width: int, height: int) -> bytes:
         """
@@ -439,7 +513,8 @@ class ZRLEEncoder:
         ZRLE uses a tile-based approach (64x64 tiles)
         For simplicity, this implementation works on the whole image
         """
-        result = bytearray()
+        # Use buffer pool for result
+        result = _buffer_pool.get(len(pixel_data) * 2)  # Worst case estimate
         bpp = 3  # CPIXEL format
 
         i = 0
@@ -465,7 +540,9 @@ class ZRLEEncoder:
 
             i += run_length * bpp
 
-        return bytes(result)
+        encoded = bytes(result)
+        _buffer_pool.put(result)
+        return encoded
 
 
 class EncoderManager:

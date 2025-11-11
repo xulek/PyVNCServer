@@ -3,7 +3,7 @@ Region-based change detection for efficient screen updates
 Implements intelligent dirty region tracking
 """
 
-import hashlib
+import zlib
 import logging
 from typing import NamedTuple
 from collections.abc import Iterator
@@ -61,8 +61,8 @@ class TileGrid:
         self.tiles_x = (width + tile_size - 1) // tile_size
         self.tiles_y = (height + tile_size - 1) // tile_size
 
-        # Store checksums for each tile
-        self.tile_checksums: dict[tuple[int, int], bytes] = {}
+        # Store checksums for each tile (CRC32 returns int)
+        self.tile_checksums: dict[tuple[int, int], int] = {}
 
         self.logger = logging.getLogger(__name__)
 
@@ -88,8 +88,8 @@ class TileGrid:
                     pixel_data, tx, ty, bytes_per_pixel
                 )
 
-                # Calculate checksum
-                checksum = hashlib.md5(tile_data).digest()
+                # Calculate checksum (CRC32 is 5-10x faster than MD5 for change detection)
+                checksum = zlib.crc32(tile_data)
 
                 # Compare with previous
                 key = (tx, ty)
@@ -112,21 +112,35 @@ class TileGrid:
 
     def _extract_tile(self, pixel_data: bytes, tile_x: int, tile_y: int,
                      bpp: int) -> bytes:
-        """Extract pixel data for a specific tile"""
-        result = bytearray()
-
+        """
+        Extract pixel data for a specific tile
+        Optimized with memoryview for faster slicing and reduced allocations
+        """
         # Calculate tile boundaries
         start_x = tile_x * self.tile_size
         start_y = tile_y * self.tile_size
         end_x = min(start_x + self.tile_size, self.width)
         end_y = min(start_y + self.tile_size, self.height)
 
-        # Extract tile rows
+        tile_width = (end_x - start_x) * bpp
+        tile_height = end_y - start_y
+
+        # Pre-allocate result buffer (faster than extend in loop)
+        result = bytearray(tile_width * tile_height)
+
+        # Use memoryview for zero-copy slicing
+        src_view = memoryview(pixel_data)
+        dst_offset = 0
+
+        # Extract tile rows with optimized slicing
         for y in range(start_y, end_y):
             row_offset = y * self.width * bpp
             tile_offset = row_offset + start_x * bpp
-            tile_end = row_offset + end_x * bpp
-            result.extend(pixel_data[tile_offset:tile_end])
+            tile_end = tile_offset + tile_width
+
+            # Direct memoryview slice copy (faster than extend)
+            result[dst_offset:dst_offset + tile_width] = src_view[tile_offset:tile_end]
+            dst_offset += tile_width
 
         return bytes(result)
 
@@ -237,8 +251,8 @@ class AdaptiveChangeDetector:
         # Tile-based detection for normal activity
         self.tile_grid = TileGrid(width, height, tile_size=64)
 
-        # Full-screen checksum for low activity
-        self.full_checksum: bytes | None = None
+        # Full-screen checksum for low activity (CRC32 returns int)
+        self.full_checksum: int | None = None
 
         # Activity tracking
         self.change_history: list[float] = []  # % of screen changed
@@ -258,8 +272,8 @@ class AdaptiveChangeDetector:
         Returns:
             List of changed regions, or None if full update needed
         """
-        # First, check if anything changed at all
-        current_checksum = hashlib.md5(pixel_data).digest()
+        # First, check if anything changed at all (CRC32 is much faster than MD5)
+        current_checksum = zlib.crc32(pixel_data)
 
         if self.full_checksum == current_checksum:
             # No changes at all

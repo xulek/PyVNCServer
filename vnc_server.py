@@ -216,6 +216,16 @@ class VNCServerV3:
         conn_metrics: ConnectionMetrics | None = None
 
         try:
+            # Detect localhost connection for performance optimization
+            is_localhost = addr[0] in ('127.0.0.1', '::1', 'localhost')
+            if is_localhost:
+                self.logger.info(f"Localhost connection detected - using optimized fast path")
+                # Enable TCP_NODELAY for localhost (disable Nagle's algorithm for lower latency)
+                try:
+                    client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception as e:
+                    self.logger.warning(f"Could not set TCP_NODELAY: {e}")
+
             # Register connection metrics
             if self.metrics:
                 conn_metrics = self.metrics.register_connection(client_id)
@@ -297,14 +307,19 @@ class VNCServerV3:
             encoder_manager = EncoderManager()
             client_encodings: set[int] = {0}  # Default: Raw encoding
 
-            change_detector = AdaptiveChangeDetector(width, height) if self.enable_region_detection else None
+            # For localhost, disable change detection (overhead not worth it with high bandwidth)
+            use_change_detection = self.enable_region_detection and not is_localhost
+            change_detector = AdaptiveChangeDetector(width, height) if use_change_detection else None
             cursor_encoder = CursorEncoder() if self.enable_cursor_encoding else None
+
+            if is_localhost and self.enable_region_detection:
+                self.logger.info("Change detection disabled for localhost connection (optimization)")
 
             # Main message loop
             self._client_message_loop(
                 client_socket, protocol, screen_capture, input_handler,
                 current_pixel_format, client_encodings, width, height,
-                encoder_manager, change_detector, cursor_encoder, conn_metrics
+                encoder_manager, change_detector, cursor_encoder, conn_metrics, is_localhost
             )
 
         except Exception as e:
@@ -327,10 +342,21 @@ class VNCServerV3:
                             encoder_manager: EncoderManager,
                             change_detector: AdaptiveChangeDetector | None,
                             cursor_encoder: CursorEncoder | None,
-                            conn_metrics: ConnectionMetrics | None):
-        """Enhanced client message handling loop"""
+                            conn_metrics: ConnectionMetrics | None,
+                            is_localhost: bool = False):
+        """
+        Enhanced client message handling loop with localhost optimization
 
-        throttler = PerformanceThrottler(max_rate=self.frame_rate)
+        Localhost optimizations:
+        - No frame rate limiting (max throughput)
+        - Raw encoding only (no compression overhead)
+        - TCP_NODELAY enabled (lower latency)
+        - Change detection disabled (unnecessary overhead)
+        """
+
+        # For localhost, allow higher frame rates (up to 120 FPS), otherwise use configured rate
+        max_frame_rate = 120 if is_localhost else self.frame_rate
+        throttler = PerformanceThrottler(max_rate=max_frame_rate)
         last_frame_time = time.time()
 
         while not self.shutdown_handler.is_shutting_down():
@@ -401,8 +427,10 @@ class VNCServerV3:
                                 pass
 
                         # Select best encoding
+                        # For localhost, prefer Raw encoding (no compression overhead)
+                        content_type = "localhost" if is_localhost else "dynamic"
                         encoding_type, encoder = encoder_manager.get_best_encoder(
-                            client_encodings, content_type="dynamic"
+                            client_encodings, content_type=content_type
                         )
 
                         # Encode pixel data

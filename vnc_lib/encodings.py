@@ -470,13 +470,16 @@ class EncoderManager:
 
         Args:
             client_encodings: Set of encoding types supported by client
-            content_type: Type of content ("static", "dynamic", "scrolling", "default")
+            content_type: Type of content ("static", "dynamic", "scrolling", "localhost", "default")
 
         Returns:
             (encoding_type, encoder) tuple
         """
         # Preferred order based on content type using pattern matching (Python 3.13)
         match content_type:
+            case "localhost":
+                # For localhost connections, prefer Raw (no compression overhead, maximum speed)
+                preference_order = [0]  # Raw only - compression is unnecessary overhead for localhost
             case "static":
                 # For static content, prefer compression
                 preference_order = [16, 5, 2, 0]  # ZRLE, Hextile, RRE, Raw

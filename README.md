@@ -73,7 +73,13 @@ python vnc_server.py
 
 # Connect with any VNC client
 vncviewer localhost:5900
+
+# Or use the bundled browser client
+python -m http.server 8000   # serve ./web assets (required for ES modules)
+# then open http://localhost:8000/web/vnc_client.html
 ```
+
+The web client includes FPS/bandwidth stats plus a **View only** toggle so you can monitor sessions without sending keyboard/mouse input.
 
 ### Configuration
 

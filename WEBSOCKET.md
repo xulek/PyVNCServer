@@ -25,12 +25,27 @@ WebSocket will listen on port 5900 (same as VNC).
 
 ### 3. Connect with Browser
 
-Open [web/vnc_client.html](web/vnc_client.html) in your browser, or use noVNC:
+Use the bundled noVNC wrapper (recommended for quick testing):
+
+```bash
+# from repo root
+python -m http.server 8000
+# open http://localhost:8000/web/vnc_client.html
+```
+
+The page pulls in `web/noVNC` via ES modules, so serve it over HTTP—not `file://`.
+
+Highlights:
+- Responsive viewer where the framebuffer canvas always fills the panel.
+- Status banner + FPS/Bandwidth/Encoding stats.
+- Built-in **View only** toggle so you can monitor sessions without sending input.
+
+Prefer the upstream UI? Clone noVNC and open `vnc.html` as usual:
 
 ```bash
 git clone https://github.com/novnc/noVNC.git
 cd noVNC
-# Open vnc.html in browser
+# open vnc.html in browser
 ```
 
 ### 4. Connect to Server
@@ -44,6 +59,7 @@ cd noVNC
 ✅ **No Proxy Needed** - Direct WebSocket support built-in
 ✅ **Auto-Detection** - Same port handles VNC and WebSocket
 ✅ **noVNC Compatible** - Works with standard noVNC client
+✅ **Built-in Browser Client** - Modern UI with view-only toggle & stats
 ✅ **High Performance** - 20-100x compression with Tight encoding
 ✅ **RFC 6455 Compliant** - Standard WebSocket protocol
 

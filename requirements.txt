@@ -1,8 +1,19 @@
 # Core dependencies
-mss>=9.0.0  # High-performance screen capture (recommended)
-Pillow>=10.0.0  # Fallback for screen capture and image processing
-pyautogui>=0.9.54
-pycryptodome>=3.19.0
+mss>=9.0.0  # High-performance screen capture (3-5x faster than PIL)
+Pillow>=10.0.0  # Image processing and JPEG encoding
+pyautogui>=0.9.54  # Input simulation
+pycryptodome>=3.19.0  # VNC authentication
+numpy>=1.24.0  # Required for H.264 encoding
+
+# Advanced encoding dependencies (optional but recommended)
+# Tight encoding: Built-in (no additional dependencies)
+# JPEG encoding: Uses Pillow (already included above)
+
+# H.264 video encoding (optional - for video streaming)
+# Uncomment to enable H.264 support (set enable_h264_encoding: true in config.json)
+# av>=10.0.0  # PyAV for H.264 encoding (requires FFmpeg libraries)
+# Installation: pip install av
+# Note: May require system FFmpeg installation on some platforms
 
 # Testing (optional)
 pytest>=7.4.0

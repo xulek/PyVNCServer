@@ -27,9 +27,15 @@ class RFBProtocol:
     ENCODING_COPYRECT = 1
     ENCODING_RRE = 2
     ENCODING_HEXTILE = 5
+    ENCODING_TIGHT = 7          # Tight encoding (TightVNC extension)
     ENCODING_ZRLE = 16
+    ENCODING_H264 = 50          # H.264 video encoding (custom extension)
+
+    # Pseudo-encodings
     ENCODING_CURSOR = -239
     ENCODING_DESKTOP_SIZE = -223
+    ENCODING_JPEG_QUALITY_LOW = -23   # JPEG quality level 0-9 (pseudo-encoding base -23 to -32)
+    ENCODING_JPEG_QUALITY_HIGH = -32
 
     # Message types - Client to Server (RFC 6143 Section 7.5)
     MSG_SET_PIXEL_FORMAT = 0

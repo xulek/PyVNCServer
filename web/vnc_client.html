@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PyVNCServer - Browser Client</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 1rem 2rem;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .header h1 {
+            color: #333;
+            font-size: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .header .status {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #ccc;
+            animation: pulse 2s infinite;
+        }
+
+        .header .status.connected {
+            background: #22c55e;
+        }
+
+        .header .status.connecting {
+            background: #f59e0b;
+        }
+
+        .header .status.disconnected {
+            background: #ef4444;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 2rem;
+            gap: 1rem;
+        }
+
+        .control-panel {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 1.5rem;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        .form-group {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .form-control {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        label {
+            font-weight: 600;
+            color: #555;
+            font-size: 0.9rem;
+        }
+
+        input[type="text"],
+        input[type="password"],
+        input[type="number"] {
+            padding: 0.75rem;
+            border: 2px solid #e5e7eb;
+            border-radius: 6px;
+            font-size: 1rem;
+            transition: border-color 0.3s;
+        }
+
+        input[type="text"]:focus,
+        input[type="password"]:focus,
+        input[type="number"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .btn {
+            padding: 0.75rem 2rem;
+            border: none;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-danger {
+            background: #ef4444;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.4);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+
+        .viewer-container {
+            flex: 1;
+            background: rgba(0, 0, 0, 0.8);
+            border-radius: 10px;
+            overflow: hidden;
+            position: relative;
+            min-height: 600px;
+            display: flex;
+            align-items: stretch;
+            justify-content: stretch;
+        }
+
+        #vnc-screen {
+            flex: 1;
+            display: flex;
+            position: relative;
+            width: 100%;
+            min-height: 0;
+        }
+
+        #vnc-screen canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: contain;
+            background: black;
+        }
+
+        .stats {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 1rem;
+            border-radius: 10px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #667eea;
+        }
+
+        .stat-label {
+            font-size: 0.8rem;
+            color: #666;
+            text-transform: uppercase;
+        }
+
+        .message {
+            padding: 1rem;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+            display: none;
+        }
+
+        .message.show {
+            display: block;
+        }
+
+        .message.error {
+            background: #fee;
+            color: #c00;
+            border: 1px solid #fcc;
+        }
+
+        .message.info {
+            background: #e7f3ff;
+            color: #0066cc;
+            border: 1px solid #b3d9ff;
+        }
+
+        .message.success {
+            background: #efe;
+            color: #060;
+            border: 1px solid #cfc;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            color: white;
+            font-size: 1.2rem;
+        }
+
+        .checkbox-inline {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 600;
+            color: #555;
+        }
+
+        .checkbox-inline input {
+            width: 18px;
+            height: 18px;
+        }
+
+        .loading.show {
+            display: block;
+        }
+
+        .spinner {
+            border: 4px solid rgba(255,255,255,0.3);
+            border-top: 4px solid white;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 1rem;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>
+            <span class="status" id="status-indicator"></span>
+            PyVNCServer - Web Client
+        </h1>
+    </div>
+
+    <div class="container">
+        <div class="control-panel">
+            <div id="message" class="message"></div>
+
+            <div class="form-group">
+                <div class="form-control">
+                    <label for="host">Server Host</label>
+                    <input type="text" id="host" value="localhost" placeholder="localhost or IP">
+                </div>
+                <div class="form-control">
+                    <label for="port">Port</label>
+                    <input type="number" id="port" value="5900" placeholder="5900">
+                </div>
+                <div class="form-control">
+                    <label for="password">Password (optional)</label>
+                    <input type="password" id="password" placeholder="Leave blank if none">
+                </div>
+                <div class="form-control">
+                    <label for="view-only">Interaction</label>
+                    <label class="checkbox-inline">
+                        <input type="checkbox" id="view-only">
+                        View only (disable mouse/keyboard)
+                    </label>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 1rem;">
+                <button id="connect-btn" class="btn btn-primary" onclick="connect()">
+                    Connect
+                </button>
+                <button id="disconnect-btn" class="btn btn-danger" onclick="disconnect()" disabled>
+                    Disconnect
+                </button>
+            </div>
+        </div>
+
+        <div class="viewer-container">
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <div>Connecting to VNC server...</div>
+            </div>
+            <!-- noVNC will render into this container -->
+            <div id="vnc-screen"></div>
+        </div>
+
+        <div class="stats">
+            <div class="stat-item">
+                <div class="stat-value" id="fps">0</div>
+                <div class="stat-label">FPS</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="bandwidth">0</div>
+                <div class="stat-label">KB/s</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="resolution">-</div>
+                <div class="stat-label">Resolution</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="encoding">-</div>
+                <div class="stat-label">Encoding</div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        // Browser VNC client powered by noVNC.
+        //
+        // Usage:
+        // - Place noVNC in a subdirectory: web/noVNC (so that
+        //   web/noVNC/core/rfb.js exists), OR adjust the import path below.
+        // - Then open this HTML file in a browser and connect.
+
+        import RFB from './noVNC/core/rfb.js';
+
+        let rfb = null;
+        let frameCount = 0;
+        let bytesReceived = 0;
+        let lastStatsUpdate = Date.now();
+        let desktopName = '';
+        const viewOnlyToggle = document.getElementById('view-only');
+
+        function showMessage(msg, type = 'info') {
+            const msgEl = document.getElementById('message');
+            msgEl.textContent = msg;
+            msgEl.className = `message show ${type}`;
+            setTimeout(() => {
+                msgEl.className = 'message';
+            }, 5000);
+        }
+
+        function updateStatus(status) {
+            const indicator = document.getElementById('status-indicator');
+            indicator.className = `status ${status}`;
+        }
+
+        function connect() {
+            const host = document.getElementById('host').value;
+            const port = document.getElementById('port').value;
+            const password = document.getElementById('password').value;
+            const viewOnly = viewOnlyToggle.checked;
+
+            document.getElementById('loading').className = 'loading show';
+            document.getElementById('connect-btn').disabled = true;
+            updateStatus('connecting');
+
+            try {
+                const url = `ws://${host}:${port}`;
+                const target = document.getElementById('vnc-screen');
+
+                // Dispose old connection if any
+                if (rfb) {
+                    rfb.disconnect();
+                    rfb = null;
+                }
+
+                // Creating a new RFB object will start a new connection
+                rfb = new RFB(target, url, {
+                    credentials: { password: password }
+                });
+
+                rfb.viewOnly = viewOnly;
+                // Configure display
+                rfb.scaleViewport = true;
+                rfb.resizeSession = false;
+
+                // Event handlers
+                rfb.addEventListener('connect', () => {
+                    showMessage('Connected to ' + (desktopName || 'VNC server'), 'success');
+                    updateStatus('connected');
+                    document.getElementById('disconnect-btn').disabled = false;
+                    document.getElementById('loading').className = 'loading';
+                    frameCount = 0;
+                    bytesReceived = 0;
+                    lastStatsUpdate = Date.now();
+                });
+
+                rfb.addEventListener('disconnect', (e) => {
+                    const clean = e.detail.clean;
+                    const reason = clean ? 'Disconnected' : 'Connection error';
+                    showMessage(reason, clean ? 'info' : 'error');
+                    updateStatus('disconnected');
+                    document.getElementById('disconnect-btn').disabled = true;
+                    document.getElementById('connect-btn').disabled = false;
+                    document.getElementById('loading').className = 'loading';
+                });
+
+                rfb.addEventListener('credentialsrequired', () => {
+                    const pwd = prompt('Password required:');
+                    if (pwd) {
+                        rfb.sendCredentials({ password: pwd });
+                    } else {
+                        rfb.disconnect();
+                    }
+                });
+
+                rfb.addEventListener('desktopname', (e) => {
+                    desktopName = e.detail.name;
+                    const resolution = `${rfb._fbWidth}x${rfb._fbHeight}`;
+                    document.getElementById('resolution').textContent = resolution;
+                });
+
+                // Track stats
+                rfb.addEventListener('fbupdated', () => {
+                    frameCount++;
+                    updateStats();
+                });
+
+            } catch (error) {
+                showMessage('Failed to connect: ' + error.message, 'error');
+                updateStatus('disconnected');
+                document.getElementById('loading').className = 'loading';
+                document.getElementById('connect-btn').disabled = false;
+            }
+        }
+
+        function disconnect() {
+            if (rfb) {
+                rfb.disconnect();
+                rfb = null;
+            }
+        }
+
+        function handleViewOnlyToggle(event) {
+            if (rfb) {
+                rfb.viewOnly = event.target.checked;
+                showMessage(
+                    event.target.checked
+                        ? 'View-only mode enabled'
+                        : 'View-only mode disabled',
+                    'info'
+                );
+            }
+        }
+
+        function updateStats() {
+            const now = Date.now();
+            const elapsed = (now - lastStatsUpdate) / 1000;
+
+            if (elapsed >= 1.0) {
+                const fps = frameCount / elapsed;
+
+                document.getElementById('fps').textContent = fps.toFixed(1);
+
+                // Update encoding info if available
+                if (rfb && rfb._fbDepth) {
+                    document.getElementById('encoding').textContent = 'Raw';
+                }
+
+                frameCount = 0;
+                bytesReceived = 0;
+                lastStatsUpdate = now;
+            }
+        }
+
+        // Initialize status indicator
+        window.onload = () => {
+            updateStatus('disconnected');
+            viewOnlyToggle.addEventListener('change', handleViewOnlyToggle);
+        };
+
+        // Expose functions globally so inline onclick handlers work.
+        window.connect = connect;
+        window.disconnect = disconnect;
+    </script>
+
+    <div style="text-align: center; padding: 2rem; color: white;">
+        <p><strong>Note:</strong> This is a simplified demo client. For production use, integrate with
+        <a href="https://github.com/novnc/noVNC" target="_blank" style="color: #fbbf24;">noVNC library</a>
+        for full VNC protocol support.</p>
+        <p style="margin-top: 1rem;">
+            PyVNCServer with WebSocket support enables browser-based remote desktop access!
+        </p>
+    </div>
+</body>
+</html>

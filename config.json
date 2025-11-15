@@ -1,5 +1,5 @@
 {
-  "_comment": "VNC Server v3.0 Configuration",
+  "_comment": "VNC Server v3.0 Configuration - Enhanced with Advanced Encodings",
 
   "host": "0.0.0.0",
   "port": 5900,
@@ -13,15 +13,41 @@
   "enable_cursor_encoding": false,
   "enable_metrics": true,
 
+  "_advanced_encodings": "New high-performance encoding options (experimental - test before production use)",
+  "enable_tight_encoding": true,
+  "tight_disable_for_ultravnc": true,
+  "enable_jpeg_encoding": false,
+  "enable_h264_encoding": false,
+
+  "_parallel_encoding": "Multi-threaded encoding for better CPU utilization",
+  "enable_parallel_encoding": true,
+  "encoding_threads": null,
+
+  "_websocket_support": "Browser-based VNC access with noVNC",
+  "enable_websocket": false,
+
   "log_level": "INFO",
   "log_file": null,
 
   "_performance_notes": {
-    "frame_rate": "1-60 FPS, higher = smoother but more CPU/bandwidth",
+    "frame_rate": "1-60 FPS (localhost: up to 120 FPS), higher = smoother but more CPU/bandwidth",
     "scale_factor": "0.1-2.0, lower = smaller resolution, less bandwidth",
-    "enable_region_detection": "Reduces bandwidth for incremental updates",
-    "enable_metrics": "Enables performance monitoring and statistics"
+    "enable_region_detection": "Reduces bandwidth for incremental updates (auto-disabled for localhost)",
+    "enable_metrics": "Enables performance monitoring and statistics",
+    "enable_tight_encoding": "20-100x compression (experimental - may have issues with some clients)",
+    "enable_jpeg_encoding": "50-200x compression for photos/video (experimental, requires testing)",
+    "enable_h264_encoding": "50-500x compression for video streaming (experimental, requires PyAV)",
+    "enable_parallel_encoding": "2-4x faster encoding on multi-core CPUs",
+    "encoding_threads": "null = auto-detect (CPU count - 1), or specify number",
+    "enable_websocket": "Enable browser-based access via noVNC (disabled by default, set to true to enable)"
   },
 
-  "_encoding_priority": "ZRLE > Hextile > RRE > Raw (auto-selected based on client)"
+  "_encoding_priority": "Tight > ZRLE > Hextile > RRE > CopyRect > Raw (auto-selected based on client and content)",
+
+  "_bandwidth_optimization": {
+    "low_bandwidth": "Use Tight encoding with JPEG for photos",
+    "medium_bandwidth": "Use Tight encoding for all content",
+    "high_bandwidth_localhost": "Auto-optimized: Raw encoding, no change detection, high frame rate",
+    "video_streaming": "Enable H.264 encoding for best quality/bandwidth ratio"
+  }
 }

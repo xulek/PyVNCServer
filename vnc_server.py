@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 from vnc_lib.protocol import RFBProtocol
-from vnc_lib.auth import VNCAuth, NoAuth
+from vnc_lib.auth import VNCAuth
 from vnc_lib.input_handler import InputHandler
 from vnc_lib.screen_capture import ScreenCapture
 from vnc_lib.encodings import EncoderManager
@@ -24,7 +24,7 @@ from vnc_lib.server_utils import (
 )
 from vnc_lib.exceptions import (
     VNCError, ProtocolError, AuthenticationError, ConnectionError,
-    MultiClientError, ExceptionCollector, categorize_exceptions
+    ExceptionCollector, categorize_exceptions
 )
 
 
@@ -178,6 +178,26 @@ class VNCServerV3:
 
                     self.logger.info(f"New connection from {addr}")
 
+                    # Check if WebSocket connection
+                    enable_websocket = self.config.get('enable_websocket', True)
+                    if enable_websocket:
+                        try:
+                            from vnc_lib.websocket_wrapper import is_websocket_request, WebSocketVNCAdapter
+
+                            if is_websocket_request(client_socket):
+                                self.logger.info(f"WebSocket connection detected from {addr}")
+                                try:
+                                    # Wrap socket with WebSocket adapter
+                                    client_socket = WebSocketVNCAdapter(client_socket)
+                                except Exception as e:
+                                    self.logger.error(f"WebSocket handshake failed: {e}")
+                                    client_socket.close()
+                                    self.connection_pool.release(client_id)
+                                    continue
+                        except Exception as e:
+                            # If WebSocket detection fails, just continue with regular VNC
+                            self.logger.debug(f"WebSocket detection error (continuing with VNC): {e}")
+
                     # Handle in separate thread
                     thread = threading.Thread(
                         target=self._handle_client_wrapper,
@@ -219,7 +239,7 @@ class VNCServerV3:
             # Detect localhost connection for performance optimization
             is_localhost = addr[0] in ('127.0.0.1', '::1', 'localhost')
             if is_localhost:
-                self.logger.info(f"Localhost connection detected - using optimized fast path")
+                self.logger.info("Localhost connection detected - using optimized fast path")
                 # Enable TCP_NODELAY for localhost (disable Nagle's algorithm for lower latency)
                 try:
                     client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -230,7 +250,21 @@ class VNCServerV3:
             if self.metrics:
                 conn_metrics = self.metrics.register_connection(client_id)
 
-            # Initialize protocol handler
+            # Optional WebSocket support (for browser/noVNC clients)
+            if self.config.get('enable_websocket', False):
+                try:
+                    from vnc_lib.websocket_wrapper import (
+                        is_websocket_request,
+                        WebSocketVNCAdapter,
+                    )
+                    if is_websocket_request(client_socket):
+                        self.logger.info("WebSocket handshake detected; wrapping client socket")
+                        client_socket = WebSocketVNCAdapter(client_socket)
+                except Exception as e:
+                    self.logger.error(f"WebSocket setup failed: {e}")
+                    return
+
+            # Initialize protocol handler (raw TCP or WebSocket-adapted)
             protocol = RFBProtocol()
 
             # Step 1: Protocol Version Handshake
@@ -304,13 +338,36 @@ class VNCServerV3:
             )
 
             # Initialize encoders and change detection
-            encoder_manager = EncoderManager()
+            # Enable advanced encodings from config
+            enable_tight = self.config.get('enable_tight_encoding', True)
+            enable_jpeg = self.config.get('enable_jpeg_encoding', True)
+            enable_h264 = self.config.get('enable_h264_encoding', False)
+            disable_tight_for_ultravnc = self.config.get('tight_disable_for_ultravnc', True)
+
+            encoder_manager = EncoderManager(
+                enable_tight=enable_tight,
+                enable_jpeg=enable_jpeg,
+                enable_h264=enable_h264,
+                disable_tight_for_ultravnc=disable_tight_for_ultravnc,
+            )
             client_encodings: set[int] = {0}  # Default: Raw encoding
 
             # For localhost, disable change detection (overhead not worth it with high bandwidth)
             use_change_detection = self.enable_region_detection and not is_localhost
             change_detector = AdaptiveChangeDetector(width, height) if use_change_detection else None
             cursor_encoder = CursorEncoder() if self.enable_cursor_encoding else None
+
+            # Initialize parallel encoder for multi-threaded encoding
+            use_parallel = self.config.get('enable_parallel_encoding', True)
+            parallel_encoder = None
+            if use_parallel:
+                try:
+                    from vnc_lib.parallel_encoder import ParallelEncoder
+                    max_workers = self.config.get('encoding_threads', None)
+                    parallel_encoder = ParallelEncoder(max_workers=max_workers)
+                    self.logger.info(f"Parallel encoding enabled with {parallel_encoder.max_workers} workers")
+                except ImportError as e:
+                    self.logger.warning(f"Parallel encoding unavailable: {e}")
 
             if is_localhost and self.enable_region_detection:
                 self.logger.info("Change detection disabled for localhost connection (optimization)")
@@ -319,7 +376,8 @@ class VNCServerV3:
             self._client_message_loop(
                 client_socket, protocol, screen_capture, input_handler,
                 current_pixel_format, client_encodings, width, height,
-                encoder_manager, change_detector, cursor_encoder, conn_metrics, is_localhost
+                encoder_manager, change_detector, cursor_encoder, conn_metrics,
+                is_localhost, parallel_encoder
             )
 
         except Exception as e:
@@ -343,7 +401,8 @@ class VNCServerV3:
                             change_detector: AdaptiveChangeDetector | None,
                             cursor_encoder: CursorEncoder | None,
                             conn_metrics: ConnectionMetrics | None,
-                            is_localhost: bool = False):
+                            is_localhost: bool = False,
+                            parallel_encoder = None):
         """
         Enhanced client message handling loop with localhost optimization
 
@@ -421,29 +480,72 @@ class VNCServerV3:
                                 protocol.send_framebuffer_update(client_socket, [])
                                 continue
 
-                            # Send region updates if available
-                            if changed_regions is not None and len(changed_regions) < 10:
-                                # TODO: Implement region-based encoding
-                                pass
+                            # Send region updates if available using parallel encoding
+                            if changed_regions is not None and len(changed_regions) < 10 and parallel_encoder:
+                                # Use parallel encoding for changed regions
+                                bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
+                                content_type = "localhost" if is_localhost else "dynamic"
+
+                                # Prepare regions for parallel encoding
+                                regions_to_encode = []
+                                for x, y, w, h in changed_regions:
+                                    # Extract region pixel data
+                                    region_data = self._extract_region(
+                                        result.pixel_data, fb_width, fb_height,
+                                        x, y, w, h, bytes_per_pixel
+                                    )
+                                    encoding_type, encoder = encoder_manager.get_best_encoder(
+                                        client_encodings, content_type=content_type
+                                    )
+                                    regions_to_encode.append(((x, y, w, h), region_data, encoding_type, encoder))
+
+                                # Encode regions in parallel
+                                encoded_results = parallel_encoder.encode_regions(regions_to_encode, bytes_per_pixel)
+
+                                # Build rectangles from results
+                                rectangles = [
+                                    (r.x, r.y, r.width, r.height, r.encoding_type, r.encoded_data)
+                                    for r in encoded_results
+                                ]
+
+                                protocol.send_framebuffer_update(client_socket, rectangles)
+
+                                # Record metrics
+                                if conn_metrics:
+                                    encoding_time = time.perf_counter() - start_time
+                                    total_bytes = sum(r.original_size for r in encoded_results)
+                                    compressed_bytes = sum(r.compressed_size for r in encoded_results)
+                                    conn_metrics.record_frame(encoding_time, total_bytes, compressed_bytes)
+
+                                continue
 
                         # Select best encoding
-                        # For localhost, prefer Raw encoding (no compression overhead)
-                        content_type = "localhost" if is_localhost else "dynamic"
+                        # TESTING: Force Tight encoding to debug the issue
+                        content_type = "dynamic"  # Force Tight encoding even for localhost
+                        # Was: content_type = "localhost" if is_localhost else "dynamic"
                         encoding_type, encoder = encoder_manager.get_best_encoder(
                             client_encodings, content_type=content_type
                         )
 
-                        # Encode pixel data
+                        self.logger.info(f"Selected encoding: {encoding_type} for content type: {content_type}")
+
+                        # Encode pixel data (single-threaded for full frame)
                         bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
+                        self.logger.info(f"Encoding frame: {fb_width}x{fb_height}, bpp={bytes_per_pixel}, data_size={len(result.pixel_data)}")
+
                         encoded_data = encoder.encode(
                             result.pixel_data, fb_width, fb_height, bytes_per_pixel
                         )
+
+                        self.logger.info(f"Encoded data size: {len(encoded_data)} bytes")
 
                         # Send framebuffer update
                         rectangles = [
                             (0, 0, fb_width, fb_height, encoding_type, encoded_data)
                         ]
+                        self.logger.info(f"Sending framebuffer update with {len(rectangles)} rectangle(s)")
                         protocol.send_framebuffer_update(client_socket, rectangles)
+                        self.logger.info("Framebuffer update sent successfully")
 
                         # Record metrics
                         if conn_metrics:
@@ -534,6 +636,20 @@ class VNCServerV3:
                 # Re-raise if any critical errors
                 if "ProtocolError" in categories or "ConnectionError" in categories:
                     raise exc_group
+
+    def _extract_region(self, pixel_data: bytes, fb_width: int, fb_height: int,
+                       x: int, y: int, width: int, height: int,
+                       bytes_per_pixel: int) -> bytes:
+        """Extract a rectangular region from framebuffer"""
+        result = bytearray()
+        for row in range(height):
+            src_y = y + row
+            if src_y >= fb_height:
+                break
+            src_offset = (src_y * fb_width + x) * bytes_per_pixel
+            row_data = pixel_data[src_offset:src_offset + width * bytes_per_pixel]
+            result.extend(row_data)
+        return bytes(result)
 
     def _cleanup(self):
         """Cleanup server resources"""

@@ -453,7 +453,8 @@ class EncoderManager:
     and content analysis (Python 3.13 style)
     """
 
-    def __init__(self):
+    def __init__(self, enable_tight: bool = True, enable_h264: bool = False,
+                 enable_jpeg: bool = True, disable_tight_for_ultravnc: bool = True):
         self.encoders: dict[int, Encoder] = {
             0: RawEncoder(),
             1: CopyRectEncoder(),  # CopyRect for scrolling/movement
@@ -461,7 +462,43 @@ class EncoderManager:
             5: HextileEncoder(),
             16: ZRLEEncoder(),
         }
-        self.logger = logging.getLogger(__name__)
+
+        # Add advanced encoders if enabled
+        if enable_tight:
+            try:
+                from vnc_lib.tight_encoding import TightEncoder
+                self.encoders[7] = TightEncoder()
+                self.logger = logging.getLogger(__name__)
+                self.logger.info("Tight encoding enabled")
+            except ImportError as e:
+                self.logger = logging.getLogger(__name__)
+                self.logger.warning(f"Tight encoding unavailable: {e}")
+
+        if enable_jpeg:
+            try:
+                from vnc_lib.jpeg_encoding import JPEGEncoder
+                self.encoders[21] = JPEGEncoder()
+                self.logger.info("JPEG encoding enabled")
+            except ImportError as e:
+                if not hasattr(self, 'logger'):
+                    self.logger = logging.getLogger(__name__)
+                self.logger.warning(f"JPEG encoding unavailable (PIL needed): {e}")
+
+        if enable_h264:
+            try:
+                # H.264 is managed separately per-client
+                self.logger.info("H.264 encoding enabled (per-client initialization)")
+            except Exception as e:
+                if not hasattr(self, 'logger'):
+                    self.logger = logging.getLogger(__name__)
+                self.logger.warning(f"H.264 encoding unavailable: {e}")
+
+        if not hasattr(self, 'logger'):
+            self.logger = logging.getLogger(__name__)
+
+        # Internal flag to avoid logging the same UltraVNC notice repeatedly
+        self._tight_disabled_for_ultravnc_logged = False
+        self._disable_tight_for_ultravnc = disable_tight_for_ultravnc
 
     def get_best_encoder(self, client_encodings: set[int],
                         content_type: str = "default") -> tuple[int, Encoder]:
@@ -475,23 +512,46 @@ class EncoderManager:
         Returns:
             (encoding_type, encoder) tuple
         """
+        # Detect UltraVNC-style clients: they advertise Ultra (9) and/or TRLE (10)
+        # encodings, which typical Tight/TigerVNC viewers do not.
+        is_ultravnc_client = 9 in client_encodings or 10 in client_encodings
+
         # Preferred order based on content type using pattern matching (Python 3.13)
         match content_type:
             case "localhost":
-                # For localhost connections, prefer Raw (no compression overhead, maximum speed)
-                preference_order = [0]  # Raw only - compression is unnecessary overhead for localhost
+                # For localhost connections, prefer Raw (maximum speed, no compression overhead)
+                preference_order = [0]  # Raw only - compression unnecessary for localhost
             case "static":
                 # For static content, prefer compression
-                preference_order = [16, 5, 2, 0]  # ZRLE, Hextile, RRE, Raw
+                preference_order = [7, 16, 5, 2, 0]  # Tight, ZRLE, Hextile, RRE, Raw
             case "dynamic":
-                # For dynamic content, prefer speed
-                preference_order = [5, 2, 0, 16]  # Hextile, RRE, Raw, ZRLE
+                # For dynamic content, prefer speed with good compression
+                preference_order = [7, 5, 2, 16, 0]  # Tight, Hextile, RRE, ZRLE, Raw
             case "scrolling":
-                # For scrolling, try CopyRect first
-                preference_order = [1, 5, 2, 16, 0]  # CopyRect, Hextile, RRE, ZRLE, Raw
+                # For scrolling, try CopyRect first, then Tight
+                preference_order = [1, 7, 5, 2, 16, 0]  # CopyRect, Tight, Hextile, RRE, ZRLE, Raw
+            case "video":
+                # For video/photos, prefer JPEG or H.264
+                preference_order = [50, 21, 7, 16, 0]  # H.264, JPEG, Tight, ZRLE, Raw
+            case "photo":
+                # For photographic content, prefer JPEG
+                preference_order = [21, 7, 16, 0]  # JPEG, Tight, ZRLE, Raw
             case _:
-                # Default: balanced
-                preference_order = [16, 5, 2, 1, 0]
+                # Default: balanced (Tight is best overall)
+                preference_order = [7, 16, 5, 2, 1, 0]  # Tight, ZRLE, Hextile, RRE, CopyRect, Raw
+
+        # For UltraVNC viewers, Tight encoding is currently unstable/buggy on the
+        # client side even though our implementation passes TigerVNC and LibVNC
+        # clients. To maximize compatibility, we can optionally disable Tight for
+        # such clients (configurable via tight_disable_for_ultravnc).
+        if self._disable_tight_for_ultravnc and is_ultravnc_client and 7 in self.encoders:
+            preference_order = [enc for enc in preference_order if enc != 7]
+            if not self._tight_disabled_for_ultravnc_logged:
+                self.logger.info(
+                    "Detected UltraVNC-like client (encodings include 9/10); "
+                    "disabling Tight encoding for compatibility"
+                )
+                self._tight_disabled_for_ultravnc_logged = True
 
         # Find first available encoder
         for enc_type in preference_order:

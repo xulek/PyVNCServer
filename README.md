@@ -108,6 +108,7 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `network_profile_override` | `null \| "localhost" \| "lan" \| "wan"` | Forces profile, bypasses auto-detection |
 | `scale_factor` | `float` | Capture scaling factor |
 | `max_connections` | `int` | Max simultaneous clients |
+| `client_socket_timeout` | `float` | Per-client read timeout in seconds |
 | `enable_region_detection` | `bool` | Incremental update optimization |
 | `enable_cursor_encoding` | `bool` | Cursor pseudo-encoding support |
 | `enable_metrics` | `bool` | Internal metrics collection |
@@ -118,6 +119,12 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `enable_parallel_encoding` | `bool` | Parallel region encoding |
 | `encoding_threads` | `int \| null` | Worker count for parallel encoding |
 | `enable_websocket` | `bool` | WebSocket transport support |
+| `websocket_detect_timeout` | `float` | Timeout for WebSocket request detection |
+| `websocket_max_handshake_bytes` | `int` | Max HTTP upgrade header size |
+| `websocket_max_payload_bytes` | `int` | Max inbound WebSocket frame payload size |
+| `websocket_max_buffer_bytes` | `int` | Max adapter receive buffer size |
+| `max_set_encodings` | `int` | Max SetEncodings items accepted from client |
+| `max_client_cut_text` | `int` | Max ClientCutText payload accepted from client |
 | `log_level` | `str` | Python logging level |
 | `log_file` | `str \| null` | Optional file logging target |
 

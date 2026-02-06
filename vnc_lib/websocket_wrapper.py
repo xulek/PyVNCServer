@@ -38,8 +38,12 @@ class WebSocketWrapper:
     """
 
     MAGIC_STRING = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # RFC 6455
+    DEFAULT_MAX_HANDSHAKE_BYTES = 64 * 1024  # 64 KiB
+    DEFAULT_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024  # 8 MiB
 
-    def __init__(self, client_socket: socket.socket):
+    def __init__(self, client_socket: socket.socket,
+                 max_handshake_bytes: int = DEFAULT_MAX_HANDSHAKE_BYTES,
+                 max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES):
         """
         Initialize WebSocket wrapper
 
@@ -49,6 +53,8 @@ class WebSocketWrapper:
         self.socket = client_socket
         self.handshake_complete = False
         self.logger = logging.getLogger(__name__)
+        self.max_handshake_bytes = max(1024, int(max_handshake_bytes))
+        self.max_payload_bytes = max(1024, int(max_payload_bytes))
 
     def do_handshake(self) -> bool:
         """
@@ -59,15 +65,25 @@ class WebSocketWrapper:
         """
         try:
             # Read HTTP request
-            request = b""
+            request = bytearray()
             while b"\r\n\r\n" not in request:
                 chunk = self.socket.recv(4096)
                 if not chunk:
                     return False
-                request += chunk
+                request.extend(chunk)
+                if len(request) > self.max_handshake_bytes:
+                    self.logger.warning(
+                        f"WebSocket handshake exceeds max header size: "
+                        f"{len(request)} > {self.max_handshake_bytes}"
+                    )
+                    return False
 
             # Parse request
-            request_str = request.decode('utf-8', errors='ignore')
+            request_str = bytes(request).decode('utf-8', errors='ignore')
+            request_line = request_str.split('\r\n', 1)[0]
+            if not self._validate_request_line(request_line):
+                self.logger.warning(f"Invalid WebSocket request line: {request_line!r}")
+                return False
             headers = self._parse_headers(request_str)
 
             # Validate WebSocket request
@@ -119,6 +135,14 @@ class WebSocketWrapper:
             self.logger.error(f"WebSocket handshake failed: {e}")
             return False
 
+    def _validate_request_line(self, request_line: str) -> bool:
+        """Validate HTTP request line for WebSocket upgrade."""
+        parts = request_line.split()
+        if len(parts) < 3:
+            return False
+        method, _path, version = parts[0], parts[1], parts[2]
+        return method.upper() == 'GET' and version.upper().startswith('HTTP/')
+
     def _parse_headers(self, request: str) -> dict[str, str]:
         """Parse HTTP headers from request"""
         headers = {}
@@ -147,6 +171,13 @@ class WebSocketWrapper:
         if 'sec-websocket-key' not in headers:
             return False
 
+        # RFC 6455 requires version 13. Keep compatibility with clients
+        # that omit the header, but reject explicitly unsupported versions.
+        version = headers.get('sec-websocket-version')
+        if version and version.strip() != '13':
+            self.logger.warning(f"Unsupported Sec-WebSocket-Version: {version}")
+            return False
+
         return True
 
     def _calculate_accept_key(self, ws_key: str) -> str:
@@ -172,7 +203,7 @@ class WebSocketWrapper:
         try:
             # Read frame header
             header = self._recv_exact(2)
-            if not header:
+            if header is None:
                 return None
 
             # Parse frame
@@ -193,25 +224,31 @@ class WebSocketWrapper:
             # Extended payload length
             if payload_len == 126:
                 ext_len = self._recv_exact(2)
-                if not ext_len:
+                if ext_len is None:
                     return None
                 payload_len = struct.unpack(">H", ext_len)[0]
             elif payload_len == 127:
                 ext_len = self._recv_exact(8)
-                if not ext_len:
+                if ext_len is None:
                     return None
                 payload_len = struct.unpack(">Q", ext_len)[0]
+
+            if payload_len > self.max_payload_bytes:
+                self.logger.warning(
+                    f"WebSocket payload too large: {payload_len} > {self.max_payload_bytes}"
+                )
+                return None
 
             # Read masking key
             masking_key = None
             if masked:
                 masking_key = self._recv_exact(4)
-                if not masking_key:
+                if masking_key is None:
                     return None
 
             # Read payload
             payload = self._recv_exact(payload_len)
-            if not payload:
+            if payload is None:
                 return None
 
             # Unmask if needed
@@ -354,7 +391,10 @@ class WebSocketVNCAdapter:
     Provides same interface as regular socket for transparent integration
     """
 
-    def __init__(self, client_socket: socket.socket, do_handshake: bool = True):
+    def __init__(self, client_socket: socket.socket, do_handshake: bool = True,
+                 max_handshake_bytes: int = WebSocketWrapper.DEFAULT_MAX_HANDSHAKE_BYTES,
+                 max_payload_bytes: int = WebSocketWrapper.DEFAULT_MAX_PAYLOAD_BYTES,
+                 max_buffer_bytes: int = 16 * 1024 * 1024):
         """
         Initialize WebSocket VNC adapter
 
@@ -362,9 +402,14 @@ class WebSocketVNCAdapter:
             client_socket: Raw TCP socket
             do_handshake: Perform handshake immediately
         """
-        self.ws = WebSocketWrapper(client_socket)
+        self.ws = WebSocketWrapper(
+            client_socket,
+            max_handshake_bytes=max_handshake_bytes,
+            max_payload_bytes=max_payload_bytes,
+        )
         self.logger = logging.getLogger(__name__)
         self.recv_buffer = bytearray()
+        self.max_buffer_bytes = max(4096, int(max_buffer_bytes))
 
         if do_handshake:
             if not self.ws.do_handshake():
@@ -378,6 +423,11 @@ class WebSocketVNCAdapter:
             if data is None:
                 break
             if len(data) > 0:  # Skip empty frames (ping/pong)
+                if len(self.recv_buffer) + len(data) > self.max_buffer_bytes:
+                    raise ConnectionError(
+                        f"WebSocket receive buffer exceeded limit: "
+                        f"{len(self.recv_buffer) + len(data)} > {self.max_buffer_bytes}"
+                    )
                 self.recv_buffer.extend(data)
 
         # Return requested amount
@@ -404,8 +454,16 @@ class WebSocketVNCAdapter:
         except:
             pass  # Ignore errors for WebSocket
 
+    def settimeout(self, value):
+        """Socket timeout setter (pass-through)."""
+        self.ws.socket.settimeout(value)
 
-def is_websocket_request(client_socket: socket.socket) -> bool:
+    def gettimeout(self):
+        """Socket timeout getter (pass-through)."""
+        return self.ws.socket.gettimeout()
+
+
+def is_websocket_request(client_socket: socket.socket, peek_timeout: float = 0.5) -> bool:
     """
     Check if incoming connection is WebSocket request
 
@@ -417,17 +475,15 @@ def is_websocket_request(client_socket: socket.socket) -> bool:
     Returns:
         True if WebSocket request detected
     """
+    original_timeout = None
     try:
         # Set a short timeout for the peek
         original_timeout = client_socket.gettimeout()
-        client_socket.settimeout(0.1)  # 100ms timeout
+        client_socket.settimeout(peek_timeout)
 
         # Peek at first bytes without consuming them
         # Note: MSG_PEEK may not work reliably on all platforms
         first_bytes = client_socket.recv(16, socket.MSG_PEEK)
-
-        # Restore original timeout
-        client_socket.settimeout(original_timeout)
 
         if not first_bytes:
             return False
@@ -440,6 +496,12 @@ def is_websocket_request(client_socket: socket.socket) -> bool:
     except socket.timeout:
         # Timeout means no data available yet - not a WebSocket
         return False
-    except Exception as e:
+    except Exception:
         # On error, assume not WebSocket (better to fail open for VNC clients)
         return False
+    finally:
+        if original_timeout is not None:
+            try:
+                client_socket.settimeout(original_timeout)
+            except Exception:
+                pass

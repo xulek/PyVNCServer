@@ -333,15 +333,20 @@ class ConnectionPool:
         Args:
             client_id: Client identifier to release
         """
+        was_active = False
         with self._lock:
             if client_id in self.active_connections:
                 self.active_connections.remove(client_id)
+                was_active = True
 
-        self.connection_semaphore.release()
-        self.logger.debug(
-            f"Connection released: {client_id} "
-            f"({len(self.active_connections)}/{self.max_connections})"
-        )
+        if was_active:
+            self.connection_semaphore.release()
+            self.logger.debug(
+                f"Connection released: {client_id} "
+                f"({len(self.active_connections)}/{self.max_connections})"
+            )
+        else:
+            self.logger.warning(f"Connection release called for unknown client: {client_id}")
 
     def get_active_count(self) -> int:
         """Get number of active connections"""

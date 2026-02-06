@@ -10,6 +10,7 @@
   "network_profile_override": null,
   "scale_factor": 1.0,
   "max_connections": 10,
+  "client_socket_timeout": 60.0,
 
   "enable_region_detection": true,
   "enable_cursor_encoding": false,
@@ -27,6 +28,14 @@
 
   "_websocket_support": "Browser-based VNC access with noVNC",
   "enable_websocket": false,
+  "websocket_detect_timeout": 0.5,
+  "websocket_max_handshake_bytes": 65536,
+  "websocket_max_payload_bytes": 8388608,
+  "websocket_max_buffer_bytes": 16777216,
+
+  "_protocol_limits": "Defensive limits for client-controlled payload sizes",
+  "max_set_encodings": 1024,
+  "max_client_cut_text": 16777216,
 
   "log_level": "INFO",
   "log_file": null,
@@ -36,6 +45,7 @@
     "lan_frame_rate": "1-120 FPS for LAN connections (default 60), localhost always 120",
     "network_profile_override": "null = auto-detect, or force 'localhost', 'lan', or 'wan'",
     "scale_factor": "0.1-2.0, lower = smaller resolution, less bandwidth",
+    "client_socket_timeout": "Client read timeout in seconds to mitigate slow-client DoS",
     "enable_region_detection": "Reduces bandwidth for incremental updates (auto-disabled for localhost)",
     "enable_metrics": "Enables performance monitoring and statistics",
     "enable_tight_encoding": "20-100x compression (experimental - may have issues with some clients)",
@@ -43,7 +53,13 @@
     "enable_h264_encoding": "50-500x compression for video streaming (experimental, requires PyAV)",
     "enable_parallel_encoding": "2-4x faster encoding on multi-core CPUs",
     "encoding_threads": "null = auto-detect (CPU count - 1), or specify number",
-    "enable_websocket": "Enable browser-based access via noVNC (disabled by default, set to true to enable)"
+    "enable_websocket": "Enable browser-based access via noVNC (disabled by default, set to true to enable)",
+    "websocket_detect_timeout": "Peek timeout (seconds) used to detect WebSocket handshakes",
+    "websocket_max_handshake_bytes": "Maximum HTTP upgrade header size in bytes",
+    "websocket_max_payload_bytes": "Maximum inbound WebSocket frame payload size in bytes",
+    "websocket_max_buffer_bytes": "Maximum adapter receive buffer size in bytes",
+    "max_set_encodings": "Maximum number of encodings accepted in SetEncodings",
+    "max_client_cut_text": "Maximum ClientCutText payload size in bytes"
   },
 
   "_encoding_priority": "Tight > ZRLE > Hextile > RRE > CopyRect > Raw (auto-selected based on client and content)",

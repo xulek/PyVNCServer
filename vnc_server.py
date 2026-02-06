@@ -69,11 +69,53 @@ class VNCServerV3:
         self.network_profile_override = self.config.get('network_profile_override', None)
         self.scale_factor = self.config.get('scale_factor', self.DEFAULT_SCALE_FACTOR)
         self.max_connections = self.config.get('max_connections', self.MAX_CONNECTIONS)
+        self.client_socket_timeout = max(
+            1.0, float(self.config.get('client_socket_timeout', 60.0))
+        )
 
         # Features
         self.enable_region_detection = self.config.get('enable_region_detection', True)
         self.enable_cursor_encoding = self.config.get('enable_cursor_encoding', False)
         self.enable_metrics = self.config.get('enable_metrics', True)
+        self.enable_websocket = self.config.get('enable_websocket', False)
+
+        # Protocol and WebSocket safety limits
+        self.max_set_encodings = max(
+            1, int(self.config.get('max_set_encodings', RFBProtocol.DEFAULT_MAX_SET_ENCODINGS))
+        )
+        self.max_client_cut_text = max(
+            1, int(self.config.get('max_client_cut_text', RFBProtocol.DEFAULT_MAX_CLIENT_CUT_TEXT))
+        )
+        self.websocket_detect_timeout = max(
+            0.05, float(self.config.get('websocket_detect_timeout', 0.5))
+        )
+        self.websocket_max_handshake_bytes = max(
+            1024,
+            int(
+                self.config.get(
+                    'websocket_max_handshake_bytes',
+                    64 * 1024,
+                )
+            ),
+        )
+        self.websocket_max_payload_bytes = max(
+            1024,
+            int(
+                self.config.get(
+                    'websocket_max_payload_bytes',
+                    8 * 1024 * 1024,
+                )
+            ),
+        )
+        self.websocket_max_buffer_bytes = max(
+            4096,
+            int(
+                self.config.get(
+                    'websocket_max_buffer_bytes',
+                    16 * 1024 * 1024,
+                )
+            ),
+        )
 
         # Server components
         self.shutdown_handler = GracefulShutdown()
@@ -103,7 +145,13 @@ class VNCServerV3:
         self.logger.info(f"Frame rate: {self.frame_rate} FPS, Scale: {self.scale_factor}")
         self.logger.info(f"Max connections: {self.max_connections}")
         self.logger.info(f"Features: region_detection={self.enable_region_detection}, "
-                        f"cursor={self.enable_cursor_encoding}, metrics={self.enable_metrics}")
+                        f"cursor={self.enable_cursor_encoding}, metrics={self.enable_metrics}, "
+                        f"websocket={self.enable_websocket}")
+        if not self.password:
+            self.logger.warning(
+                "Server is running without authentication (SecurityType None). "
+                "Use a password or network-level protections for untrusted environments."
+            )
 
     def _load_config(self, config_file: str) -> dict:
         """Load configuration from JSON file"""
@@ -181,26 +229,6 @@ class VNCServerV3:
 
                     self.logger.info(f"New connection from {addr}")
 
-                    # Check if WebSocket connection
-                    enable_websocket = self.config.get('enable_websocket', True)
-                    if enable_websocket:
-                        try:
-                            from vnc_lib.websocket_wrapper import is_websocket_request, WebSocketVNCAdapter
-
-                            if is_websocket_request(client_socket):
-                                self.logger.info(f"WebSocket connection detected from {addr}")
-                                try:
-                                    # Wrap socket with WebSocket adapter
-                                    client_socket = WebSocketVNCAdapter(client_socket)
-                                except Exception as e:
-                                    self.logger.error(f"WebSocket handshake failed: {e}")
-                                    client_socket.close()
-                                    self.connection_pool.release(client_id)
-                                    continue
-                        except Exception as e:
-                            # If WebSocket detection fails, just continue with regular VNC
-                            self.logger.debug(f"WebSocket detection error (continuing with VNC): {e}")
-
                     # Handle in separate thread
                     thread = threading.Thread(
                         target=self._handle_client_wrapper,
@@ -237,6 +265,7 @@ class VNCServerV3:
                      addr: tuple, client_id: str):
         """Handle a single client connection"""
         conn_metrics: ConnectionMetrics | None = None
+        parallel_encoder = None
 
         try:
             # Detect network profile for performance optimization
@@ -247,6 +276,11 @@ class VNCServerV3:
             is_localhost = network_profile == NetworkProfile.LOCALHOST
             is_lan = network_profile == NetworkProfile.LAN
             self.logger.info(f"Connection from {addr[0]}: network profile = {network_profile.value}")
+
+            try:
+                client_socket.settimeout(self.client_socket_timeout)
+            except Exception as e:
+                self.logger.warning(f"Could not set client socket timeout: {e}")
 
             # Enable TCP_NODELAY for all connections (VNC is interactive;
             # Nagle's algorithm only adds latency with zero benefit)
@@ -268,21 +302,32 @@ class VNCServerV3:
                 conn_metrics = self.metrics.register_connection(client_id)
 
             # Optional WebSocket support (for browser/noVNC clients)
-            if self.config.get('enable_websocket', False):
+            if self.enable_websocket:
                 try:
                     from vnc_lib.websocket_wrapper import (
                         is_websocket_request,
                         WebSocketVNCAdapter,
                     )
-                    if is_websocket_request(client_socket):
+                    if is_websocket_request(
+                        client_socket,
+                        peek_timeout=self.websocket_detect_timeout
+                    ):
                         self.logger.info("WebSocket handshake detected; wrapping client socket")
-                        client_socket = WebSocketVNCAdapter(client_socket)
+                        client_socket = WebSocketVNCAdapter(
+                            client_socket,
+                            max_handshake_bytes=self.websocket_max_handshake_bytes,
+                            max_payload_bytes=self.websocket_max_payload_bytes,
+                            max_buffer_bytes=self.websocket_max_buffer_bytes,
+                        )
                 except Exception as e:
                     self.logger.error(f"WebSocket setup failed: {e}")
                     return
 
             # Initialize protocol handler (raw TCP or WebSocket-adapted)
-            protocol = RFBProtocol()
+            protocol = RFBProtocol(
+                max_set_encodings=self.max_set_encodings,
+                max_client_cut_text=self.max_client_cut_text,
+            )
 
             # Step 1: Protocol Version Handshake
             with PerformanceMonitor("Version negotiation", self.logger):
@@ -367,7 +412,6 @@ class VNCServerV3:
 
             # Initialize parallel encoder for multi-threaded encoding
             use_parallel = self.config.get('enable_parallel_encoding', True)
-            parallel_encoder = None
             if use_parallel:
                 try:
                     from vnc_lib.parallel_encoder import ParallelEncoder
@@ -393,6 +437,11 @@ class VNCServerV3:
             if conn_metrics:
                 conn_metrics.record_error()
         finally:
+            if parallel_encoder:
+                try:
+                    parallel_encoder.shutdown(wait=False)
+                except Exception:
+                    pass
             client_socket.close()
             if self.metrics:
                 self.metrics.unregister_connection(client_id)
@@ -436,7 +485,6 @@ class VNCServerV3:
             case _:
                 max_frame_rate = self.frame_rate
         throttler = PerformanceThrottler(max_rate=max_frame_rate)
-        last_frame_time = time.time()
 
         while not self.shutdown_handler.is_shutting_down():
             try:
@@ -463,7 +511,8 @@ class VNCServerV3:
                     case protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
                         request = protocol.parse_framebuffer_update_request(client_socket)
 
-                        # Capture screen (throttle after send, not before capture)
+                        # Throttle before expensive capture/encoding work.
+                        throttler.throttle()
                         start_time = time.perf_counter()
                         result = screen_capture.capture_fast(current_pixel_format)
 
@@ -532,9 +581,9 @@ class VNCServerV3:
                                     encoding_time = time.perf_counter() - start_time
                                     total_bytes = sum(r.original_size for r in encoded_results)
                                     compressed_bytes = sum(r.compressed_size for r in encoded_results)
-                                    conn_metrics.record_frame(encoding_time, total_bytes, compressed_bytes)
-
-                                throttler.throttle()
+                                    conn_metrics.record_frame(
+                                        compressed_bytes, encoding_time, total_bytes
+                                    )
                                 continue
 
                             # Non-parallel region encoding fallback
@@ -543,25 +592,30 @@ class VNCServerV3:
                                 content_type = network_profile.value if network_profile != NetworkProfile.WAN else "dynamic"
 
                                 rectangles = []
+                                original_total_bytes = 0
+                                compressed_total_bytes = 0
                                 for x, y, w, h in changed_regions:
                                     region_data = self._extract_region(
                                         result.pixel_data, fb_width, fb_height,
                                         x, y, w, h, bytes_per_pixel
                                     )
+                                    original_total_bytes += len(region_data)
                                     encoding_type, encoder = encoder_manager.get_best_encoder(
                                         client_encodings, content_type=content_type
                                     )
                                     encoded_data = encoder.encode(region_data, w, h, bytes_per_pixel)
+                                    compressed_total_bytes += len(encoded_data)
                                     rectangles.append((x, y, w, h, encoding_type, encoded_data))
 
                                 protocol.send_framebuffer_update(client_socket, rectangles)
 
                                 if conn_metrics:
                                     encoding_time = time.perf_counter() - start_time
-                                    total_bytes = sum(len(r[5]) for r in rectangles if r[5])
-                                    conn_metrics.record_frame(encoding_time, total_bytes, 0)
-
-                                throttler.throttle()
+                                    conn_metrics.record_frame(
+                                        compressed_total_bytes,
+                                        encoding_time,
+                                        original_total_bytes,
+                                    )
                                 continue
 
                         # Select best encoding based on network profile
@@ -596,9 +650,6 @@ class VNCServerV3:
                             conn_metrics.record_frame(
                                 len(encoded_data), encoding_time, len(result.pixel_data)
                             )
-
-                        last_frame_time = time.time()
-                        throttler.throttle()
 
                     case protocol.MSG_KEY_EVENT:
                         key_event = protocol.parse_key_event(client_socket)

@@ -51,9 +51,23 @@ class RFBProtocol:
     MSG_BELL = 2
     MSG_SERVER_CUT_TEXT = 3
 
-    def __init__(self):
+    DEFAULT_MAX_SET_ENCODINGS = 1024
+    DEFAULT_MAX_CLIENT_CUT_TEXT = 16 * 1024 * 1024  # 16 MiB
+
+    def __init__(self, max_set_encodings: int | None = None,
+                 max_client_cut_text: int | None = None):
         self.version = (3, 8)  # Default to highest supported version
         self.logger = logging.getLogger(__name__)
+        self.max_set_encodings = (
+            max_set_encodings
+            if max_set_encodings is not None
+            else self.DEFAULT_MAX_SET_ENCODINGS
+        )
+        self.max_client_cut_text = (
+            max_client_cut_text
+            if max_client_cut_text is not None
+            else self.DEFAULT_MAX_CLIENT_CUT_TEXT
+        )
 
     def negotiate_version(self, client_socket) -> Tuple[int, int]:
         """
@@ -142,7 +156,9 @@ class RFBProtocol:
                 self.logger.warning(f"Client selected unsupported security type: {selected_type}")
                 # Send security result: failed
                 client_socket.sendall(struct.pack(">I", 1))
-                return (selected_type, False)
+                raise ConnectionError(
+                    f"Client selected unsupported security type: {selected_type}"
+                )
 
             self.logger.info(f"Security type negotiated: {security_type}")
             return (security_type, security_type == self.SECURITY_VNC_AUTH)
@@ -238,6 +254,10 @@ class RFBProtocol:
             raise ConnectionError("Failed to receive SetEncodings header")
 
         _, num_encodings = struct.unpack(">BH", header)
+        if num_encodings > self.max_set_encodings:
+            raise ConnectionError(
+                f"Too many encodings requested: {num_encodings} > {self.max_set_encodings}"
+            )
 
         # Receive encoding types (SIGNED integers per RFC)
         enc_data = self._recv_exact(client_socket, 4 * num_encodings)
@@ -304,6 +324,10 @@ class RFBProtocol:
             raise ConnectionError("Failed to receive ClientCutText length")
 
         length = struct.unpack(">I", length_data)[0]
+        if length > self.max_client_cut_text:
+            raise ConnectionError(
+                f"ClientCutText too large: {length} > {self.max_client_cut_text}"
+            )
 
         # Receive text
         text_data = self._recv_exact(client_socket, length)

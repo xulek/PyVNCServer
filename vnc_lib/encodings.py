@@ -175,9 +175,17 @@ class RREEncoder:
     """
 
     ENCODING_TYPE = 2
+    DEFAULT_MAX_PIXELS = 256 * 256
+    DEFAULT_MAX_SUBRECTANGLES = 4096
+    DEFAULT_BACKGROUND_SAMPLE_PIXELS = 65536
 
-    def __init__(self):
+    def __init__(self, max_pixels: int = DEFAULT_MAX_PIXELS,
+                 max_subrectangles: int = DEFAULT_MAX_SUBRECTANGLES,
+                 background_sample_pixels: int = DEFAULT_BACKGROUND_SAMPLE_PIXELS):
         self.logger = logging.getLogger(__name__)
+        self.max_pixels = max(1, int(max_pixels))
+        self.max_subrectangles = max(1, int(max_subrectangles))
+        self.background_sample_pixels = max(256, int(background_sample_pixels))
 
     def encode(self, pixel_data: PixelData, width: int, height: int,
                bytes_per_pixel: int) -> EncodedData:
@@ -193,13 +201,29 @@ class RREEncoder:
             self.logger.warning(f"RRE: unsupported bpp {bytes_per_pixel}")
             return pixel_data
 
+        num_pixels = width * height
+        if num_pixels <= 0:
+            return pixel_data
+        if len(pixel_data) < num_pixels * bytes_per_pixel:
+            self.logger.warning("RRE: pixel buffer smaller than expected, falling back to raw")
+            return pixel_data
+        if num_pixels > self.max_pixels:
+            self.logger.debug(
+                f"RRE: region too large ({num_pixels} px > {self.max_pixels}), using raw"
+            )
+            return pixel_data
+
         # Find background color (most common pixel)
         background = self._find_background(pixel_data, bytes_per_pixel)
 
         # Find rectangles of different colors
         subrects = self._find_subrectangles(
-            pixel_data, width, height, bytes_per_pixel, background
+            pixel_data, width, height, bytes_per_pixel, background,
+            max_subrectangles=self.max_subrectangles
         )
+        if subrects is None:
+            self.logger.debug("RRE: too many subrectangles, using raw")
+            return pixel_data
 
         # Build encoded data
         result = bytearray()
@@ -221,8 +245,13 @@ class RREEncoder:
     def _find_background(self, pixel_data: PixelData, bpp: int) -> bytes:
         """Find most common pixel value (background)"""
         pixel_counts: dict[bytes, int] = {}
+        num_pixels = len(pixel_data) // bpp
+        sample_stride = 1
+        if num_pixels > self.background_sample_pixels:
+            sample_stride = max(1, num_pixels // self.background_sample_pixels)
+        step = bpp * sample_stride
 
-        for i in range(0, len(pixel_data), bpp):
+        for i in range(0, len(pixel_data), step):
             pixel = pixel_data[i:i+bpp]
             pixel_counts[pixel] = pixel_counts.get(pixel, 0) + 1
 
@@ -231,7 +260,8 @@ class RREEncoder:
 
     def _find_subrectangles(self, pixel_data: PixelData, width: int,
                            height: int, bpp: int,
-                           background: bytes) -> list[tuple[bytes, int, int, int, int]]:
+                           background: bytes,
+                           max_subrectangles: int) -> list[tuple[bytes, int, int, int, int]] | None:
         """Find rectangles of non-background colors"""
         subrects: list[tuple[bytes, int, int, int, int]] = []
         processed = [[False] * width for _ in range(height)]
@@ -277,6 +307,8 @@ class RREEncoder:
                         processed[y + dy][x + dx] = True
 
                 subrects.append((pixel, x, y, rect_width, rect_height))
+                if len(subrects) > max_subrectangles:
+                    return None
 
         return subrects
 
@@ -378,11 +410,15 @@ class ZRLEEncoder:
         2. Compress with zlib
         3. Prepend length header
         """
+        if not pixel_data:
+            compressed = zlib.compress(b'', level=self.compression_level)
+            return struct.pack(">I", len(compressed)) + compressed
+
         # Convert to CPIXEL format (compact pixel format)
-        cpixel_data = self._convert_to_cpixel(pixel_data, bytes_per_pixel)
+        cpixel_data, cpixel_bpp = self._convert_to_cpixel(pixel_data, bytes_per_pixel)
 
         # Apply run-length encoding
-        rle_data = self._apply_rle(cpixel_data, width, height)
+        rle_data = self._apply_rle(cpixel_data, cpixel_bpp)
 
         # Compress with zlib
         compressed = zlib.compress(rle_data, level=self.compression_level)
@@ -396,39 +432,59 @@ class ZRLEEncoder:
 
         return result
 
-    def _convert_to_cpixel(self, pixel_data: PixelData, bpp: int) -> bytes:
+    def _convert_to_cpixel(self, pixel_data: PixelData, bpp: int) -> tuple[bytes, int]:
         """
         Convert to CPIXEL format
         For 32-bit pixels, use 3 bytes (RGB) instead of 4 (RGBA)
         """
-        if bpp != 4:
-            return pixel_data
+        if bpp in (1, 2, 3):
+            return pixel_data, bpp
 
-        # Convert RGBA to RGB
-        result = bytearray()
-        for i in range(0, len(pixel_data), 4):
-            result.extend(pixel_data[i:i+3])  # Skip alpha channel
+        if bpp == 4:
+            # Keep channel ordering, only drop padding byte.
+            num_pixels = len(pixel_data) // 4
+            result = bytearray(num_pixels * 3)
+            src_view = memoryview(pixel_data)
+            dst_view = memoryview(result)
+            dst_view[0::3] = src_view[0::4]
+            dst_view[1::3] = src_view[1::4]
+            dst_view[2::3] = src_view[2::4]
+            return bytes(result), 3
 
-        return bytes(result)
+        self.logger.warning(f"ZRLE: unsupported bpp {bpp}, treating as single-byte pixels")
+        return pixel_data, 1
 
-    def _apply_rle(self, pixel_data: PixelData, width: int, height: int) -> bytes:
+    def _apply_rle(self, pixel_data: PixelData, pixel_size: int) -> bytes:
         """
         Apply run-length encoding
 
         ZRLE uses a tile-based approach (64x64 tiles)
         For simplicity, this implementation works on the whole image
         """
+        if pixel_size <= 0:
+            return b''
+        if not pixel_data:
+            return b''
+        if len(pixel_data) < pixel_size:
+            return b''
+
+        if len(pixel_data) % pixel_size != 0:
+            # Keep decoder state valid even for malformed buffers.
+            usable_len = len(pixel_data) - (len(pixel_data) % pixel_size)
+            pixel_data = pixel_data[:usable_len]
+            if not pixel_data:
+                return b''
+
         result = bytearray()
-        bpp = 3  # CPIXEL format
 
         i = 0
         while i < len(pixel_data):
-            pixel = pixel_data[i:i+bpp]
+            pixel = pixel_data[i:i+pixel_size]
             run_length = 1
 
             # Count consecutive identical pixels
-            while (i + run_length * bpp < len(pixel_data) and
-                   pixel_data[i+run_length*bpp:i+(run_length+1)*bpp] == pixel):
+            while (i + run_length * pixel_size < len(pixel_data) and
+                   pixel_data[i+run_length*pixel_size:i+(run_length+1)*pixel_size] == pixel):
                 run_length += 1
                 if run_length >= 255:  # Max run length
                     break
@@ -442,7 +498,7 @@ class ZRLEEncoder:
                 result.extend(pixel)
                 result.append(1)
 
-            i += run_length * bpp
+            i += run_length * pixel_size
 
         return bytes(result)
 

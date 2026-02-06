@@ -130,6 +130,19 @@ class TestSecurityNegotiation:
         assert len(mock_socket.data_sent) == 4
         assert struct.unpack(">I", mock_socket.data_sent)[0] == 2
 
+    def test_security_negotiation_unsupported_selection_fails(self):
+        """Client selecting unsupported security type must fail hard."""
+        protocol = RFBProtocol()
+        protocol.version = (3, 8)
+        mock_socket = MockSocket(struct.pack("B", 42))
+
+        with pytest.raises(ConnectionError):
+            protocol.negotiate_security(mock_socket, password="test")
+
+        # Server should send [count, offered_type] and then failure result.
+        assert mock_socket.data_sent[:2] == b'\x01\x02'
+        assert struct.unpack(">I", mock_socket.data_sent[2:6])[0] == 1
+
 
 class TestMessageParsing:
     """Test message parsing functions"""
@@ -179,6 +192,15 @@ class TestMessageParsing:
         assert -223 in encodings  # Pseudo-encoding
         assert 16 in encodings
         assert len(encodings) == 4
+
+    def test_parse_set_encodings_rejects_too_many(self):
+        """Reject oversized SetEncodings list to avoid resource abuse."""
+        protocol = RFBProtocol(max_set_encodings=2)
+        encodings_data = struct.pack(">BH" + "i" * 3, 0, 3, 0, 2, 16)
+        mock_socket = MockSocket(encodings_data)
+
+        with pytest.raises(ConnectionError):
+            protocol.parse_set_encodings(mock_socket)
 
     def test_parse_framebuffer_update_request(self):
         """Test parsing FramebufferUpdateRequest"""
@@ -246,6 +268,15 @@ class TestMessageParsing:
         received_text = protocol.parse_client_cut_text(mock_socket)
 
         assert received_text == text
+
+    def test_parse_client_cut_text_rejects_oversized_payload(self):
+        """Reject oversized clipboard message before reading body."""
+        protocol = RFBProtocol(max_client_cut_text=8)
+        cut_data = struct.pack(">xxxI", 9) + b'123456789'
+        mock_socket = MockSocket(cut_data)
+
+        with pytest.raises(ConnectionError):
+            protocol.parse_client_cut_text(mock_socket)
 
 
 class TestMessageSending:

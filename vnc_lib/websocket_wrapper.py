@@ -55,6 +55,8 @@ class WebSocketWrapper:
         self.logger = logging.getLogger(__name__)
         self.max_handshake_bytes = max(1024, int(max_handshake_bytes))
         self.max_payload_bytes = max(1024, int(max_payload_bytes))
+        self._fragment_buffer = bytearray()
+        self._fragment_opcode: int | None = None
 
     def do_handshake(self) -> bool:
         """
@@ -201,80 +203,111 @@ class WebSocketWrapper:
             return None
 
         try:
-            # Read frame header
-            header = self._recv_exact(2)
-            if header is None:
-                return None
-
-            # Parse frame
-            byte1, byte2 = header[0], header[1]
-
-            # Check FIN bit
-            fin = (byte1 & 0x80) != 0
-
-            # Get opcode
-            opcode = byte1 & 0x0F
-
-            # Check if masked
-            masked = (byte2 & 0x80) != 0
-
-            # Get payload length
-            payload_len = byte2 & 0x7F
-
-            # Extended payload length
-            if payload_len == 126:
-                ext_len = self._recv_exact(2)
-                if ext_len is None:
-                    return None
-                payload_len = struct.unpack(">H", ext_len)[0]
-            elif payload_len == 127:
-                ext_len = self._recv_exact(8)
-                if ext_len is None:
-                    return None
-                payload_len = struct.unpack(">Q", ext_len)[0]
-
-            if payload_len > self.max_payload_bytes:
-                self.logger.warning(
-                    f"WebSocket payload too large: {payload_len} > {self.max_payload_bytes}"
-                )
-                return None
-
-            # Read masking key
-            masking_key = None
-            if masked:
-                masking_key = self._recv_exact(4)
-                if masking_key is None:
+            while True:
+                # Read frame header
+                header = self._recv_exact(2)
+                if header is None:
                     return None
 
-            # Read payload
-            payload = self._recv_exact(payload_len)
-            if payload is None:
-                return None
+                # Parse frame
+                byte1, byte2 = header[0], header[1]
 
-            # Unmask if needed
-            if masked and masking_key:
-                payload = self._unmask(payload, masking_key)
+                # Check FIN bit
+                fin = (byte1 & 0x80) != 0
 
-            # Handle control frames
-            if opcode == WebSocketOpcode.CLOSE:
-                self.logger.info("WebSocket close frame received")
-                return None
-            elif opcode == WebSocketOpcode.PING:
-                self._send_pong(payload)
-                return b''  # Return empty to continue
-            elif opcode == WebSocketOpcode.PONG:
-                return b''  # Ignore pong
+                # Get opcode
+                opcode = byte1 & 0x0F
 
-            # Return binary payload
-            if opcode == WebSocketOpcode.BINARY or opcode == WebSocketOpcode.CONTINUATION:
-                return payload
+                # Check if masked
+                masked = (byte2 & 0x80) != 0
 
-            # Text frame - shouldn't happen for VNC
-            if opcode == WebSocketOpcode.TEXT:
-                self.logger.warning("Received text frame, expected binary")
-                return payload.encode('utf-8') if isinstance(payload, str) else payload
+                # Get payload length
+                payload_len = byte2 & 0x7F
 
-            return None
+                # Extended payload length
+                if payload_len == 126:
+                    ext_len = self._recv_exact(2)
+                    if ext_len is None:
+                        return None
+                    payload_len = struct.unpack(">H", ext_len)[0]
+                elif payload_len == 127:
+                    ext_len = self._recv_exact(8)
+                    if ext_len is None:
+                        return None
+                    payload_len = struct.unpack(">Q", ext_len)[0]
+
+                if payload_len > self.max_payload_bytes:
+                    self.logger.warning(
+                        f"WebSocket payload too large: {payload_len} > {self.max_payload_bytes}"
+                    )
+                    return None
+
+                # Read masking key
+                masking_key = None
+                if masked:
+                    masking_key = self._recv_exact(4)
+                    if masking_key is None:
+                        return None
+
+                # Read payload
+                payload = self._recv_exact(payload_len)
+                if payload is None:
+                    return None
+
+                # Unmask if needed
+                if masked and masking_key:
+                    payload = self._unmask(payload, masking_key)
+
+                # Handle control frames
+                if opcode == WebSocketOpcode.CLOSE:
+                    self.logger.info("WebSocket close frame received")
+                    return None
+                if opcode == WebSocketOpcode.PING:
+                    self._send_pong(payload)
+                    return b''  # Return empty to continue
+                if opcode == WebSocketOpcode.PONG:
+                    return b''  # Ignore pong
+
+                if opcode == WebSocketOpcode.CONTINUATION:
+                    if self._fragment_opcode is None:
+                        # Broken client: continuation without a start frame.
+                        self.logger.warning("WebSocket continuation frame without active fragment")
+                        if fin:
+                            return payload
+                        self._fragment_opcode = WebSocketOpcode.BINARY
+                        self._fragment_buffer = bytearray(payload)
+                        continue
+
+                    self._fragment_buffer.extend(payload)
+                    if fin:
+                        message = bytes(self._fragment_buffer)
+                        self._fragment_buffer.clear()
+                        self._fragment_opcode = None
+                        return message
+                    continue
+
+                if opcode not in (WebSocketOpcode.BINARY, WebSocketOpcode.TEXT):
+                    self.logger.warning(f"Unsupported WebSocket opcode: 0x{opcode:02x}")
+                    self._fragment_buffer.clear()
+                    self._fragment_opcode = None
+                    return None
+
+                if opcode == WebSocketOpcode.TEXT:
+                    self.logger.warning("Received text frame, expected binary")
+
+                if self._fragment_opcode is not None:
+                    self.logger.warning(
+                        "WebSocket fragment stream reset due to unexpected new data frame"
+                    )
+                    self._fragment_buffer.clear()
+                    self._fragment_opcode = None
+
+                if fin:
+                    return payload
+
+                # Start of fragmented message.
+                self._fragment_opcode = opcode
+                self._fragment_buffer = bytearray(payload)
 
         except Exception as e:
             self.logger.error(f"Error receiving WebSocket data: {e}")
@@ -358,13 +391,15 @@ class WebSocketWrapper:
 
     def _recv_exact(self, n: int) -> Optional[bytes]:
         """Receive exactly n bytes"""
-        buf = b''
+        if n == 0:
+            return b''
+        buf = bytearray()
         while len(buf) < n:
             chunk = self.socket.recv(n - len(buf))
             if not chunk:
                 return None
-            buf += chunk
-        return buf
+            buf.extend(chunk)
+        return bytes(buf)
 
     def close(self):
         """Close WebSocket connection"""

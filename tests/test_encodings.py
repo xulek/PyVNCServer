@@ -81,6 +81,31 @@ class TestEncoders(unittest.TestCase):
         self.assertIsInstance(result, bytes)
         self.assertGreater(len(result), 4)  # At least header
 
+    def test_zrle_encoder_16bit_pixels(self):
+        """ZRLE should work with 16-bit pixel streams (bpp=2)."""
+        encoder = ZRLEEncoder(compression_level=6)
+        pixels_16 = bytes([0x12, 0x34] * (self.width * self.height))
+        result = encoder.encode(pixels_16, self.width, self.height, 2)
+
+        self.assertIsInstance(result, bytes)
+        self.assertGreater(len(result), 4)
+
+    def test_zrle_encoder_8bit_pixels(self):
+        """ZRLE should work with 8-bit pixel streams (bpp=1)."""
+        encoder = ZRLEEncoder(compression_level=6)
+        pixels_8 = bytes([0x7F] * (self.width * self.height))
+        result = encoder.encode(pixels_8, self.width, self.height, 1)
+
+        self.assertIsInstance(result, bytes)
+        self.assertGreater(len(result), 4)
+
+    def test_rre_large_region_falls_back_to_raw(self):
+        """Large region should avoid expensive RRE path."""
+        encoder = RREEncoder(max_pixels=64)
+        large_pixels = bytes([1, 2, 3, 4] * 100)  # 100 pixels
+        result = encoder.encode(large_pixels, width=10, height=10, bytes_per_pixel=4)
+        self.assertEqual(result, large_pixels)
+
     def test_encoder_manager(self):
         """Test encoder manager selection"""
         manager = EncoderManager()

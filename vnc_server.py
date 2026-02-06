@@ -117,6 +117,11 @@ class VNCServerV3:
             ),
         )
 
+        # Shared capture backend across clients reduces duplicate grabs when
+        # multiple viewers request updates at the same time.
+        self.screen_capture = ScreenCapture(scale_factor=self.scale_factor)
+        self._screen_capture_lock = threading.Lock()
+
         # Server components
         self.shutdown_handler = GracefulShutdown()
         self.connection_pool = ConnectionPool(max_connections=self.max_connections)
@@ -361,7 +366,6 @@ class VNCServerV3:
             self.logger.debug(f"Client shared flag: {shared_flag}")
 
             # Step 5: ServerInit
-            screen_capture = ScreenCapture(scale_factor=self.scale_factor)
             input_handler = InputHandler(scale_factor=self.scale_factor)
 
             # Default pixel format: BGR0 matches native Windows BGRA capture
@@ -381,7 +385,7 @@ class VNCServerV3:
             }
 
             # Get initial screen dimensions
-            initial_result = screen_capture.capture_fast(current_pixel_format)
+            initial_result = self._capture_frame(self.screen_capture, current_pixel_format)
 
             width, height = initial_result.width, initial_result.height
 
@@ -426,7 +430,7 @@ class VNCServerV3:
 
             # Main message loop
             self._client_message_loop(
-                client_socket, protocol, screen_capture, input_handler,
+                client_socket, protocol, self.screen_capture, input_handler,
                 current_pixel_format, client_encodings, width, height,
                 encoder_manager, change_detector, cursor_encoder, conn_metrics,
                 is_localhost, parallel_encoder, network_profile
@@ -514,7 +518,7 @@ class VNCServerV3:
                         # Throttle before expensive capture/encoding work.
                         throttler.throttle()
                         start_time = time.perf_counter()
-                        result = screen_capture.capture_fast(current_pixel_format)
+                        result = self._capture_frame(screen_capture, current_pixel_format)
 
                         if result.pixel_data is None:
                             continue
@@ -534,12 +538,21 @@ class VNCServerV3:
                                 ])
                                 continue
 
+                        request_region = self._normalize_request_region(request, fb_width, fb_height)
+                        if request_region is None:
+                            protocol.send_framebuffer_update(client_socket, [])
+                            continue
+                        req_x, req_y, req_w, req_h = request_region
+
                         # Check for changes (incremental update)
                         if request['incremental'] and change_detector:
                             changed_regions = change_detector.detect_changes(
                                 result.pixel_data,
                                 current_pixel_format['bits_per_pixel'] // 8
                             )
+
+                            if changed_regions is not None:
+                                changed_regions = self._intersect_regions(changed_regions, request_region)
 
                             if changed_regions is not None and len(changed_regions) == 0:
                                 # No changes
@@ -628,17 +641,37 @@ class VNCServerV3:
 
                         # Encode pixel data (single-threaded for full frame)
                         bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
-                        self.logger.debug(f"Encoding frame: {fb_width}x{fb_height}, bpp={bytes_per_pixel}, data_size={len(result.pixel_data)}")
+                        full_request = (
+                            req_x == 0 and req_y == 0 and req_w == fb_width and req_h == fb_height
+                        )
+                        if full_request:
+                            frame_pixels = result.pixel_data
+                        else:
+                            frame_pixels = self._extract_region(
+                                result.pixel_data,
+                                fb_width,
+                                fb_height,
+                                req_x,
+                                req_y,
+                                req_w,
+                                req_h,
+                                bytes_per_pixel,
+                            )
+
+                        self.logger.debug(
+                            f"Encoding frame: {req_w}x{req_h}, bpp={bytes_per_pixel}, "
+                            f"data_size={len(frame_pixels)}"
+                        )
 
                         encoded_data = encoder.encode(
-                            result.pixel_data, fb_width, fb_height, bytes_per_pixel
+                            frame_pixels, req_w, req_h, bytes_per_pixel
                         )
 
                         self.logger.debug(f"Encoded data size: {len(encoded_data)} bytes")
 
                         # Send framebuffer update
                         rectangles = [
-                            (0, 0, fb_width, fb_height, encoding_type, encoded_data)
+                            (req_x, req_y, req_w, req_h, encoding_type, encoded_data)
                         ]
                         self.logger.debug(f"Sending framebuffer update with {len(rectangles)} rectangle(s)")
                         protocol.send_framebuffer_update(client_socket, rectangles)
@@ -648,7 +681,7 @@ class VNCServerV3:
                         if conn_metrics:
                             encoding_time = time.perf_counter() - start_time
                             conn_metrics.record_frame(
-                                len(encoded_data), encoding_time, len(result.pixel_data)
+                                len(encoded_data), encoding_time, len(frame_pixels)
                             )
 
                     case protocol.MSG_KEY_EVENT:
@@ -736,15 +769,96 @@ class VNCServerV3:
                        x: int, y: int, width: int, height: int,
                        bytes_per_pixel: int) -> bytes:
         """Extract a rectangular region from framebuffer"""
-        result = bytearray()
+        if bytes_per_pixel <= 0 or width <= 0 or height <= 0:
+            return b''
+
+        if x < 0:
+            width += x
+            x = 0
+        if y < 0:
+            height += y
+            y = 0
+        if x >= fb_width or y >= fb_height:
+            return b''
+
+        width = min(width, fb_width - x)
+        height = min(height, fb_height - y)
+        if width <= 0 or height <= 0:
+            return b''
+
+        row_size = width * bytes_per_pixel
+        result = bytearray(height * row_size)
+        dst_offset = 0
+
         for row in range(height):
-            src_y = y + row
-            if src_y >= fb_height:
-                break
-            src_offset = (src_y * fb_width + x) * bytes_per_pixel
-            row_data = pixel_data[src_offset:src_offset + width * bytes_per_pixel]
-            result.extend(row_data)
+            src_offset = ((y + row) * fb_width + x) * bytes_per_pixel
+            result[dst_offset:dst_offset + row_size] = pixel_data[src_offset:src_offset + row_size]
+            dst_offset += row_size
+
         return bytes(result)
+
+    def _capture_frame(self, screen_capture: ScreenCapture, pixel_format: dict):
+        """Capture frame safely from shared capture backend."""
+        with self._screen_capture_lock:
+            return screen_capture.capture_fast(pixel_format)
+
+    def _normalize_request_region(self, request: dict, fb_width: int,
+                                  fb_height: int) -> tuple[int, int, int, int] | None:
+        """Clamp client-requested update rectangle to framebuffer bounds."""
+        if fb_width <= 0 or fb_height <= 0:
+            return None
+
+        x = int(request.get('x', 0))
+        y = int(request.get('y', 0))
+        width = int(request.get('width', 0))
+        height = int(request.get('height', 0))
+
+        if width <= 0 or height <= 0:
+            return None
+        if x >= fb_width or y >= fb_height:
+            return None
+
+        x = max(0, x)
+        y = max(0, y)
+        width = min(width, fb_width - x)
+        height = min(height, fb_height - y)
+        if width <= 0 or height <= 0:
+            return None
+
+        return x, y, width, height
+
+    def _intersect_rectangles(self, first: tuple[int, int, int, int],
+                              second: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
+        """Return intersection of two rectangles or None if disjoint."""
+        x1, y1, w1, h1 = first
+        x2, y2, w2, h2 = second
+
+        left = max(x1, x2)
+        top = max(y1, y2)
+        right = min(x1 + w1, x2 + w2)
+        bottom = min(y1 + h1, y2 + h2)
+
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right - left, bottom - top
+
+    def _intersect_regions(self, regions, request_region: tuple[int, int, int, int]) -> list[tuple[int, int, int, int]]:
+        """Filter changed regions to the client-requested area."""
+        filtered: list[tuple[int, int, int, int]] = []
+        for region in regions:
+            if hasattr(region, 'x'):
+                rect = (int(region.x), int(region.y), int(region.width), int(region.height))
+            else:
+                rect = (
+                    int(region[0]),
+                    int(region[1]),
+                    int(region[2]),
+                    int(region[3]),
+                )
+            intersection = self._intersect_rectangles(rect, request_region)
+            if intersection is not None:
+                filtered.append(intersection)
+        return filtered
 
     def _cleanup(self):
         """Cleanup server resources"""

@@ -117,11 +117,6 @@ class VNCServerV3:
             ),
         )
 
-        # Shared capture backend across clients reduces duplicate grabs when
-        # multiple viewers request updates at the same time.
-        self.screen_capture = ScreenCapture(scale_factor=self.scale_factor)
-        self._screen_capture_lock = threading.Lock()
-
         # Server components
         self.shutdown_handler = GracefulShutdown()
         self.connection_pool = ConnectionPool(max_connections=self.max_connections)
@@ -366,6 +361,7 @@ class VNCServerV3:
             self.logger.debug(f"Client shared flag: {shared_flag}")
 
             # Step 5: ServerInit
+            screen_capture = ScreenCapture(scale_factor=self.scale_factor)
             input_handler = InputHandler(scale_factor=self.scale_factor)
 
             # Default pixel format: BGR0 matches native Windows BGRA capture
@@ -385,7 +381,13 @@ class VNCServerV3:
             }
 
             # Get initial screen dimensions
-            initial_result = self._capture_frame(self.screen_capture, current_pixel_format)
+            initial_result = self._capture_frame(screen_capture, current_pixel_format)
+            if (
+                initial_result.pixel_data is None
+                or initial_result.width <= 0
+                or initial_result.height <= 0
+            ):
+                raise ConnectionError("Initial screen capture failed")
 
             width, height = initial_result.width, initial_result.height
 
@@ -430,7 +432,7 @@ class VNCServerV3:
 
             # Main message loop
             self._client_message_loop(
-                client_socket, protocol, self.screen_capture, input_handler,
+                client_socket, protocol, screen_capture, input_handler,
                 current_pixel_format, client_encodings, width, height,
                 encoder_manager, change_detector, cursor_encoder, conn_metrics,
                 is_localhost, parallel_encoder, network_profile
@@ -798,9 +800,8 @@ class VNCServerV3:
         return bytes(result)
 
     def _capture_frame(self, screen_capture: ScreenCapture, pixel_format: dict):
-        """Capture frame safely from shared capture backend."""
-        with self._screen_capture_lock:
-            return screen_capture.capture_fast(pixel_format)
+        """Capture a frame for a single client connection."""
+        return screen_capture.capture_fast(pixel_format)
 
     def _normalize_request_region(self, request: dict, fb_width: int,
                                   fb_height: int) -> tuple[int, int, int, int] | None:

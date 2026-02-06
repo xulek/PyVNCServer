@@ -127,6 +127,13 @@ class TestEncoders(unittest.TestCase):
         enc_type, encoder = manager.get_best_encoder(encodings_all)
         self.assertIn(enc_type, encodings_all)
 
+    def test_encoder_manager_lan_prefers_raw(self):
+        """LAN profile should prioritize low-latency raw encoding."""
+        manager = EncoderManager()
+        encodings_lan = {0, 2, 5, 16}
+        enc_type, _ = manager.get_best_encoder(encodings_lan, content_type="lan")
+        self.assertEqual(enc_type, 0)
+
 
 class TestEncoderPerformance(unittest.TestCase):
     """Performance tests for encoders"""

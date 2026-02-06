@@ -6,7 +6,7 @@
   "password": "",
 
   "frame_rate": 30,
-  "lan_frame_rate": 60,
+  "lan_frame_rate": 30,
   "network_profile_override": null,
   "scale_factor": 1.0,
   "max_connections": 10,
@@ -42,7 +42,7 @@
 
   "_performance_notes": {
     "frame_rate": "1-60 FPS (WAN), higher = smoother but more CPU/bandwidth",
-    "lan_frame_rate": "1-120 FPS for LAN connections (default 60), localhost always 120",
+    "lan_frame_rate": "1-120 FPS for LAN connections (default 30), localhost always 120",
     "network_profile_override": "null = auto-detect, or force 'localhost', 'lan', or 'wan'",
     "scale_factor": "0.1-2.0, lower = smaller resolution, less bandwidth",
     "client_socket_timeout": "Client read timeout in seconds to mitigate slow-client DoS",

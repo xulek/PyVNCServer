@@ -9,6 +9,7 @@ import threading
 import time
 import logging
 import json
+import argparse
 from pathlib import Path
 
 from vnc_lib.protocol import RFBProtocol
@@ -65,7 +66,7 @@ class VNCServerV3:
         self.port = self.config.get('port', self.DEFAULT_PORT)
         self.password = self.config.get('password', '')
         self.frame_rate = max(1, min(60, self.config.get('frame_rate', self.DEFAULT_FRAME_RATE)))
-        self.lan_frame_rate = max(1, min(120, self.config.get('lan_frame_rate', 60)))
+        self.lan_frame_rate = max(1, min(120, self.config.get('lan_frame_rate', 30)))
         self.network_profile_override = self.config.get('network_profile_override', None)
         self.scale_factor = self.config.get('scale_factor', self.DEFAULT_SCALE_FACTOR)
         self.max_connections = self.config.get('max_connections', self.MAX_CONNECTIONS)
@@ -697,6 +698,9 @@ class VNCServerV3:
 
                     case protocol.MSG_POINTER_EVENT:
                         pointer_event = protocol.parse_pointer_event(client_socket)
+                        pointer_event = self._coalesce_pointer_events(
+                            client_socket, protocol, pointer_event
+                        )
                         input_handler.handle_pointer_event(
                             pointer_event['button_mask'],
                             pointer_event['x'],
@@ -732,6 +736,9 @@ class VNCServerV3:
                         break
 
             except Exception as e:
+                if isinstance(e, OSError):
+                    self.logger.warning(f"Socket error in message loop: {e}")
+                    break
                 self.logger.error(f"Unexpected error in message loop: {e}", exc_info=True)
                 if conn_metrics:
                     conn_metrics.record_error()
@@ -802,6 +809,53 @@ class VNCServerV3:
     def _capture_frame(self, screen_capture: ScreenCapture, pixel_format: dict):
         """Capture a frame for a single client connection."""
         return screen_capture.capture_fast(pixel_format)
+
+    def _coalesce_pointer_events(self, client_socket,
+                                 protocol: RFBProtocol,
+                                 first_event: dict) -> dict:
+        """
+        Coalesce a burst of PointerEvent messages and keep only the newest one.
+
+        This prevents cursor "catch-up" behavior when the socket queue contains
+        many stale pointer positions.
+        """
+        latest = first_event
+        if not hasattr(client_socket, 'recv'):
+            return latest
+
+        original_timeout = None
+        try:
+            original_timeout = client_socket.gettimeout()
+            client_socket.settimeout(0.0)
+
+            while True:
+                try:
+                    # PointerEvent message is 1-byte type + 5-byte payload.
+                    peek = client_socket.recv(6, socket.MSG_PEEK)
+                except (BlockingIOError, InterruptedError, socket.timeout):
+                    break
+                except OSError:
+                    break
+
+                if len(peek) < 6 or peek[0] != protocol.MSG_POINTER_EVENT:
+                    break
+
+                msg_type_data = protocol._recv_exact(client_socket, 1)
+                if not msg_type_data or msg_type_data[0] != protocol.MSG_POINTER_EVENT:
+                    break
+
+                latest = protocol.parse_pointer_event(client_socket)
+        except Exception:
+            # Best-effort optimization; fall back to single-event handling.
+            pass
+        finally:
+            if original_timeout is not None:
+                try:
+                    client_socket.settimeout(original_timeout)
+                except Exception:
+                    pass
+
+        return latest
 
     def _normalize_request_region(self, request: dict, fb_width: int,
                                   fb_height: int) -> tuple[int, int, int, int] | None:
@@ -891,6 +945,19 @@ class VNCServerV3:
 
 def main():
     """Main entry point"""
+    parser = argparse.ArgumentParser(description="PyVNCServer v3.0")
+    parser.add_argument(
+        "--config",
+        default="config.json",
+        help="Path to configuration file (default: config.json)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        help="Override log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+    )
+    args = parser.parse_args()
+
     # Setup basic logging
     logging.basicConfig(
         level=logging.INFO,
@@ -898,7 +965,17 @@ def main():
     )
 
     # Create and start server
-    server = VNCServerV3()
+    server = VNCServerV3(config_file=args.config)
+    if args.log_level:
+        level_name = args.log_level.upper()
+        level = getattr(logging, level_name, None)
+        if isinstance(level, int):
+            logging.getLogger().setLevel(level)
+            server.logger.info(f"Log level overridden from CLI: {level_name}")
+        else:
+            server.logger.warning(
+                f"Invalid CLI log level '{args.log_level}', keeping configured level"
+            )
     server.start()
 
 

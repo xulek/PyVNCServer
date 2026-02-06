@@ -578,8 +578,10 @@ class EncoderManager:
                 # For localhost connections, prefer Raw (maximum speed, no compression overhead)
                 preference_order = [0]  # Raw only - compression unnecessary for localhost
             case "lan":
-                # For LAN connections, prefer fast encoders (skip expensive Tight)
-                preference_order = [5, 16, 2, 0]  # Hextile, ZRLE, RRE, Raw
+                # Current Hextile implementation is tile-raw and typically slower than
+                # Raw while barely reducing payload size. For low-latency LAN usage,
+                # prefer Raw first and keep compressed encoders as fallback.
+                preference_order = [0, 16, 2, 5]  # Raw, ZRLE, RRE, Hextile
             case "static":
                 # For static content, prefer compression
                 preference_order = [7, 16, 5, 2, 0]  # Tight, ZRLE, Hextile, RRE, Raw

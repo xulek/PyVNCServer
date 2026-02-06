@@ -40,6 +40,7 @@ class InputHandler:
         self._screen_height: int = 0
         self._screen_size_time: float = 0.0
         self._screen_size_ttl: float = 5.0  # Refresh every 5 seconds
+        self._last_pointer_pos: tuple[int, int] | None = None
 
         # Lazy load pyautogui (only when needed and display is available)
         self._pyautogui = None
@@ -51,6 +52,15 @@ class InputHandler:
                 self._pyautogui = pyautogui
                 # Disable pyautogui fail-safe
                 pyautogui.FAILSAFE = False
+                # Eliminate per-call artificial delays to avoid pointer lag
+                # under high input event rates (common over VNC).
+                pyautogui.PAUSE = 0
+                if hasattr(pyautogui, 'MINIMUM_DURATION'):
+                    pyautogui.MINIMUM_DURATION = 0
+                if hasattr(pyautogui, 'MINIMUM_SLEEP'):
+                    pyautogui.MINIMUM_SLEEP = 0
+                if hasattr(pyautogui, 'DARWIN_CATCH_UP_TIME'):
+                    pyautogui.DARWIN_CATCH_UP_TIME = 0
             except Exception as e:
                 self.logger.warning(f"pyautogui not available: {e}")
                 self._pyautogui_available = False
@@ -104,7 +114,10 @@ class InputHandler:
                 return
 
             # Move mouse to position
-            self._pyautogui.moveTo(actual_x, actual_y, duration=0)
+            target_pos = (actual_x, actual_y)
+            if self._last_pointer_pos != target_pos:
+                self._pyautogui.moveTo(actual_x, actual_y, duration=0)
+                self._last_pointer_pos = target_pos
 
             # Handle button state changes
             self._handle_button_changes(button_mask)

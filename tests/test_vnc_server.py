@@ -2,6 +2,10 @@
 Targeted unit tests for VNCServerV3 helper logic.
 """
 
+import struct
+import socket
+
+from vnc_lib.protocol import RFBProtocol
 from vnc_server import VNCServerV3
 
 
@@ -74,3 +78,48 @@ def test_extract_region_handles_bounds_safely():
         height=1,
         bytes_per_pixel=1,
     ) == b''
+
+
+def test_coalesce_pointer_events_keeps_latest():
+    server = _server_without_init()
+    protocol = RFBProtocol()
+    initial = {'button_mask': 0, 'x': 10, 'y': 10}
+
+    # Two queued PointerEvent messages (type byte + 5-byte payload each):
+    # (1, 20, 30) then (0, 40, 50)
+    queued = (
+        bytes([protocol.MSG_POINTER_EVENT]) + struct.pack(">BHH", 1, 20, 30) +
+        bytes([protocol.MSG_POINTER_EVENT]) + struct.pack(">BHH", 0, 40, 50)
+    )
+    sock = _FakeSocket(queued)
+    sock.settimeout(5.0)
+
+    latest = server._coalesce_pointer_events(sock, protocol, initial)
+
+    assert latest == {'button_mask': 0, 'x': 40, 'y': 50}
+    assert sock.gettimeout() == 5.0
+
+
+class _FakeSocket:
+    """Socket-like object for MSG_PEEK tests."""
+
+    MSG_PEEK = socket.MSG_PEEK
+
+    def __init__(self, incoming: bytes):
+        self._incoming = bytearray(incoming)
+        self._timeout = None
+
+    def recv(self, n, flags=0):
+        if flags == self.MSG_PEEK:
+            return bytes(self._incoming[:n])
+        if not self._incoming:
+            return b''
+        data = bytes(self._incoming[:n])
+        del self._incoming[:n]
+        return data
+
+    def settimeout(self, value):
+        self._timeout = value
+
+    def gettimeout(self):
+        return self._timeout

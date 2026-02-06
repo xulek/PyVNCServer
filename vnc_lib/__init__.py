@@ -42,7 +42,8 @@ from .metrics import (
 )
 from .server_utils import (
     HealthStatus, GracefulShutdown, HealthChecker,
-    ConnectionPool, PerformanceThrottler
+    ConnectionPool, PerformanceThrottler,
+    NetworkProfile, detect_network_profile
 )
 
 # Python 3.13 enhancements

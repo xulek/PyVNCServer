@@ -320,16 +320,26 @@ class RFBProtocol:
         """
         # Message type + padding + number of rectangles
         header = struct.pack(">BxH", self.MSG_FRAMEBUFFER_UPDATE, len(rectangles))
-        client_socket.sendall(header)
 
-        for x, y, width, height, encoding, data in rectangles:
-            # Rectangle header
-            rect_header = struct.pack(">HHHHi", x, y, width, height, encoding)
-            client_socket.sendall(rect_header)
+        # Calculate total size to decide whether to batch into single sendall
+        total_data_size = sum(len(data) for _, _, _, _, _, data in rectangles if data)
+        total_size = len(header) + len(rectangles) * 12 + total_data_size  # 12 = rect header size
 
-            # Rectangle data (encoding-specific)
-            if data:
-                self._send_large_data(client_socket, data)
+        if total_size <= 1_048_576:  # Under 1MB: batch into single send
+            parts = [header]
+            for x, y, width, height, encoding, data in rectangles:
+                parts.append(struct.pack(">HHHHi", x, y, width, height, encoding))
+                if data:
+                    parts.append(data if isinstance(data, (bytes, bytearray)) else bytes(data))
+            client_socket.sendall(b"".join(parts))
+        else:
+            # Large update: send header then stream rectangle data
+            client_socket.sendall(header)
+            for x, y, width, height, encoding, data in rectangles:
+                rect_header = struct.pack(">HHHHi", x, y, width, height, encoding)
+                client_socket.sendall(rect_header)
+                if data:
+                    self._send_large_data(client_socket, data)
 
     def send_bell(self, client_socket):
         """Send Bell message (RFC 6143 Section 7.6.2)"""
@@ -351,14 +361,15 @@ class RFBProtocol:
             buf += chunk
         return buf
 
-    def _send_large_data(self, sock, data: bytes, chunk_size: int = 65536):
-        """Send large data in chunks"""
+    def _send_large_data(self, sock, data: bytes, chunk_size: int = 262144):
+        """Send large data in chunks using memoryview to avoid copies"""
+        view = memoryview(data)
         total_sent = 0
         data_len = len(data)
 
         while total_sent < data_len:
             end = min(total_sent + chunk_size, data_len)
-            sent = sock.send(data[total_sent:end])
+            sent = sock.send(view[total_sent:end])
             if sent == 0:
                 raise ConnectionError("Socket connection broken during send")
             total_sent += sent

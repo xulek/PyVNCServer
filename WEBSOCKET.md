@@ -1,135 +1,78 @@
-# WebSocket Support - Quick Start
+# WebSocket Support
 
-PyVNCServer includes built-in WebSocket support for browser-based VNC access.
+PyVNCServer can accept browser connections over WebSocket (for noVNC and custom web clients).
 
-## Quick Start (4 Steps)
+## How It Works
 
-### 1. Enable WebSocket
+- WebSocket and regular VNC can share the same TCP port (default `5900`).
+- The server detects WebSocket handshakes by checking whether the incoming stream starts with HTTP `GET`.
+- If a WebSocket upgrade is detected, the socket is wrapped and VNC frames are tunneled through WebSocket binary frames.
+- If not, the connection continues as regular RFB/TCP.
 
-Edit `config.json`:
+## Quick Start
+
+### 1. Enable WebSocket in `config.json`
+
 ```json
 {
   "enable_websocket": true
 }
 ```
 
-**Note:** WebSocket is disabled by default to avoid interfering with regular VNC clients.
+Note: In the repository's current `config.json`, this flag is set to `false`, so you need to enable it manually.
 
-### 2. Start Server
+### 2. Start the server
 
 ```bash
 python vnc_server.py
 ```
 
-WebSocket will listen on port 5900 (same as VNC).
-
-### 3. Connect with Browser
-
-Use the bundled noVNC wrapper (recommended for quick testing):
+### 3. Serve the bundled web client
 
 ```bash
-# from repo root
 python -m http.server 8000
-# open http://localhost:8000/web/vnc_client.html
 ```
 
-The page pulls in `web/noVNC` via ES modules, so serve it over HTTP—not `file://`.
+Open:
 
-Highlights:
-- Responsive viewer where the framebuffer canvas always fills the panel.
-- Status banner + FPS/Bandwidth/Encoding stats.
-- Built-in **View only** toggle so you can monitor sessions without sending input.
+`http://localhost:8000/web/vnc_client.html`
 
-Prefer the upstream UI? Clone noVNC and open `vnc.html` as usual:
+The page imports modules from `web/noVNC`, so use HTTP/HTTPS (not `file://`).
 
-```bash
-git clone https://github.com/novnc/noVNC.git
-cd noVNC
-# open vnc.html in browser
-```
+### 4. Connect
 
-### 4. Connect to Server
+- Host: `localhost`
+- Port: `5900` (or your configured VNC port)
+- Password: according to `config.json`
 
-- **Host:** localhost
-- **Port:** 5900
-- **Password:** (if configured)
+## Upstream noVNC UI
 
-## Features
+You can also use upstream noVNC (`vnc.html` / `vnc_lite.html`) and connect directly to:
 
-✅ **No Proxy Needed** - Direct WebSocket support built-in
-✅ **Auto-Detection** - Same port handles VNC and WebSocket
-✅ **noVNC Compatible** - Works with standard noVNC client
-✅ **Built-in Browser Client** - Modern UI with view-only toggle & stats
-✅ **High Performance** - 20-100x compression with Tight encoding
-✅ **RFC 6455 Compliant** - Standard WebSocket protocol
+`ws://<server-host>:<vnc-port>`
 
-## Configuration
+No `websockify` is required for plain WebSocket because PyVNCServer already supports WebSocket transport.
 
-```json
-{
-  "enable_websocket": true,
-  "enable_tight_encoding": true,
-  "port": 5900
-}
-```
-
-## Example: Embed in Web Page
+## Minimal Embedding Example
 
 ```html
-<!DOCTYPE html>
-<html>
-<head>
-    <script type="module">
-        import RFB from './noVNC/core/rfb.js';
-
-        const rfb = new RFB(
-            document.getElementById('screen'),
-            'ws://localhost:5900'
-        );
-    </script>
-</head>
-<body>
-    <div id="screen"></div>
-</body>
-</html>
+<script type="module">
+  import RFB from './noVNC/core/rfb.js';
+  const rfb = new RFB(
+    document.getElementById('screen'),
+    'ws://localhost:5900',
+    { credentials: { password: '' } }
+  );
+  rfb.scaleViewport = true;
+</script>
 ```
 
-## Documentation
+## Production Notes (TLS / `wss://`)
 
-- **Full Guide:** [web/README_NOVNC.md](web/README_NOVNC.md)
-- **Performance:** [PERFORMANCE.md](PERFORMANCE.md#websocket-support-browser-access)
-- **noVNC Project:** https://github.com/novnc/noVNC
+PyVNCServer provides plain `ws://` transport.  
+For browser-safe encrypted transport in production, terminate TLS in a reverse proxy and expose `wss://`.
 
-## Architecture
-
-```
-Browser (noVNC)
-    ↓ WebSocket (ws://)
-PyVNCServer (auto-detect WebSocket)
-    ↓ VNC Protocol over WebSocket frames
-Screen Capture → Encoding (Tight) → WebSocket → Browser
-```
-
-## Performance
-
-| Metric | Value |
-|--------|-------|
-| Bandwidth | 2-5 MB/s (with Tight) |
-| Latency | 20-50ms (LAN) |
-| FPS | 30-60 |
-| Compression | 95-97% reduction |
-
-## Browser Support
-
-✅ Chrome/Chromium
-✅ Firefox
-✅ Safari
-✅ Edge
-✅ Mobile browsers
-
-## Security
-
-For production, use reverse proxy with TLS:
+Example (Nginx):
 
 ```nginx
 location / {
@@ -140,6 +83,20 @@ location / {
 }
 ```
 
----
+## Troubleshooting
 
-**That's it!** Browser-based VNC access with zero configuration.
+### Browser page loads but cannot connect
+
+- Verify `"enable_websocket": true` in `config.json`.
+- Ensure VNC server is running on the target host/port.
+- Check that firewalls allow inbound TCP on the VNC port.
+
+### Opening HTML file directly fails
+
+Use an HTTP server (`python -m http.server 8000`), because ES module imports from `web/noVNC` do not work reliably via `file://`.
+
+## Related Docs
+
+- `web/README_NOVNC.md`
+- `web/vnc_client.html`
+- https://github.com/novnc/noVNC

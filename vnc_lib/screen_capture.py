@@ -4,7 +4,6 @@ Handles screen grabbing and pixel format conversion
 Enhanced with Python 3.13 features and high-performance mss backend
 """
 
-import hashlib
 import logging
 import struct
 import time
@@ -67,6 +66,9 @@ class ScreenCapture:
         # Performance optimization: cache last screenshot
         self._cached_screenshot: Any = None
         self._cached_rgb_bytes: bytes | None = None
+        self._cached_bgra_bytes: bytes | None = None
+        self._cached_width: int = 0
+        self._cached_height: int = 0
         self._cache_time: float = 0.0
         self._cache_ttl: float = 0.016  # ~60 FPS max
 
@@ -121,6 +123,65 @@ class ScreenCapture:
         result = self.capture_fast(pixel_format)
         return result.pixel_data, result.checksum, result.width, result.height
 
+    def _is_bgr0_format(self, pixel_format: dict) -> bool:
+        """Check if client wants BGR0 format (matches native BGRA capture output)"""
+        return (
+            pixel_format.get('bits_per_pixel') == 32
+            and pixel_format.get('depth') == 24
+            and pixel_format.get('true_colour_flag', 0)
+            and not pixel_format.get('big_endian_flag', 0)
+            and pixel_format.get('red_shift') == 16
+            and pixel_format.get('green_shift') == 8
+            and pixel_format.get('blue_shift') == 0
+        )
+
+    def _is_rgb0_format(self, pixel_format: dict) -> bool:
+        """Check if client wants RGB0 format"""
+        return (
+            pixel_format.get('bits_per_pixel') == 32
+            and pixel_format.get('depth') == 24
+            and pixel_format.get('true_colour_flag', 0)
+            and not pixel_format.get('big_endian_flag', 0)
+            and pixel_format.get('red_shift') == 0
+            and pixel_format.get('green_shift') == 8
+            and pixel_format.get('blue_shift') == 16
+        )
+
+    def _grab_screen_bgra(self) -> tuple[bytes | None, int, int]:
+        """
+        Grab screenshot as raw BGRA bytes (no color conversion).
+        Only available with mss backend.
+
+        Returns:
+            (bgra_bytes, width, height) or (None, 0, 0) on error
+        """
+        current_time = time.time()
+
+        if (self._cached_bgra_bytes is not None and
+            current_time - self._cache_time < self._cache_ttl):
+            return self._cached_bgra_bytes, self._cached_width, self._cached_height
+
+        if not self._mss_available:
+            return None, 0, 0
+
+        try:
+            monitor = self._sct.monitors[self.monitor] if self.monitor < len(self._sct.monitors) else self._sct.monitors[0]
+            sct_img = self._sct.grab(monitor)
+            width = sct_img.width
+            height = sct_img.height
+            bgra_bytes = bytes(sct_img.raw)
+
+            self._cached_bgra_bytes = bgra_bytes
+            self._cached_rgb_bytes = None  # Invalidate RGB cache
+            self._cached_width = width
+            self._cached_height = height
+            self._cache_time = current_time
+
+            return bgra_bytes, width, height
+        except Exception as e:
+            self.logger.error(f"Failed to grab screen (BGRA): {e}")
+            return None, 0, 0
+
     def capture_fast(self, pixel_format: dict) -> CaptureResult:
         """
         Fast screen capture with caching
@@ -136,7 +197,24 @@ class ScreenCapture:
             self._ensure_capture_backend()
             start_time = time.perf_counter()
 
-            # Grab screenshot (with proper backend)
+            # Fast path: for 32-bit formats with mss, work directly with BGRA
+            # to avoid the expensive intermediate RGB conversion
+            if self._mss_available and self.scale_factor == 1.0:
+                bgra_bytes, width, height = self._grab_screen_bgra()
+                if bgra_bytes is not None:
+                    num_pixels = width * height
+                    pixel_data = self._convert_bgra_to_pixel_format(
+                        bgra_bytes, width, height, num_pixels, pixel_format
+                    )
+                    if pixel_data is not None:
+                        elapsed = time.perf_counter() - start_time
+                        self.logger.debug(
+                            f"Screen capture (BGRA fast path): {width}x{height}, "
+                            f"{len(pixel_data)} bytes, {elapsed*1000:.2f}ms"
+                        )
+                        return CaptureResult(pixel_data, None, width, height, elapsed)
+
+            # Standard path: grab as RGB, then convert
             rgb_bytes, width, height = self._grab_screen_rgb()
             if rgb_bytes is None:
                 return CaptureResult(None, None, 0, 0, 0.0)
@@ -169,16 +247,13 @@ class ScreenCapture:
             # Convert to requested pixel format
             pixel_data = self._convert_rgb_to_pixel_format(rgb_bytes, width, height, pixel_format)
 
-            # Calculate checksum for change detection
-            checksum = hashlib.md5(pixel_data).digest()
-
             elapsed = time.perf_counter() - start_time
             self.logger.debug(
                 f"Screen capture: {width}x{height}, "
                 f"{len(pixel_data)} bytes, {elapsed*1000:.2f}ms"
             )
 
-            return CaptureResult(pixel_data, checksum, width, height, elapsed)
+            return CaptureResult(pixel_data, None, width, height, elapsed)
 
         except Exception as e:
             self.logger.error(f"Screen capture error: {e}", exc_info=True)
@@ -241,6 +316,7 @@ class ScreenCapture:
 
             # Cache the result
             self._cached_rgb_bytes = rgb_bytes
+            self._cached_bgra_bytes = None  # Invalidate BGRA cache
             self._cached_width = width
             self._cached_height = height
             self._cache_time = current_time
@@ -326,6 +402,48 @@ class ScreenCapture:
         except Exception as e:
             self.logger.error(f"Region capture error: {e}")
             return None
+
+    def _convert_bgra_to_pixel_format(self, bgra_bytes: bytes, width: int, height: int,
+                                      num_pixels: int, pixel_format: dict) -> bytes | None:
+        """
+        Convert BGRA bytes directly to VNC pixel format, skipping intermediate RGB.
+        Returns None if the format isn't a 32-bit true color format we can handle.
+
+        Benchmark results show BGRA->RGB0 swap costs ~50ms at 1080p.
+        For BGR0 format (red_shift=16, blue_shift=0), we can skip the swap entirely.
+        """
+        bpp = pixel_format.get('bits_per_pixel', 0)
+        if bpp != 32 or not pixel_format.get('true_colour_flag', 0):
+            return None  # Fall back to standard path
+
+        big_endian = pixel_format.get('big_endian_flag', 0)
+        red_shift = pixel_format['red_shift']
+        green_shift = pixel_format['green_shift']
+        blue_shift = pixel_format['blue_shift']
+
+        pixel_size = num_pixels * 4
+        if self._pixel_buffer is None or len(self._pixel_buffer) != pixel_size:
+            self._pixel_buffer = bytearray(pixel_size)
+
+        bgra_view = memoryview(bgra_bytes)
+        pix_view = memoryview(self._pixel_buffer)
+
+        if not big_endian and red_shift == 16 and green_shift == 8 and blue_shift == 0:
+            # BGR0: native BGRA capture is B(0) G(8) R(16) A(24)
+            # The client expects B(0) G(8) R(16) with padding byte — identical layout!
+            # Use the BGRA data directly; the alpha byte (pos 3) becomes padding.
+            # True zero-copy: no channel swapping or memoryview copying needed.
+            return bgra_bytes
+
+        if not big_endian and red_shift == 0 and green_shift == 8 and blue_shift == 16:
+            # RGB0: swap B and R channels from BGRA
+            pix_view[0::4] = bgra_view[2::4]  # R (from BGRA pos 2)
+            pix_view[1::4] = bgra_view[1::4]  # G
+            pix_view[2::4] = bgra_view[0::4]  # B (from BGRA pos 0)
+            return bytes(self._pixel_buffer)
+
+        # Other 32-bit formats: fall back to standard path
+        return None
 
     def _convert_rgb_to_pixel_format(self, rgb_bytes: bytes, width: int, height: int,
                                      pixel_format: dict) -> bytes:

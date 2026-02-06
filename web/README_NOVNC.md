@@ -1,56 +1,75 @@
-# noVNC Quick Notes
+# noVNC Integration Notes
 
-PyVNCServer ships with built‑in WebSocket + noVNC support. Below are the only steps you need.
+This project includes a browser client (`web/vnc_client.html`) built on top of the bundled noVNC sources in `web/noVNC`.
 
-## 1. Ensure WebSocket is enabled
+## 1. Enable WebSocket in server config
 
-`config.json` should contain:
+Set in `config.json`:
+
 ```json
-{ "enable_websocket": true }
+{
+  "enable_websocket": true
+}
 ```
-(Default is already `true` in this repo.)
 
-## 2. Start the server
+Important: current repository default is `false`, so this must be enabled explicitly.
+
+## 2. Start PyVNCServer
 
 ```bash
 python vnc_server.py
 ```
 
-## 3. Use the bundled browser client (recommended)
+## 3. Serve the web assets
+
+From repository root:
 
 ```bash
-python -m http.server 8000        # from repo root
-# visit http://localhost:8000/web/vnc_client.html
+python -m http.server 8000
 ```
 
-Features:
-- Responsive canvas that stays visible (no CSS hacks needed)
-- FPS/Bandwidth/Resolution/Encoding stats
-- Toggleable **View only** mode (blocks mouse/keyboard)
+Open:
 
-Because the page imports `web/noVNC` via ES modules, serve it over HTTP/HTTPS (not `file://`).
+`http://localhost:8000/web/vnc_client.html`
 
-## 4. Prefer upstream noVNC UI?
+Do not open the HTML directly with `file://`; ES module imports for noVNC require HTTP/HTTPS.
 
-```bash
-git clone https://github.com/novnc/noVNC.git
-cd noVNC
-# open vnc.html or vnc_lite.html in your browser
-```
-Connect using `Host=localhost`, `Port=5900`, optional password.
+## 4. Connection settings
 
-## 5. Embedding elsewhere
+- Host: `localhost`
+- Port: `5900` (or your configured server port)
+- Password: if configured in `config.json`
 
-Import the module from `web/noVNC/core/rfb.js`:
+## Using upstream noVNC UI
+
+If you prefer upstream `vnc.html` or `vnc_lite.html`, connect directly to:
+
+`ws://<server-host>:<server-port>`
+
+PyVNCServer already supports WebSocket on the same port as VNC, so `websockify` is not required for basic usage.
+
+## Minimal embedding example
 
 ```html
 <script type="module">
   import RFB from './noVNC/core/rfb.js';
-  const rfb = new RFB(document.getElementById('screen'), 'ws://localhost:5900', {
-    credentials: { password: '' },
-  });
+
+  const rfb = new RFB(
+    document.getElementById('screen'),
+    'ws://localhost:5900',
+    { credentials: { password: '' } }
+  );
+
   rfb.scaleViewport = true;
 </script>
 ```
 
-That’s it—no websockify needed since PyVNCServer already speaks WebSocket/TCP on the same port (5900).
+## Security note
+
+For production browser access, terminate TLS at a reverse proxy and expose `wss://`.
+
+## Related docs
+
+- `WEBSOCKET.md`
+- `web/vnc_client.html`
+- https://github.com/novnc/noVNC

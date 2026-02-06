@@ -1,298 +1,198 @@
 # PyVNCServer
 
-A modern, RFC 6143 compliant VNC server implementation in pure Python 3.13, showcasing advanced language features and efficient remote desktop protocol handling.
-
 [![Python Version](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-## Overview
+PyVNCServer is an RFB (VNC) server implementation in Python. The repository combines:
+- a runnable server (`vnc_server.py`)
+- a reusable protocol/encoding library (`vnc_lib/`)
+- browser client assets (`web/`)
+- demos, tests, and benchmarks
 
-PyVNCServer is a full-featured VNC (Virtual Network Computing) server written entirely in Python 3.13. It demonstrates modern Python capabilities while providing a complete, RFC-compliant remote desktop solution.
+## Scope
 
-**Key Highlights:**
-- 🚀 Pure Python implementation (no native dependencies)
-- 📡 Full RFC 6143 protocol compliance
-- 🎯 Python 3.13 features (pattern matching, type parameters, exception groups)
-- ⚡ High performance with smart encoding and change detection
-- 📊 Built-in monitoring and metrics
+`vnc_server.py` is the main entrypoint and source of truth for runtime behavior.
 
-## Features
+The `vnc_lib/` package contains additional modules (for example session recording, clipboard helpers, Prometheus exporter, structured logging, and performance tooling). These modules are available for integration, but not all of them are wired into the default server loop.
 
-### Core VNC Protocol
-- **Protocol Versions**: RFB 3.3, 3.7, 3.8
-- **Authentication**: None, VNC Authentication (DES)
-- **Encodings**: Raw, CopyRect, RRE, Hextile, ZRLE
-- **Pixel Formats**: 8, 16, 32 bits per pixel
-- **Input Events**: Keyboard and pointer (mouse)
-- **Clipboard**: Bidirectional clipboard synchronization
+## Implemented Capabilities
 
-### Advanced Features
-- 🚀 **CopyRect Encoding** - 10-100x bandwidth reduction for scrolling
-- 📐 **Desktop Resize** - Dynamic screen resolution changes
-- 📊 **Performance Metrics** - Real-time FPS, bandwidth, and compression stats
-- 🔄 **Change Detection** - Region-based updates for optimal performance
-- 📹 **Session Recording** - Record and playback VNC sessions
-- 📈 **Prometheus Metrics** - HTTP endpoint for monitoring
-- 📝 **Structured Logging** - Context-aware logging with JSON support
-- ⚡ **Performance Monitoring** - Real-time profiling and analysis
-- 🎯 **High-Performance Screen Capture** - mss backend for 3-5x faster captures than PIL
+### Server Runtime (`vnc_server.py`)
+- RFB protocol negotiation for versions 3.3, 3.7, and 3.8
+- Security: `None` and `VNC Authentication`
+- Encodings: Raw, CopyRect, RRE, Hextile, ZRLE
+- Optional encoders: Tight, JPEG, H.264 (H.264 requires extra dependencies)
+- Incremental updates with adaptive change detection
+- Desktop size update support via pseudo-encoding
+- Network profile tuning (`localhost`, `lan`, `wan`) for frame rate and socket behavior
+- Optional WebSocket transport support for browser clients
+- Connection pool, health checks, and per-connection metrics
+- Optional parallel region encoding
 
-### Python 3.13 Features
-- Pattern matching for message handling (PEP 634)
-- Generic type parameters (PEP 695)
-- Exception groups for error handling (PEP 654)
-- Full type hints with strict validation
+### Library Modules (`vnc_lib/`)
+- Session recording and playback (`session_recorder.py`)
+- Clipboard message parsing and synchronization helpers (`clipboard.py`)
+- Prometheus metrics exporter (`prometheus_exporter.py`)
+- Structured logging helpers (`structured_logging.py`)
+- Performance monitoring utilities (`metrics.py`, `performance_monitor.py`)
 
 ## Requirements
 
-- **Python 3.13+**
-- **Linux** with X11 or Xvfb
-- Dependencies:
-  - `mss>=9.0.0` - High-performance screen capture (recommended)
-  - `Pillow>=10.0.0` - Fallback screen capture and image processing
-  - `pycryptodome>=3.19.0` - VNC authentication
+- Python 3.13+ (CI is configured for Python 3.13)
+- GUI-capable environment for screen capture and input simulation
+- Dependencies from `requirements.txt`:
+  - `mss` (preferred capture backend)
+  - `Pillow`
+  - `pyautogui`
+  - `pycryptodome`
+  - `numpy`
+- Optional for H.264:
+  - `av` (PyAV) and FFmpeg libraries
+
+## Installation
+
+```bash
+git clone https://github.com/xulek/PyVNCServer.git
+cd PyVNCServer
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
 ## Quick Start
 
-### Installation
+1. Review `config.json` and set at least `host`, `port`, and `password`.
+2. Start the server:
 
 ```bash
-# Clone repository
-git clone https://github.com/xulek/PyVNCServer.git
-cd PyVNCServer
-
-# Install dependencies
-pip install -r requirements.txt
+python vnc_server.py
 ```
 
-### Basic Usage
+3. Connect with a VNC client (example):
 
 ```bash
-# Start server (default: port 5900, no password)
-python vnc_server.py
-
-# Connect with any VNC client
 vncviewer localhost:5900
-
-# Or use the bundled browser client
-python -m http.server 8000   # serve ./web assets (required for ES modules)
-# then open http://localhost:8000/web/vnc_client.html
 ```
 
-The web client includes FPS/bandwidth stats plus a **View only** toggle so you can monitor sessions without sending keyboard/mouse input.
+## Browser Access (WebSocket + noVNC)
 
-### Configuration
+1. Set `"enable_websocket": true` in `config.json`.
+2. Start the VNC server:
 
-Edit `config.json` for custom settings:
-
-```json
-{
-    "host": "0.0.0.0",
-    "port": 5900,
-    "password": "your_password",
-    "frame_rate": 30,
-    "max_connections": 10,
-    "enable_metrics": true,
-    "log_level": "INFO"
-}
-```
-
-Then run:
 ```bash
 python vnc_server.py
 ```
 
-## Usage Examples
+3. Serve web assets from project root:
 
-### Basic Server
+```bash
+python -m http.server 8000
+```
+
+4. Open:
+
+`http://localhost:8000/web/vnc_client.html`
+
+Additional details are documented in `WEBSOCKET.md` and `web/README_NOVNC.md`.
+
+## Configuration
+
+The repository ships with a ready-to-edit `config.json`. Key fields:
+
+| Key | Type | Description |
+|---|---|---|
+| `host` | `str` | Bind address |
+| `port` | `int` | VNC port |
+| `password` | `str` | Empty string disables auth |
+| `frame_rate` | `int` | Target FPS for WAN profile |
+| `lan_frame_rate` | `int` | Target FPS for LAN profile |
+| `network_profile_override` | `null \| "localhost" \| "lan" \| "wan"` | Forces profile, bypasses auto-detection |
+| `scale_factor` | `float` | Capture scaling factor |
+| `max_connections` | `int` | Max simultaneous clients |
+| `enable_region_detection` | `bool` | Incremental update optimization |
+| `enable_cursor_encoding` | `bool` | Cursor pseudo-encoding support |
+| `enable_metrics` | `bool` | Internal metrics collection |
+| `enable_tight_encoding` | `bool` | Tight encoder availability |
+| `tight_disable_for_ultravnc` | `bool` | Compatibility workaround for UltraVNC-like clients |
+| `enable_jpeg_encoding` | `bool` | JPEG encoder availability |
+| `enable_h264_encoding` | `bool` | H.264 encoder availability (requires optional deps) |
+| `enable_parallel_encoding` | `bool` | Parallel region encoding |
+| `encoding_threads` | `int \| null` | Worker count for parallel encoding |
+| `enable_websocket` | `bool` | WebSocket transport support |
+| `log_level` | `str` | Python logging level |
+| `log_file` | `str \| null` | Optional file logging target |
+
+## Programmatic Startup
+
+`vnc_server.py` does not expose CLI flags for config selection. For a custom config path, start it programmatically:
 
 ```python
-from vnc_lib import VNCServer
+from vnc_server import VNCServerV3
 
-server = VNCServer(config_file="config.json")
+server = VNCServerV3(config_file="config.production.json")
 server.start()
 ```
 
-### Session Recording
+## Examples
 
-```python
-from vnc_lib import SessionRecorder
-
-with SessionRecorder('session.vnc.gz') as recorder:
-    recorder.record_handshake(b'RFB 003.008\n')
-    recorder.record_key_event(key=65, down=True)
-    # Session automatically saved on exit
+```bash
+python examples/advanced_features_demo.py
+python examples/python313_features_demo.py
 ```
 
-### Prometheus Metrics
+## Benchmarks
 
-```python
-from vnc_lib import PrometheusExporter
-
-with PrometheusExporter(port=9100) as exporter:
-    collector = exporter.collector
-    collector.record_connection(success=True)
-    collector.record_bytes_sent(1024, encoding='zrle')
-    # Metrics available at http://localhost:9100/metrics
+```bash
+python benchmarks/benchmark_lan_latency.py 127.0.0.1 5900 20
+python benchmarks/benchmark_screen_capture.py
+python benchmarks/benchmark_screen_capture_methods.py 20
 ```
-
-### Structured Logging
-
-```python
-from vnc_lib import get_logger, LogContext
-
-logger = get_logger('vnc_server')
-
-with LogContext(client_ip='192.168.1.100'):
-    logger.info("Client connected")
-    # All logs include client_ip context
-```
-
-## Architecture
-
-```
-vnc_lib/
-├── protocol.py             # RFB protocol implementation
-├── encodings.py            # Encoding implementations
-├── screen_capture.py       # Screen grabbing
-├── input_handler.py        # Keyboard/mouse input
-├── session_recorder.py     # Session recording
-├── clipboard.py            # Clipboard sync
-├── prometheus_exporter.py  # Metrics export
-├── structured_logging.py   # Enhanced logging
-├── performance_monitor.py  # Performance profiling
-└── connection_pool.py      # Connection management
-```
-
-## Configuration Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `host` | "0.0.0.0" | Bind address |
-| `port` | 5900 | VNC port |
-| `password` | "" | Authentication password (empty = no auth) |
-| `frame_rate` | 30 | Target FPS (1-60) |
-| `max_connections` | 10 | Maximum concurrent clients |
-| `enable_region_detection` | true | Region-based change detection |
-| `enable_metrics` | true | Performance metrics collection |
-| `log_level` | "INFO" | Logging level |
-
-## Performance
-
-### Screen Capture Performance
-
-PyVNCServer uses **mss** (Multiple Screen Shots) as the primary backend for high-performance screen capture:
-
-| Backend | Capture Speed | CPU Usage | Notes |
-|---------|--------------|-----------|-------|
-| **mss** | ~5-15ms | Low | **Recommended** - 3-5x faster than PIL |
-| **PIL** | ~20-50ms | Medium | Automatic fallback if mss unavailable |
-
-Benefits of mss backend:
-- ⚡ **3-5x faster** screen captures compared to PIL/Pillow
-- 🔋 **Lower CPU usage** due to direct system API access
-- 🎯 **Zero PIL overhead** - direct BGRA to RGB conversion
-- 📦 **Smaller memory footprint** - no intermediate PIL Image objects
-
-### Encoding Performance
-
-| Encoding | Use Case | Bandwidth | CPU |
-|----------|----------|-----------|-----|
-| **Raw** | Fallback | Highest | Lowest |
-| **CopyRect** | Scrolling | 1-2% of Raw | Minimal |
-| **RRE** | Static content | 20-40% of Raw | Low |
-| **Hextile** | Dynamic content | 30-60% of Raw | Medium |
-| **ZRLE** | Mixed content | 10-30% of Raw | Higher |
-
-### Real-World Performance
-
-- **Static desktop**: ~100 bytes/frame (99.98% reduction)
-- **Scrolling**: ~2 KB/frame with CopyRect
-- **Video playback**: ~150 KB/frame
-- **Change detection**: 95-99% bandwidth savings on static content
 
 ## Testing
 
 ```bash
-# Run all tests
-python -m pytest tests/
-
-# With coverage
-python -m pytest --cov=vnc_lib tests/
+python -m pytest tests/ -v --tb=short
+python -m pytest tests/ -v --cov=vnc_lib --cov-report=term-missing
 ```
 
-## Security Considerations
+## Project Layout
 
-⚠️ **Important**:
-- VNC Authentication uses DES (weak by modern standards)
-- No TLS/SSL encryption - use SSH tunnel for production
-- No built-in brute-force protection
-
-### Recommended Secure Setup
-
-```bash
-# SSH tunnel (recommended)
-ssh -L 5900:localhost:5900 user@server
-
-# Then connect to localhost:5900
-vncviewer localhost:5900
+```text
+benchmarks/          Performance and latency scripts
+examples/            Runnable demo scripts
+tests/               Unit tests
+vnc_lib/             Core protocol, encoding, and utility modules
+web/                 Browser client assets and noVNC integration
+vnc_server.py        Server entrypoint
+config.json          Runtime configuration template
 ```
+
+## Security Notes
+
+- VNC authentication is DES-based challenge/response and should be treated as legacy protection.
+- Traffic is not encrypted by default.
+- For production, run behind SSH tunneling or TLS-terminating reverse proxy/VPN.
+- Expose the server only on trusted networks.
 
 ## Troubleshooting
 
-### Permission denied on screen capture
+### No screen capture/input in Linux headless environments
+
+`pyautogui` and capture backends require a graphical session. For X11:
+
 ```bash
-xhost +local:
 export DISPLAY=:0
 ```
 
-### Low frame rate / high latency
-- Check encoding selection
-- Disable region detection for faster updates
-- Reduce frame_rate in config
+For headless servers, run an X server/Xvfb and ensure the process has display access.
 
-### High CPU usage
-- Reduce frame_rate
-- Enable region_detection
-- Use more efficient encoding (ZRLE)
+### `mss` or `Pillow` import/runtime issues
 
-## Development
+Reinstall dependencies:
 
 ```bash
-# Debug mode
-python vnc_server.py --log-level DEBUG
-
-# Run demo
-python examples/advanced_features_demo.py
+python -m pip install -r requirements.txt
 ```
-
-## Roadmap
-
-- [ ] TLS/SSL encryption (VeNCrypt)
-- [ ] Tight encoding support
-- [ ] H.264/VP9 video encoding
-- [ ] WebSocket support (noVNC compatibility)
-- [ ] Multi-threaded encoding
-
-## Contributing
-
-Contributions welcome! Please:
-1. Use Python 3.13 features where appropriate
-2. Maintain RFC 6143 compliance
-3. Add type hints to all functions
-4. Include tests for new features
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## References
-
-- [RFC 6143 - The Remote Framebuffer Protocol](https://datatracker.ietf.org/doc/html/rfc6143)
-- [PEP 634 - Structural Pattern Matching](https://peps.python.org/pep-0634/)
-- [PEP 695 - Type Parameter Syntax](https://peps.python.org/pep-0695/)
-- [PEP 654 - Exception Groups](https://peps.python.org/pep-0654/)
-
----
-
-**Note**: This is an educational/demonstration project showcasing Python 3.13 features. For production use, consider established VNC servers with full security features.
+MIT. See `LICENSE`.

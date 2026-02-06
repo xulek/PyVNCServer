@@ -3,7 +3,7 @@ Region-based change detection for efficient screen updates
 Implements intelligent dirty region tracking
 """
 
-import hashlib
+import zlib
 import logging
 from typing import NamedTuple
 from collections.abc import Iterator
@@ -61,8 +61,8 @@ class TileGrid:
         self.tiles_x = (width + tile_size - 1) // tile_size
         self.tiles_y = (height + tile_size - 1) // tile_size
 
-        # Store checksums for each tile
-        self.tile_checksums: dict[tuple[int, int], bytes] = {}
+        # Store checksums for each tile (CRC32 is 3-5x faster than MD5)
+        self.tile_checksums: dict[tuple[int, int], int] = {}
 
         self.logger = logging.getLogger(__name__)
 
@@ -88,8 +88,8 @@ class TileGrid:
                     pixel_data, tx, ty, bytes_per_pixel
                 )
 
-                # Calculate checksum
-                checksum = hashlib.md5(tile_data).digest()
+                # Calculate checksum (CRC32 is faster than MD5 for non-crypto use)
+                checksum = zlib.crc32(tile_data)
 
                 # Compare with previous
                 key = (tx, ty)
@@ -237,8 +237,9 @@ class AdaptiveChangeDetector:
         # Tile-based detection for normal activity
         self.tile_grid = TileGrid(width, height, tile_size=64)
 
-        # Full-screen checksum for low activity
-        self.full_checksum: bytes | None = None
+        # Full-screen sampled bytes for quick-check (faster than MD5)
+        self._prev_sample: bytes | None = None
+        self._prev_length: int = 0
 
         # Activity tracking
         self.change_history: list[float] = []  # % of screen changed
@@ -258,15 +259,16 @@ class AdaptiveChangeDetector:
         Returns:
             List of changed regions, or None if full update needed
         """
-        # First, check if anything changed at all
-        current_checksum = hashlib.md5(pixel_data).digest()
-
-        if self.full_checksum == current_checksum:
-            # No changes at all
-            return []
-
-        # Update full checksum
-        self.full_checksum = current_checksum
+        # Quick-check: sample every 4096th byte for O(n/4096) comparison
+        data_len = len(pixel_data)
+        if data_len == self._prev_length and self._prev_sample is not None:
+            sample = pixel_data[::4096]
+            if sample == self._prev_sample:
+                return []
+            self._prev_sample = sample
+        else:
+            self._prev_sample = pixel_data[::4096]
+            self._prev_length = data_len
 
         # Use tile-based detection
         changed_regions = self.tile_grid.update_and_get_changed(
@@ -296,11 +298,13 @@ class AdaptiveChangeDetector:
         self.width = width
         self.height = height
         self.tile_grid.resize(width, height)
-        self.full_checksum = None
+        self._prev_sample = None
+        self._prev_length = 0
         self.change_history.clear()
 
     def reset(self):
         """Reset change detection state"""
         self.tile_grid.reset()
-        self.full_checksum = None
+        self._prev_sample = None
+        self._prev_length = 0
         self.change_history.clear()

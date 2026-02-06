@@ -5,6 +5,7 @@ Handles keyboard and mouse events with proper state tracking
 
 import logging
 import os
+import time
 from typing import Dict, Optional
 
 
@@ -33,6 +34,12 @@ class InputHandler:
 
         # Mouse safety margin (prevent clicks near screen edges)
         self.safe_margin = 10
+
+        # Cached screen dimensions (avoid calling pyautogui.size() on every event)
+        self._screen_width: int = 0
+        self._screen_height: int = 0
+        self._screen_size_time: float = 0.0
+        self._screen_size_ttl: float = 5.0  # Refresh every 5 seconds
 
         # Lazy load pyautogui (only when needed and display is available)
         self._pyautogui = None
@@ -81,8 +88,12 @@ class InputHandler:
             actual_x = int(x / self.scale_factor)
             actual_y = int(y / self.scale_factor)
 
-            # Get screen dimensions
-            screen_width, screen_height = self._pyautogui.size()
+            # Get screen dimensions (cached with TTL)
+            now = time.monotonic()
+            if now - self._screen_size_time > self._screen_size_ttl:
+                self._screen_width, self._screen_height = self._pyautogui.size()
+                self._screen_size_time = now
+            screen_width, screen_height = self._screen_width, self._screen_height
 
             # Safety check - don't move cursor near edges
             if (actual_x < self.safe_margin or

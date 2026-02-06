@@ -12,15 +12,16 @@ This script demonstrates all the Python 3.13 enhancements in the VNC server:
 5. Enhanced Type Narrowing
 6. Improved Error Messages
 
-Run with: python3.13 python313_features_demo.py
+Run with: python3.13 examples/python313_features_demo.py
 """
 
 import sys
 import logging
 from pathlib import Path
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from vnc_lib.metrics import SlidingWindow
 from vnc_lib.exceptions import (

@@ -7,9 +7,44 @@ import signal
 import threading
 import logging
 import time
-from dataclasses import dataclass, field
+import ipaddress
+from dataclasses import dataclass
+from enum import Enum
 from typing import Callable
-from collections.abc import Sequence
+
+
+class NetworkProfile(Enum):
+    """Network profile for connection optimization"""
+    LOCALHOST = "localhost"
+    LAN = "lan"
+    WAN = "wan"
+
+
+def detect_network_profile(client_ip: str) -> NetworkProfile:
+    """
+    Detect network profile based on client IP address.
+
+    Args:
+        client_ip: Client IP address string
+
+    Returns:
+        NetworkProfile enum value
+    """
+    try:
+        addr = ipaddress.ip_address(client_ip)
+    except ValueError:
+        # If we can't parse it, treat as WAN (safest default)
+        return NetworkProfile.WAN
+
+    # Loopback -> LOCALHOST
+    if addr.is_loopback:
+        return NetworkProfile.LOCALHOST
+
+    # Private networks (10.x, 172.16-31.x, 192.168.x) and link-local -> LAN
+    if addr.is_private or addr.is_link_local:
+        return NetworkProfile.LAN
+
+    return NetworkProfile.WAN
 
 
 @dataclass

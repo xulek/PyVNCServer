@@ -191,5 +191,5 @@ performance_logs/
 session_recordings/
 captured_frames/
 connection_logs/
-
+.claude
 .history

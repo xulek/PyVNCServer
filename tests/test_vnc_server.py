@@ -53,6 +53,75 @@ def test_intersect_regions_filters_to_request_rectangle():
     assert filtered == [(25, 25, 25, 25), (60, 60, 5, 5)]
 
 
+def test_collapse_regions_to_bounding_box():
+    server = _server_without_init()
+
+    collapsed = server._collapse_regions_to_bounding_box(
+        [(10, 10, 20, 20), (40, 30, 10, 15), (5, 8, 4, 6)]
+    )
+
+    assert collapsed == [(5, 8, 45, 37)]
+
+
+def test_collapse_regions_to_bounding_box_handles_single_region():
+    server = _server_without_init()
+
+    collapsed = server._collapse_regions_to_bounding_box([(10, 10, 20, 20)])
+
+    assert collapsed == [(10, 10, 20, 20)]
+
+
+def test_should_delay_tight_for_ultravnc_by_request_count():
+    server = _server_without_init()
+    server.ultravnc_tight_warmup_requests = 5
+    server.ultravnc_tight_warmup_seconds = 0.0
+
+    assert server._should_delay_tight_for_ultravnc(
+        ultravnc_like_client=True,
+        fburq_count=3,
+        first_fburq_time=10.0,
+        now=11.0,
+    ) is True
+    assert server._should_delay_tight_for_ultravnc(
+        ultravnc_like_client=True,
+        fburq_count=6,
+        first_fburq_time=10.0,
+        now=11.0,
+    ) is False
+
+
+def test_should_delay_tight_for_ultravnc_by_time_window():
+    server = _server_without_init()
+    server.ultravnc_tight_warmup_requests = 0
+    server.ultravnc_tight_warmup_seconds = 2.0
+
+    assert server._should_delay_tight_for_ultravnc(
+        ultravnc_like_client=True,
+        fburq_count=50,
+        first_fburq_time=100.0,
+        now=101.5,
+    ) is True
+    assert server._should_delay_tight_for_ultravnc(
+        ultravnc_like_client=True,
+        fburq_count=50,
+        first_fburq_time=100.0,
+        now=102.1,
+    ) is False
+
+
+def test_should_delay_tight_for_ultravnc_false_for_non_ultravnc():
+    server = _server_without_init()
+    server.ultravnc_tight_warmup_requests = 50
+    server.ultravnc_tight_warmup_seconds = 10.0
+
+    assert server._should_delay_tight_for_ultravnc(
+        ultravnc_like_client=False,
+        fburq_count=1,
+        first_fburq_time=0.0,
+        now=0.1,
+    ) is False
+
+
 def test_extract_region_handles_bounds_safely():
     server = _server_without_init()
     pixel_data = bytes(range(12))  # 4x3, bpp=1
@@ -224,6 +293,34 @@ def test_select_encoder_for_update_lan_falls_back_to_zlib_without_tight():
     enc_type, _ = server._select_encoder_for_update(
         manager,
         {0, 6, 16},
+        NetworkProfile.LAN,
+        width=1920,
+        height=1080,
+        fb_width=1920,
+        fb_height=1080,
+        content_type="lan",
+        prefer_zlib_override=True,
+        bytes_per_pixel=4,
+    )
+    assert enc_type == 6
+
+
+def test_select_encoder_for_update_lan_disables_tight_for_ultravnc_like_client():
+    server = _server_without_init()
+    server.enable_lan_adaptive_encoding = True
+    server.lan_prefer_zlib = True
+    server.lan_zlib_area_threshold = 0.10
+    server.lan_zlib_min_pixels = 4096
+    server.lan_raw_area_threshold = 0.01
+    server.lan_raw_max_pixels = 10
+    server.lan_jpeg_area_threshold = 0.95
+    server.lan_jpeg_min_pixels = 9999999
+
+    manager = _DummyEncoderManager({0: object(), 6: object(), 7: object(), 16: object()})
+    manager._disable_tight_for_ultravnc = True
+    enc_type, _ = server._select_encoder_for_update(
+        manager,
+        {0, 6, 7, 9, 10, 16},  # UltraVNC-like (9/10 present)
         NetworkProfile.LAN,
         width=1920,
         height=1080,
@@ -431,6 +528,18 @@ def test_adjust_lan_jpeg_quality_reacts_to_timing():
     assert raised >= lowered
 
 
+def test_configure_tight_compatibility_for_ultravnc_like_client():
+    server = _server_without_init()
+    tight = _TightModeRecorder()
+    manager = _DummyEncoderManager({7: tight})
+
+    server._configure_tight_compatibility(manager, {0, 7, 9, 10})
+    assert tight.enabled_values[-1] is True
+
+    server._configure_tight_compatibility(manager, {0, 7, 16})
+    assert tight.enabled_values[-1] is False
+
+
 class _FakeSocket:
     """Socket-like object for MSG_PEEK tests."""
 
@@ -465,3 +574,11 @@ class _DummyEncoderManager:
             return 0, self.encoders[0]
         first_key = next(iter(self.encoders))
         return first_key, self.encoders[first_key]
+
+
+class _TightModeRecorder:
+    def __init__(self):
+        self.enabled_values = []
+
+    def set_stream_reset_mode(self, enabled):
+        self.enabled_values.append(bool(enabled))

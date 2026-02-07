@@ -7,6 +7,7 @@ Combines multiple compression methods for optimal performance
 import struct
 import zlib
 import logging
+import threading
 from typing import TypeAlias
 from enum import IntEnum
 
@@ -55,6 +56,7 @@ class TightEncoder:
     COMPRESSION_MIN = 1
     COMPRESSION_MAX = 9
     COMPRESSION_DEFAULT = 6
+    MIN_TO_COMPRESS = 12
 
     def __init__(self, compression_level: int = COMPRESSION_DEFAULT):
         """
@@ -73,6 +75,8 @@ class TightEncoder:
             i: zlib.compressobj(self.compression_level, zlib.DEFLATED, zlib.MAX_WBITS)
             for i in range(4)
         }
+        self._compressor_lock = threading.Lock()
+        self._reset_stream_each_rect = False
 
     def encode(self, pixel_data: PixelData, width: int, height: int,
                bytes_per_pixel: int) -> EncodedData:
@@ -89,14 +93,24 @@ class TightEncoder:
             self.logger.warning(f"Tight: unsupported bpp {bytes_per_pixel}, using raw")
             return self._encode_raw(pixel_data, width, height, bytes_per_pixel)
 
+        # Tight true-color payload is RGB TPIXEL (3 bytes). The server's native
+        # framebuffer is BGRX for 32bpp, so normalize upfront to avoid malformed
+        # palette/fill payloads and channel swaps in clients.
+        if bytes_per_pixel == 4:
+            tight_pixels = self._convert_bgrx_to_rgb(pixel_data)
+            tight_bpp = 3
+        else:
+            tight_pixels = pixel_data
+            tight_bpp = bytes_per_pixel
+
         # Solid color fill — 4 bytes for entire rectangle
-        if self._is_solid_fill(pixel_data, bytes_per_pixel):
-            return self._encode_fill(pixel_data, bytes_per_pixel)
+        if self._is_solid_fill(tight_pixels, tight_bpp):
+            return self._encode_fill(tight_pixels, tight_bpp)
 
         # Palette encoding — very efficient for text, buttons, window chrome
-        palette = self._extract_palette(pixel_data, bytes_per_pixel, max_colors=256)
+        palette = self._extract_palette(tight_pixels, tight_bpp, max_colors=256)
         if palette and len(palette) <= 256:
-            return self._encode_palette(pixel_data, width, height, bytes_per_pixel, palette)
+            return self._encode_palette(tight_pixels, width, height, tight_bpp, palette)
 
         # Gradient filter disabled — pure-Python nested loop is too CPU-expensive
         # for LAN targets. _apply_gradient_filter is O(width*height*bpp) per-pixel.
@@ -104,7 +118,21 @@ class TightEncoder:
         #     return self._encode_gradient(pixel_data, width, height, bytes_per_pixel)
 
         # Default: basic zlib compression (with TPIXEL 3-byte format for 32bpp)
-        return self._encode_basic(pixel_data, width, height, bytes_per_pixel)
+        return self._encode_basic(tight_pixels, width, height, tight_bpp)
+
+    def _convert_bgrx_to_rgb(self, pixel_data: PixelData) -> PixelData:
+        """Convert BGRX pixels to Tight RGB TPIXEL bytes."""
+        if not pixel_data:
+            return b""
+
+        num_pixels = len(pixel_data) // 4
+        src = memoryview(pixel_data)
+        rgb_buf = bytearray(num_pixels * 3)
+        dst = memoryview(rgb_buf)
+        dst[0::3] = src[2::4]  # R
+        dst[1::3] = src[1::4]  # G
+        dst[2::3] = src[0::4]  # B
+        return bytes(rgb_buf)
 
     def _is_solid_fill(self, pixel_data: PixelData, bpp: int,
                        num_samples: int = 256) -> bool:
@@ -137,14 +165,7 @@ class TightEncoder:
         """
         control = TightCompressionControl.FILL
 
-        # For 32bpp true-color, TPIXEL is 3 bytes (RGB), not 4
-        # Extract RGB components (assuming BGRA format)
-        if bpp == 4:
-            # 32bpp: send only RGB (3 bytes), skip alpha/padding
-            pixel_value = pixel_data[:3]  # First 3 bytes = BGR or RGB
-        else:
-            # For other bpp, use full pixel
-            pixel_value = pixel_data[:bpp]
+        pixel_value = pixel_data[:bpp]
 
         result = struct.pack("B", control) + pixel_value
 
@@ -193,8 +214,7 @@ class TightEncoder:
         - compressed indices
 
         For 2 colors: uses 1 bit per pixel
-        For 3-16 colors: uses 4 bits per pixel
-        For 17-256 colors: uses 8 bits per pixel
+        For 3-256 colors: uses 8 bits per pixel
         """
         num_colors = len(palette)
 
@@ -223,19 +243,19 @@ class TightEncoder:
         if num_colors == 2:
             # 1 bit per pixel (packed into bytes)
             indices = self._pack_indices_1bit(pixel_data, bpp, palette_map, width, height)
-        elif num_colors <= 16:
-            # 4 bits per pixel
-            indices = self._pack_indices_4bit(pixel_data, bpp, palette_map)
         else:
-            # 8 bits per pixel
+            # 8 bits per pixel for 3..256 colors (per Tight spec).
             indices = self._pack_indices_8bit(pixel_data, bpp, palette_map)
 
-        # Compress indices with zlib
-        compressed = zlib.compress(indices, self.compression_level)
-
-        # Add compressed length (compact format)
-        result.extend(self._encode_compact_length(len(compressed)))
-        result.extend(compressed)
+        if len(indices) < self.MIN_TO_COMPRESS:
+            # Tight requires small filtered payloads (<12 bytes) to be sent raw.
+            result.extend(indices)
+        else:
+            # Compress indices with zlib
+            compressed = self._compress_fresh_stream(indices)
+            # Add compressed length (compact format)
+            result.extend(self._encode_compact_length(len(compressed)))
+            result.extend(compressed)
 
         self.logger.debug(f"Tight PALETTE ({num_colors} colors): {len(pixel_data)} -> "
                          f"{len(result)} bytes ({len(pixel_data) / len(result):.1f}x)")
@@ -272,34 +292,9 @@ class TightEncoder:
 
         return bytes(result)
 
-    def _pack_indices_4bit(self, pixel_data: PixelData, bpp: int,
-                          palette_map: dict[bytes, int]) -> bytes:
-        """Pack palette indices as 4 bits per pixel (for 3-16 color palettes)"""
-        result = bytearray()
-        high_nibble = True
-        byte_val = 0
-
-        for i in range(0, len(pixel_data), bpp):
-            pixel = pixel_data[i:i+bpp]
-            index = palette_map.get(pixel, 0)
-
-            if high_nibble:
-                byte_val = (index & 0x0F) << 4
-                high_nibble = False
-            else:
-                byte_val |= (index & 0x0F)
-                result.append(byte_val)
-                high_nibble = True
-
-        # Flush last nibble if needed
-        if not high_nibble:
-            result.append(byte_val)
-
-        return bytes(result)
-
     def _pack_indices_8bit(self, pixel_data: PixelData, bpp: int,
                           palette_map: dict[bytes, int]) -> bytes:
-        """Pack palette indices as 8 bits per pixel (for 17-256 color palettes)"""
+        """Pack palette indices as 8 bits per pixel (for 3-256 color palettes)"""
         result = bytearray()
 
         for i in range(0, len(pixel_data), bpp):
@@ -371,13 +366,14 @@ class TightEncoder:
         # Apply gradient filter
         filtered = self._apply_gradient_filter(pixel_data, width, height, bpp)
 
-        # Compress filtered data
-        compressed = zlib.compress(filtered, self.compression_level)
-
         # Build result
         result = bytearray([control, TightCompressionControl.FILTER_GRADIENT])
-        result.extend(self._encode_compact_length(len(compressed)))
-        result.extend(compressed)
+        if len(filtered) < self.MIN_TO_COMPRESS:
+            result.extend(filtered)
+        else:
+            compressed = self._compress_fresh_stream(filtered)
+            result.extend(self._encode_compact_length(len(compressed)))
+            result.extend(compressed)
 
         self.logger.debug(f"Tight GRADIENT: {len(pixel_data)} -> {len(result)} bytes "
                          f"({len(pixel_data) / len(result):.1f}x)")
@@ -445,29 +441,36 @@ class TightEncoder:
         - 1-3 bytes: compact length of compressed data
         - N bytes: zlib-compressed pixel data from persistent stream
         """
-        # Convert to Tight pixel format (TPIXEL).
-        # For 32bpp, depth 24, Tight always uses 3 bytes per pixel (R,G,B).
-        # ScreenCapture returns 4 bytes per pixel (e.g. RGBX), so drop padding.
-        if bpp == 4:
-            num_pixels = width * height
-            src = memoryview(pixel_data)
-            rgb_buf = bytearray(num_pixels * 3)
-            rgb_view = memoryview(rgb_buf)
-            # Copy R, G, B channels; ignore 4th byte (padding/alpha)
-            rgb_view[0::3] = src[0::4]
-            rgb_view[1::3] = src[1::4]
-            rgb_view[2::3] = src[2::4]
-            tight_bytes = bytes(rgb_buf)
-        else:
-            tight_bytes = pixel_data
+        tight_bytes = pixel_data
 
-        # Use persistent zlib stream 0 (LibVNCServer-style).
         stream_id = self.STREAM_RAW
-        control = 0x00  # stream 0, basic, no explicit filter, no reset bits
+        if len(tight_bytes) < self.MIN_TO_COMPRESS:
+            # Tight requires small basic payloads (<12 bytes) to be sent raw
+            # without the compact-length field.
+            control = 1 << stream_id if self._reset_stream_each_rect else 0x00
+            result = bytes([control]) + tight_bytes
+            self.logger.debug(
+                "Tight BASIC (raw small): %d -> %d bytes, control=0x%02x",
+                len(pixel_data),
+                len(result),
+                control,
+            )
+            return result
 
-        compressor = self.compressors[stream_id]
-        compressed = compressor.compress(tight_bytes)
-        compressed += compressor.flush(zlib.Z_SYNC_FLUSH)
+        if self._reset_stream_each_rect:
+            # Compatibility mode for UltraVNC-like decoders: reset stream 0
+            # before every Tight basic rectangle.
+            control = 1 << stream_id
+            # Use a fresh zlib stream with sync flush. This avoids emitting
+            # Z_STREAM_END for each rectangle while still being independent.
+            compressed = self._compress_fresh_stream(tight_bytes)
+        else:
+            # Use persistent zlib stream 0 (LibVNCServer-style).
+            control = 0x00  # stream 0, basic, no explicit filter, no reset bits
+            with self._compressor_lock:
+                compressor = self.compressors[stream_id]
+                compressed = compressor.compress(tight_bytes)
+                compressed += compressor.flush(zlib.Z_SYNC_FLUSH)
 
         # Build result with compact length
         result = bytearray([control])
@@ -495,6 +498,19 @@ class TightEncoder:
         control = TightCompressionControl.NO_ZLIB
         return bytes([control]) + pixel_data
 
+    def _compress_fresh_stream(self, payload: bytes) -> bytes:
+        """
+        Compress payload using a fresh zlib stream and Z_SYNC_FLUSH.
+
+        Tight decoders consume rectangle payloads as stream fragments. Using
+        sync flush avoids ending the stream on each rectangle (no Z_STREAM_END),
+        which improves compatibility with older decoders.
+        """
+        compressor = zlib.compressobj(
+            self.compression_level, zlib.DEFLATED, zlib.MAX_WBITS
+        )
+        return compressor.compress(payload) + compressor.flush(zlib.Z_SYNC_FLUSH)
+
     def _encode_compact_length(self, length: int) -> bytes:
         """
         Encode length in Tight's compact format
@@ -520,3 +536,16 @@ class TightEncoder:
             for i in range(4)
         }
         self.logger.debug("Tight encoder compressors reset")
+
+    def set_stream_reset_mode(self, enabled: bool):
+        """
+        Enable/disable per-rectangle stream reset compatibility mode.
+        """
+        enabled = bool(enabled)
+        if enabled != self._reset_stream_each_rect:
+            self._reset_stream_each_rect = enabled
+            self.reset_compressors()
+            self.logger.info(
+                "Tight stream reset mode %s",
+                "enabled" if enabled else "disabled",
+            )

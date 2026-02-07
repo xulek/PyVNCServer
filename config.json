@@ -35,6 +35,8 @@
   "_advanced_encodings": "New high-performance encoding options (experimental - test before production use)",
   "enable_tight_encoding": true,
   "tight_disable_for_ultravnc": true,
+  "ultravnc_tight_warmup_requests": 16,
+  "ultravnc_tight_warmup_seconds": 2.5,
   "enable_jpeg_encoding": true,
   "enable_h264_encoding": false,
 
@@ -81,6 +83,9 @@
     "enable_region_detection": "Reduces bandwidth for incremental updates (auto-disabled for localhost)",
     "enable_metrics": "Enables performance monitoring and statistics",
     "enable_tight_encoding": "20-100x compression (experimental - may have issues with some clients)",
+    "tight_disable_for_ultravnc": "If true, never use Tight for UltraVNC-like clients (encodings 9/10)",
+    "ultravnc_tight_warmup_requests": "For UltraVNC-like clients, delay Tight until this many FB update requests pass",
+    "ultravnc_tight_warmup_seconds": "For UltraVNC-like clients, delay Tight for at least this many seconds after first FB request",
     "enable_jpeg_encoding": "50-200x compression for photos/video (experimental, requires testing)",
     "enable_h264_encoding": "50-500x compression for video streaming (experimental, requires PyAV)",
     "enable_parallel_encoding": "2-4x faster encoding on multi-core CPUs",

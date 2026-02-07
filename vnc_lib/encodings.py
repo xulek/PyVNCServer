@@ -16,6 +16,56 @@ EncodedData: TypeAlias = bytes
 Rectangle: TypeAlias = tuple[int, int, int, int]  # x, y, width, height
 
 
+_ENCODING_NAME_MAP: dict[int, str] = {
+    0: "Raw",
+    1: "CopyRect",
+    2: "RRE",
+    5: "Hextile",
+    6: "Zlib",
+    7: "Tight",
+    16: "ZRLE",
+    21: "JPEG",
+    50: "H.264",
+    9: "Ultra",
+    10: "TRLE",
+    -223: "DesktopSize",
+    -224: "LastRect",
+    -239: "Cursor",
+    -308: "ExtendedDesktopSize",
+    -314: "ContinuousUpdates",
+}
+
+
+def encoding_name(enc_type: int) -> str:
+    """
+    Return human-readable name for an encoding/pseudo-encoding id.
+    """
+    if enc_type in _ENCODING_NAME_MAP:
+        return _ENCODING_NAME_MAP[enc_type]
+
+    # Tight JPEG quality pseudo-encodings: -23..-32 (9..0)
+    if -32 <= enc_type <= -23:
+        quality_level = enc_type + 32
+        return f"JPEGQualityLevel{quality_level}"
+
+    # Tight compression level pseudo-encodings: -247..-256 (9..0)
+    if -256 <= enc_type <= -247:
+        compress_level = enc_type + 256
+        return f"CompressLevel{compress_level}"
+
+    return f"Unknown({enc_type})"
+
+
+def format_encoding_list(encodings: set[int] | list[int] | tuple[int, ...]) -> str:
+    """
+    Format encoding ids as a readable comma-separated list.
+    """
+    unique_sorted = sorted(set(int(e) for e in encodings))
+    if not unique_sorted:
+        return "none"
+    return ", ".join(f"{encoding_name(enc)} ({enc})" for enc in unique_sorted)
+
+
 class Encoder(Protocol):
     """Protocol for encoder implementations (Python 3.13 style)"""
 

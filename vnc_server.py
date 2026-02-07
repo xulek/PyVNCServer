@@ -16,7 +16,7 @@ from vnc_lib.protocol import RFBProtocol
 from vnc_lib.auth import VNCAuth
 from vnc_lib.input_handler import InputHandler
 from vnc_lib.screen_capture import ScreenCapture
-from vnc_lib.encodings import EncoderManager
+from vnc_lib.encodings import EncoderManager, encoding_name, format_encoding_list
 from vnc_lib.change_detector import AdaptiveChangeDetector
 from vnc_lib.cursor import CursorEncoder
 from vnc_lib.metrics import ServerMetrics, ConnectionMetrics, PerformanceMonitor
@@ -125,6 +125,12 @@ class VNCServerV3:
         )
         self.lan_zrle_compression_level = max(
             1, min(9, int(self.config.get('lan_zrle_compression_level', 2)))
+        )
+        self.ultravnc_tight_warmup_requests = max(
+            0, int(self.config.get('ultravnc_tight_warmup_requests', 12))
+        )
+        self.ultravnc_tight_warmup_seconds = max(
+            0.0, float(self.config.get('ultravnc_tight_warmup_seconds', 2.0))
         )
 
         # Protocol and WebSocket safety limits
@@ -458,6 +464,12 @@ class VNCServerV3:
                 disable_tight_for_ultravnc=disable_tight_for_ultravnc,
             )
             client_encodings: set[int] = {0}  # Default: Raw encoding
+            self.logger.info(
+                f"Server rectangle encodings: {format_encoding_list(set(encoder_manager.encoders.keys()))}"
+            )
+            self.logger.info(
+                f"Initial client rectangle encodings: {format_encoding_list(client_encodings)}"
+            )
 
             # For localhost, disable change detection (overhead not worth it with high bandwidth)
             use_change_detection = self.enable_region_detection and not is_localhost
@@ -554,8 +566,12 @@ class VNCServerV3:
         )
         last_fburq_time: float | None = None
         fburq_count = 0
+        first_fburq_time: float | None = None
         if lan_adaptive:
             self._configure_lan_encoders(encoder_manager, lan_jpeg_quality)
+        ultravnc_like_client = False
+        ultravnc_tight_delay_active = False
+        parallel_enabled_for_client = parallel_encoder is not None
 
         while not self.shutdown_handler.is_shutting_down():
             try:
@@ -577,11 +593,34 @@ class VNCServerV3:
                         encodings = protocol.parse_set_encodings(client_socket)
                         client_encodings.clear()
                         client_encodings.update(encodings)
-                        self.logger.info(f"Client encodings: {client_encodings}")
+                        ultravnc_like_client = 9 in client_encodings or 10 in client_encodings
+                        self._configure_tight_compatibility(
+                            encoder_manager, client_encodings
+                        )
+                        self.logger.info(
+                            f"Client encodings (all): {format_encoding_list(client_encodings)}"
+                        )
+                        server_supported = set(encoder_manager.encoders.keys())
+                        negotiated_rect = server_supported.intersection(client_encodings)
+                        self.logger.info(
+                            f"Negotiated rectangle encodings: {format_encoding_list(negotiated_rect)}"
+                        )
+                        if ultravnc_like_client:
+                            self.logger.info(
+                                "UltraVNC-like client detected; "
+                                "enabling single-rectangle update compatibility mode"
+                            )
+                            if parallel_enabled_for_client:
+                                parallel_enabled_for_client = False
+                                self.logger.info(
+                                    "UltraVNC compatibility: disabling per-region parallel encoding"
+                                )
 
                     case protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
                         now = time.perf_counter()
                         fburq_count += 1
+                        if first_fburq_time is None:
+                            first_fburq_time = now
                         if (
                             lan_zlib_enabled_runtime
                             and last_fburq_time is not None
@@ -595,10 +634,32 @@ class VNCServerV3:
                         last_fburq_time = now
 
                         request = protocol.parse_framebuffer_update_request(client_socket)
-                        if self.enable_request_coalescing:
+                        if self.enable_request_coalescing and not ultravnc_like_client:
                             request = self._coalesce_framebuffer_update_requests(
                                 client_socket, protocol, request
                             )
+                        delay_tight_for_ultravnc = self._should_delay_tight_for_ultravnc(
+                            ultravnc_like_client,
+                            fburq_count,
+                            first_fburq_time,
+                            now,
+                        )
+                        if delay_tight_for_ultravnc and not ultravnc_tight_delay_active:
+                            self.logger.info(
+                                "UltraVNC compatibility: delaying Tight for warm-up "
+                                f"(requests<={self.ultravnc_tight_warmup_requests} "
+                                f"or first {self.ultravnc_tight_warmup_seconds:.1f}s)"
+                            )
+                        elif not delay_tight_for_ultravnc and ultravnc_tight_delay_active:
+                            self.logger.info(
+                                "UltraVNC compatibility: Tight warm-up finished, Tight is allowed"
+                            )
+                        ultravnc_tight_delay_active = delay_tight_for_ultravnc
+                        if delay_tight_for_ultravnc and 7 in client_encodings:
+                            selection_encodings = set(client_encodings)
+                            selection_encodings.discard(7)
+                        else:
+                            selection_encodings = client_encodings
                         prefer_zlib_now = (
                             lan_zlib_enabled_runtime
                             and fburq_count > lan_zlib_warmup_requests
@@ -642,6 +703,14 @@ class VNCServerV3:
 
                             if changed_regions is not None:
                                 changed_regions = self._intersect_regions(changed_regions, request_region)
+                                if ultravnc_like_client and len(changed_regions) > 1:
+                                    collapsed = self._collapse_regions_to_bounding_box(changed_regions)
+                                    self.logger.debug(
+                                        "UltraVNC compatibility: collapsing %d regions to %d",
+                                        len(changed_regions),
+                                        len(collapsed),
+                                    )
+                                    changed_regions = collapsed
 
                             if changed_regions is not None and len(changed_regions) == 0:
                                 # No changes
@@ -649,7 +718,7 @@ class VNCServerV3:
                                 continue
 
                             # Send region updates if available using parallel encoding
-                            if changed_regions is not None and len(changed_regions) < 10 and parallel_encoder:
+                            if changed_regions is not None and len(changed_regions) < 10 and parallel_enabled_for_client and parallel_encoder:
                                 # Use parallel encoding for changed regions
                                 bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
                                 content_type = network_profile.value if network_profile != NetworkProfile.WAN else "dynamic"
@@ -666,7 +735,7 @@ class VNCServerV3:
                                     )
                                     encoding_type, encoder = self._select_encoder_for_update(
                                         encoder_manager,
-                                        client_encodings,
+                                        selection_encodings,
                                         network_profile,
                                         w,
                                         h,
@@ -682,6 +751,15 @@ class VNCServerV3:
                                         encoding_type, encoder, lan_jpeg_quality
                                     )
                                     regions_to_encode.append(((x, y, w, h), region_data, encoding_type, encoder))
+                                if self.logger.isEnabledFor(logging.DEBUG):
+                                    enc_counts: dict[int, int] = {}
+                                    for _, _, enc_type, _ in regions_to_encode:
+                                        enc_counts[enc_type] = enc_counts.get(enc_type, 0) + 1
+                                    enc_summary = ", ".join(
+                                        f"{encoding_name(enc)} ({enc}) x{count}"
+                                        for enc, count in sorted(enc_counts.items())
+                                    )
+                                    self.logger.debug(f"Selected region encodings: {enc_summary}")
 
                                 # Encode regions in parallel
                                 encoded_results = parallel_encoder.encode_regions(regions_to_encode, bytes_per_pixel)
@@ -692,7 +770,12 @@ class VNCServerV3:
                                     for r in encoded_results
                                 ]
 
+                                self.logger.debug(
+                                    "Sending framebuffer update with %d rectangle(s)",
+                                    len(rectangles),
+                                )
                                 protocol.send_framebuffer_update(client_socket, rectangles)
+                                self.logger.debug("Framebuffer update sent successfully")
 
                                 # Record metrics
                                 if conn_metrics:
@@ -735,7 +818,7 @@ class VNCServerV3:
                                     original_total_bytes += len(region_data)
                                     encoding_type, encoder = self._select_encoder_for_update(
                                         encoder_manager,
-                                        client_encodings,
+                                        selection_encodings,
                                         network_profile,
                                         w,
                                         h,
@@ -754,8 +837,22 @@ class VNCServerV3:
                                         jpeg_original_bytes += len(region_data)
                                         jpeg_encoded_bytes += len(encoded_data)
                                     rectangles.append((x, y, w, h, encoding_type, encoded_data))
+                                if self.logger.isEnabledFor(logging.DEBUG):
+                                    enc_counts: dict[int, int] = {}
+                                    for _, _, _, _, enc_type, _ in rectangles:
+                                        enc_counts[enc_type] = enc_counts.get(enc_type, 0) + 1
+                                    enc_summary = ", ".join(
+                                        f"{encoding_name(enc)} ({enc}) x{count}"
+                                        for enc, count in sorted(enc_counts.items())
+                                    )
+                                    self.logger.debug(f"Selected region encodings: {enc_summary}")
 
+                                self.logger.debug(
+                                    "Sending framebuffer update with %d rectangle(s)",
+                                    len(rectangles),
+                                )
                                 protocol.send_framebuffer_update(client_socket, rectangles)
+                                self.logger.debug("Framebuffer update sent successfully")
 
                                 if conn_metrics:
                                     encoding_time = time.perf_counter() - start_time
@@ -779,7 +876,7 @@ class VNCServerV3:
                         bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
                         encoding_type, encoder = self._select_encoder_for_update(
                             encoder_manager,
-                            client_encodings,
+                            selection_encodings,
                             network_profile,
                             req_w,
                             req_h,
@@ -793,7 +890,10 @@ class VNCServerV3:
                             encoding_type, encoder, lan_jpeg_quality
                         )
 
-                        self.logger.debug(f"Selected encoding: {encoding_type} for content type: {content_type}")
+                        self.logger.debug(
+                            f"Selected encoding: {encoding_name(encoding_type)} "
+                            f"({encoding_type}) for content type: {content_type}"
+                        )
 
                         # Encode pixel data (single-threaded for full frame)
                         full_request = (
@@ -904,6 +1004,24 @@ class VNCServerV3:
                     conn_metrics.record_error()
                 break
 
+    def _should_delay_tight_for_ultravnc(self,
+                                         ultravnc_like_client: bool,
+                                         fburq_count: int,
+                                         first_fburq_time: float | None,
+                                         now: float) -> bool:
+        """Decide if Tight should be delayed during UltraVNC warm-up."""
+        if not ultravnc_like_client:
+            return False
+
+        warmup_requests = max(0, int(getattr(self, 'ultravnc_tight_warmup_requests', 12)))
+        warmup_seconds = max(0.0, float(getattr(self, 'ultravnc_tight_warmup_seconds', 2.0)))
+
+        if warmup_requests > 0 and fburq_count <= warmup_requests:
+            return True
+        if warmup_seconds > 0 and first_fburq_time is not None:
+            return (now - first_fburq_time) < warmup_seconds
+        return False
+
     def handle_multiple_clients_batch(self, client_data: list[tuple[socket.socket, tuple, str]]) -> None:
         """
         Handle multiple clients with exception group support (Python 3.13)
@@ -1008,6 +1126,19 @@ class VNCServerV3:
             except Exception:
                 pass
 
+    def _configure_tight_compatibility(self, encoder_manager: EncoderManager,
+                                       client_encodings: set[int]) -> None:
+        """Toggle Tight compatibility mode for UltraVNC-like clients."""
+        tight_encoder = encoder_manager.encoders.get(7)
+        if tight_encoder is None or not hasattr(tight_encoder, 'set_stream_reset_mode'):
+            return
+
+        ultravnc_like = 9 in client_encodings or 10 in client_encodings
+        try:
+            tight_encoder.set_stream_reset_mode(ultravnc_like)
+        except Exception:
+            pass
+
     def _select_encoder_for_update(self,
                                    encoder_manager: EncoderManager,
                                    client_encodings: set[int],
@@ -1047,6 +1178,11 @@ class VNCServerV3:
         lan_zlib_min_pixels = getattr(self, 'lan_zlib_min_pixels', 131072)
         lan_jpeg_area_threshold = getattr(self, 'lan_jpeg_area_threshold', 0.25)
         lan_jpeg_min_pixels = getattr(self, 'lan_jpeg_min_pixels', 32768)
+        ultravnc_like = 9 in client_encodings or 10 in client_encodings
+        disable_tight_for_ultravnc = bool(
+            getattr(encoder_manager, '_disable_tight_for_ultravnc', False)
+        )
+        tight_allowed = not (ultravnc_like and disable_tight_for_ultravnc)
         prefer_lan_zlib = (
             allow_zlib
             and lan_prefer_zlib
@@ -1056,6 +1192,8 @@ class VNCServerV3:
         )
 
         def available(enc_type: int) -> bool:
+            if enc_type == 7 and not tight_allowed:
+                return False
             return enc_type in client_encodings and enc_type in encoders
 
         # Some viewers temporarily request low color depth (e.g., 8bpp) during
@@ -1293,6 +1431,41 @@ class VNCServerV3:
             if intersection is not None:
                 filtered.append(intersection)
         return filtered
+
+    def _collapse_regions_to_bounding_box(self, regions) -> list[tuple[int, int, int, int]]:
+        """
+        Collapse multiple regions into one bounding rectangle.
+
+        Compatibility path for clients that behave poorly with frequent
+        multi-rectangle updates.
+        """
+        if not regions:
+            return []
+        if len(regions) == 1:
+            region = regions[0]
+            if hasattr(region, 'x'):
+                return [(int(region.x), int(region.y), int(region.width), int(region.height))]
+            return [(int(region[0]), int(region[1]), int(region[2]), int(region[3]))]
+
+        normalized: list[tuple[int, int, int, int]] = []
+        for region in regions:
+            if hasattr(region, 'x'):
+                x, y, w, h = int(region.x), int(region.y), int(region.width), int(region.height)
+            else:
+                x, y, w, h = int(region[0]), int(region[1]), int(region[2]), int(region[3])
+            if w > 0 and h > 0:
+                normalized.append((x, y, w, h))
+
+        if not normalized:
+            return []
+
+        left = min(r[0] for r in normalized)
+        top = min(r[1] for r in normalized)
+        right = max(r[0] + r[2] for r in normalized)
+        bottom = max(r[1] + r[3] for r in normalized)
+        if right <= left or bottom <= top:
+            return []
+        return [(left, top, right - left, bottom - top)]
 
     def _cleanup(self):
         """Cleanup server resources"""

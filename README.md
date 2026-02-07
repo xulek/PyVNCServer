@@ -135,6 +135,8 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `enable_metrics` | `bool` | Internal metrics collection |
 | `enable_tight_encoding` | `bool` | Tight encoder availability |
 | `tight_disable_for_ultravnc` | `bool` | Compatibility workaround for UltraVNC-like clients |
+| `ultravnc_tight_warmup_requests` | `int` | Delay Tight for UltraVNC-like clients for initial framebuffer requests |
+| `ultravnc_tight_warmup_seconds` | `float` | Delay Tight for UltraVNC-like clients for initial connection seconds |
 | `enable_jpeg_encoding` | `bool` | JPEG encoder availability |
 | `enable_h264_encoding` | `bool` | H.264 encoder availability (requires optional deps) |
 | `enable_parallel_encoding` | `bool` | Parallel region encoding |

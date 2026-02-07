@@ -7,8 +7,10 @@ import unittest
 import struct
 import zlib
 from vnc_lib.encodings import (
-    RawEncoder, RREEncoder, HextileEncoder, ZlibEncoder, ZRLEEncoder, EncoderManager
+    RawEncoder, RREEncoder, HextileEncoder, ZlibEncoder, ZRLEEncoder,
+    EncoderManager, encoding_name, format_encoding_list
 )
+from vnc_lib.tight_encoding import TightEncoder
 try:
     from vnc_lib.jpeg_encoding import JPEGEncoder
     JPEG_TESTS_AVAILABLE = True
@@ -47,6 +49,21 @@ class TestEncoders(unittest.TestCase):
         # Raw encoding should return data as-is
         self.assertEqual(result, self.solid_pixels)
         self.assertEqual(len(result), self.width * self.height * self.bpp)
+
+    def test_encoding_name_human_readable(self):
+        self.assertEqual(encoding_name(7), "Tight")
+        self.assertEqual(encoding_name(-24), "JPEGQualityLevel8")
+        self.assertEqual(encoding_name(-250), "CompressLevel6")
+        self.assertEqual(encoding_name(-223), "DesktopSize")
+        self.assertEqual(encoding_name(123456), "Unknown(123456)")
+
+    def test_format_encoding_list_human_readable(self):
+        formatted = format_encoding_list({7, 0, -24})
+        self.assertEqual(
+            formatted,
+            "JPEGQualityLevel8 (-24), Raw (0), Tight (7)"
+        )
+        self.assertEqual(format_encoding_list(set()), "none")
 
     def test_rre_encoder_solid(self):
         """Test RRE encoding on solid color"""
@@ -140,6 +157,90 @@ class TestEncoders(unittest.TestCase):
         self.assertGreater(len(encoded), 4)
         self.assertEqual(encoded[:2], b"\xFF\xD8")
         self.assertEqual(encoded[-2:], b"\xFF\xD9")
+
+    def test_tight_fill_32bpp_uses_rgb_tpixel(self):
+        """Tight fill should send RGB TPIXEL for 32bpp BGRX input."""
+        encoder = TightEncoder()
+        width, height, bpp = 8, 8, 4
+        # BGRX for red
+        pixels = bytes([0, 0, 255, 0] * (width * height))
+        encoded = encoder.encode(pixels, width, height, bpp)
+
+        self.assertEqual(encoded[0], 0x80)  # FILL
+        self.assertEqual(encoded[1:4], bytes([255, 0, 0]))  # RGB
+
+    def test_tight_palette_32bpp_uses_3byte_palette_entries(self):
+        """Tight palette payload should use 3-byte RGB entries for 32bpp input."""
+        encoder = TightEncoder()
+        width, height, bpp = 8, 8, 4
+        colors_bgrx = (
+            [255, 0, 0, 0],   # blue in BGRX
+            [0, 255, 0, 0],   # green
+            [0, 0, 255, 0],   # red
+        )
+        pixels = bytearray()
+        for i in range(width * height):
+            pixels.extend(colors_bgrx[i % len(colors_bgrx)])
+        encoded = encoder.encode(bytes(pixels), width, height, bpp)
+
+        self.assertGreaterEqual(len(encoded), 3)
+        self.assertTrue((encoded[0] >> 4) & 0x04)  # explicit filter
+        self.assertEqual(encoded[1], 0x01)  # palette filter id
+        num_colors = encoded[2] + 1
+        palette_len = num_colors * 3
+        self.assertGreaterEqual(len(encoded), 3 + palette_len)
+
+    def test_tight_palette_three_colors_uses_8bit_indices(self):
+        """For 3+ colors, Tight palette indices must be 8 bits per pixel."""
+        encoder = TightEncoder()
+        width, height, bpp = 3, 1, 4
+        # Three distinct BGRX pixels.
+        pixels = bytes([
+            255, 0, 0, 0,
+            0, 255, 0, 0,
+            0, 0, 255, 0,
+        ])
+        encoded = encoder.encode(pixels, width, height, bpp)
+
+        self.assertGreaterEqual(len(encoded), 3)
+        self.assertEqual(encoded[1], 0x01)  # palette filter id
+        num_colors = encoded[2] + 1
+        self.assertEqual(num_colors, 3)
+        palette_len = num_colors * 3
+        tail = encoded[3 + palette_len:]
+        # Small palette payload (<12) must be raw and 1 byte/pixel => 3 bytes.
+        self.assertEqual(len(tail), 3)
+
+    def test_tight_basic_reset_mode_sets_stream_reset_bit(self):
+        """Compatibility mode should set stream reset bit for Tight basic rectangles."""
+        encoder = TightEncoder()
+        encoder.set_stream_reset_mode(True)
+        width, height, bpp = 64, 64, 4
+        pixels = bytearray()
+        for i in range(width * height):
+            # Many colors -> bypass fill/palette and use basic path
+            pixels.extend([i & 0xFF, (i >> 2) & 0xFF, (i >> 4) & 0xFF, 0])
+        encoded = encoder.encode(bytes(pixels), width, height, bpp)
+        self.assertGreater(len(encoded), 1)
+        self.assertEqual(encoded[0] & 0x0F, 0x01)  # reset stream 0
+        self.assertEqual(encoded[0] >> 4, 0x00)  # basic compression, stream 0
+
+    def test_tight_basic_small_payload_sent_uncompressed(self):
+        """Basic Tight payloads <12 bytes should be sent raw without length field."""
+        encoder = TightEncoder()
+        payload = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9])  # 9 bytes
+        encoded = encoder._encode_basic(payload, width=3, height=1, bpp=3)
+        self.assertEqual(encoded[0], 0x00)
+        self.assertEqual(encoded[1:], payload)
+
+    def test_tight_basic_small_payload_reset_mode_keeps_reset_bit(self):
+        """In reset mode, small raw-basic payload keeps stream reset bit."""
+        encoder = TightEncoder()
+        encoder.set_stream_reset_mode(True)
+        payload = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9])  # 9 bytes
+        encoded = encoder._encode_basic(payload, width=3, height=1, bpp=3)
+        self.assertEqual(encoded[0] & 0x0F, 0x01)
+        self.assertEqual(encoded[1:], payload)
 
     def test_rre_large_region_falls_back_to_raw(self):
         """Large region should avoid expensive RRE path."""

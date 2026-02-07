@@ -78,18 +78,20 @@ class TileGrid:
         Returns:
             List of changed regions
         """
-        changed_tiles: list[tuple[int, int]] = []
+        if bytes_per_pixel <= 0 or not pixel_data:
+            return []
 
-        # Check each tile
+        changed_tiles: list[tuple[int, int]] = []
+        row_stride = self.width * bytes_per_pixel
+        pixel_view = memoryview(pixel_data)
+
+        # Check each tile. Compute CRC incrementally per row to avoid building
+        # temporary tile buffers for every tile on every frame.
         for ty in range(self.tiles_y):
             for tx in range(self.tiles_x):
-                # Extract tile data
-                tile_data = self._extract_tile(
-                    pixel_data, tx, ty, bytes_per_pixel
+                checksum = self._calculate_tile_checksum(
+                    pixel_view, tx, ty, bytes_per_pixel, row_stride
                 )
-
-                # Calculate checksum (CRC32 is faster than MD5 for non-crypto use)
-                checksum = zlib.crc32(tile_data)
 
                 # Compare with previous
                 key = (tx, ty)
@@ -99,6 +101,13 @@ class TileGrid:
 
         # Convert tiles to regions
         regions = self._tiles_to_regions(changed_tiles)
+        if not regions:
+            return []
+
+        total_tiles = max(1, self.tiles_x * self.tiles_y)
+        if len(regions) * 100 >= total_tiles * 60:
+            # When most tiles changed, skip expensive merge work.
+            return [Region(0, 0, self.width, self.height)]
 
         # Merge nearby regions
         merged_regions = self._merge_regions(regions)
@@ -109,6 +118,24 @@ class TileGrid:
         )
 
         return merged_regions
+
+    def _calculate_tile_checksum(self, pixel_view: memoryview,
+                                 tile_x: int, tile_y: int,
+                                 bpp: int, row_stride: int) -> int:
+        """Calculate CRC32 for a tile without temporary tile allocations."""
+        start_x = tile_x * self.tile_size
+        start_y = tile_y * self.tile_size
+        end_x = min(start_x + self.tile_size, self.width)
+        end_y = min(start_y + self.tile_size, self.height)
+        tile_row_bytes = (end_x - start_x) * bpp
+
+        checksum = 0
+        for y in range(start_y, end_y):
+            row_start = y * row_stride + start_x * bpp
+            row_end = row_start + tile_row_bytes
+            checksum = zlib.crc32(pixel_view[row_start:row_end], checksum)
+
+        return checksum
 
     def _extract_tile(self, pixel_data: bytes, tile_x: int, tile_y: int,
                      bpp: int) -> bytes:
@@ -159,19 +186,12 @@ class TileGrid:
             return []
 
         merged: list[Region] = []
-        remaining = list(regions)
-
-        while remaining:
-            current = remaining.pop(0)
+        for current in regions:
             merged_any = False
 
             # Try to merge with existing merged regions
             for i, existing in enumerate(merged):
-                # Check if regions are close enough
-                distance = self._region_distance(current, existing)
-
-                if distance <= max_merge_distance:
-                    # Merge regions
+                if self._region_distance(current, existing) <= max_merge_distance:
                     merged[i] = current.merge(existing)
                     merged_any = True
                     break

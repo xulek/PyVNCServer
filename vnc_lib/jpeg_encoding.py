@@ -1,10 +1,9 @@
 """
 JPEG Encoding Implementation for VNC
 Provides lossy compression for photographic/video content
-Encoding Type: 21 (Tight JPEG sub-encoding)
+Encoding Type: 21 (JPEG rectangle encoding)
 """
 
-import struct
 import logging
 from typing import TypeAlias
 from io import BytesIO
@@ -23,7 +22,7 @@ EncodedData: TypeAlias = bytes
 
 class JPEGEncoder:
     """
-    JPEG Encoding for VNC (Type 21 - Tight JPEG sub-encoding)
+    JPEG Encoding for VNC (Type 21 - JPEG rectangle encoding)
 
     Uses JPEG compression for photographic content and video.
     Provides excellent compression (50-200x) but is lossy.
@@ -39,16 +38,12 @@ class JPEGEncoder:
     - Line art
     """
 
-    ENCODING_TYPE = 21  # Tight JPEG Quality Level pseudo-encoding
-    JPEG_ENCODING_TYPE = 7  # Uses Tight encoding with JPEG sub-encoding
+    ENCODING_TYPE = 21
 
     # JPEG quality levels
     QUALITY_MIN = 1
     QUALITY_MAX = 100
     QUALITY_DEFAULT = 80  # Good balance between size and quality
-
-    # JPEG is only efficient for larger rectangles
-    MIN_JPEG_SIZE = 4096  # Minimum pixels to consider JPEG
 
     def __init__(self, quality: int = QUALITY_DEFAULT):
         """
@@ -79,26 +74,20 @@ class JPEGEncoder:
             bytes_per_pixel: Bytes per pixel (3 or 4)
 
         Returns:
-            Encoded JPEG data with Tight encoding header
+            Encoded JPEG byte stream (SOI...EOI)
         """
-        # JPEG only makes sense for larger images
-        if width * height < self.MIN_JPEG_SIZE:
-            self.logger.debug(f"JPEG: image too small ({width}x{height}), "
-                             "not using JPEG")
-            return pixel_data  # Return raw data, let Tight handle it
-
         if bytes_per_pixel not in (3, 4):
             self.logger.warning(f"JPEG: unsupported bpp {bytes_per_pixel}")
-            return pixel_data
+            return b""
 
         try:
             # Convert pixel data to PIL Image
-            mode = "RGB" if bytes_per_pixel == 3 else "RGBA"
-            image = Image.frombytes(mode, (width, height), pixel_data)
-
-            # Convert 4bpp to RGB (strip padding byte — our data is BGR0/RGB0, not true RGBA)
-            if mode == "RGBA":
-                image = image.convert("RGB")
+            if bytes_per_pixel == 4:
+                # Server default format is BGR0 (red_shift=16, green_shift=8, blue_shift=0).
+                # Convert explicitly from BGRX to RGB for correct JPEG output.
+                image = Image.frombuffer("RGB", (width, height), pixel_data, "raw", "BGRX", 0, 1)
+            else:
+                image = Image.frombytes("RGB", (width, height), pixel_data)
 
             # Encode as JPEG
             jpeg_buffer = BytesIO()
@@ -106,26 +95,15 @@ class JPEGEncoder:
                       optimize=False, progressive=False)
             jpeg_data = jpeg_buffer.getvalue()
 
-            # Build Tight encoding format with JPEG sub-encoding
-            # Control byte: 0x90 = JPEG compression (rfbTightJpeg << 4)
-            control = 0x90
-            result = bytearray([control])
-
-            # Add compact length
-            result.extend(self._encode_compact_length(len(jpeg_data)))
-
-            # Add JPEG data
-            result.extend(jpeg_data)
-
-            compression_ratio = len(pixel_data) / len(result)
-            self.logger.debug(f"JPEG: {len(pixel_data)} -> {len(result)} bytes "
+            compression_ratio = len(pixel_data) / max(1, len(jpeg_data))
+            self.logger.debug(f"JPEG: {len(pixel_data)} -> {len(jpeg_data)} bytes "
                              f"({compression_ratio:.1f}x compression, quality={self.quality})")
 
-            return bytes(result)
+            return jpeg_data
 
         except Exception as e:
             self.logger.error(f"JPEG encoding failed: {e}")
-            return pixel_data  # Fallback to raw
+            return b""
 
     def encode_rectangle(self, pixel_data: PixelData, x: int, y: int,
                         width: int, height: int, bytes_per_pixel: int) -> tuple:
@@ -135,25 +113,7 @@ class JPEGEncoder:
         Returns: (x, y, width, height, encoding_type, encoded_data)
         """
         encoded = self.encode(pixel_data, width, height, bytes_per_pixel)
-        return (x, y, width, height, self.JPEG_ENCODING_TYPE, encoded)
-
-    def _encode_compact_length(self, length: int) -> bytes:
-        """
-        Encode length in Tight's compact format
-
-        Format:
-        - If length <= 127: 1 byte
-        - If length <= 16383: 2 bytes (bits 0-6 of first byte, bit 7 = 1)
-        - Otherwise: 3 bytes
-        """
-        if length <= 127:
-            return bytes([length])
-        elif length <= 16383:
-            return bytes([0x80 | (length & 0x7F), (length >> 7) & 0xFF])
-        else:
-            return bytes([0x80 | (length & 0x7F),
-                         0x80 | ((length >> 7) & 0x7F),
-                         (length >> 14) & 0xFF])
+        return (x, y, width, height, self.ENCODING_TYPE, encoded)
 
     def set_quality(self, quality: int):
         """Update JPEG quality level"""
@@ -180,7 +140,7 @@ class JPEGEncoder:
         - Simple graphics
         """
         # Size check
-        if width * height < self.MIN_JPEG_SIZE:
+        if width * height < 1024:
             return False
 
         # Check color complexity (JPEG good for many colors)

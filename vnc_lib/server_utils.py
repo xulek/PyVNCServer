@@ -385,14 +385,14 @@ class PerformanceThrottler:
             return
 
         with self._lock:
-            current_time = time.time()
+            current_time = time.perf_counter()
             time_since_last = current_time - self.last_operation_time
 
             if time_since_last < self.min_interval:
                 sleep_time = self.min_interval - time_since_last
                 time.sleep(sleep_time)
 
-            self.last_operation_time = time.time()
+            self.last_operation_time = time.perf_counter()
 
     def can_proceed(self) -> bool:
         """
@@ -405,6 +405,6 @@ class PerformanceThrottler:
             return True
 
         with self._lock:
-            current_time = time.time()
+            current_time = time.perf_counter()
             time_since_last = current_time - self.last_operation_time
             return time_since_last >= self.min_interval

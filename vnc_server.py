@@ -1047,6 +1047,13 @@ class VNCServerV3:
         lan_zlib_min_pixels = getattr(self, 'lan_zlib_min_pixels', 131072)
         lan_jpeg_area_threshold = getattr(self, 'lan_jpeg_area_threshold', 0.25)
         lan_jpeg_min_pixels = getattr(self, 'lan_jpeg_min_pixels', 32768)
+        prefer_lan_zlib = (
+            allow_zlib
+            and lan_prefer_zlib
+            and bytes_per_pixel == 4
+            and area >= lan_zlib_min_pixels
+            and area_ratio >= lan_zlib_area_threshold
+        )
 
         def available(enc_type: int) -> bool:
             return enc_type in client_encodings and enc_type in encoders
@@ -1064,12 +1071,9 @@ class VNCServerV3:
         # Large updates on LAN: prefer Tight (fill/palette sub-encodings give
         # massive wins for desktop content; basic fallback uses TPIXEL + zlib
         # which is >= Zlib anyway). Falls back to Zlib if Tight unavailable.
-        if (
-            allow_zlib
-            and lan_prefer_zlib
-            and bytes_per_pixel == 4
-            and area >= lan_zlib_min_pixels
-        ):
+        # Guard this with both minimum area and area ratio to avoid introducing
+        # compression latency for medium, interactive updates.
+        if prefer_lan_zlib:
             if available(7):
                 return 7, encoders[7]
             if available(6):
@@ -1079,6 +1083,7 @@ class VNCServerV3:
         if (
             allow_jpeg
             and available(21)
+            and (bytes_per_pixel is None or bytes_per_pixel in (3, 4))
             and area >= lan_jpeg_min_pixels
             and area_ratio >= lan_jpeg_area_threshold
         ):
@@ -1092,15 +1097,14 @@ class VNCServerV3:
         ):
             return 0, encoders[0]
 
-        # Medium regions that missed min_pixels: still use Tight/Zlib when
-        # preferred and bpp=4, otherwise fall back to Raw for compatibility.
-        if lan_prefer_zlib and allow_zlib and bytes_per_pixel == 4:
+        # Fallbacks for compatibility.
+        if available(0):
+            return 0, encoders[0]
+        if allow_zlib and lan_prefer_zlib and bytes_per_pixel == 4:
             if available(7):
                 return 7, encoders[7]
             if available(6):
                 return 6, encoders[6]
-        if available(0):
-            return 0, encoders[0]
         if available(2):
             return 2, encoders[2]
         if available(5):

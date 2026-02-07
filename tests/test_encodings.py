@@ -9,6 +9,11 @@ import zlib
 from vnc_lib.encodings import (
     RawEncoder, RREEncoder, HextileEncoder, ZlibEncoder, ZRLEEncoder, EncoderManager
 )
+try:
+    from vnc_lib.jpeg_encoding import JPEGEncoder
+    JPEG_TESTS_AVAILABLE = True
+except Exception:
+    JPEG_TESTS_AVAILABLE = False
 
 
 class TestEncoders(unittest.TestCase):
@@ -122,6 +127,19 @@ class TestEncoders(unittest.TestCase):
         out2 = inflator.decompress(compressed_data2, len(self.solid_pixels))
         self.assertEqual(out1, self.mixed_pixels)
         self.assertEqual(out2, self.solid_pixels)
+
+    @unittest.skipUnless(JPEG_TESTS_AVAILABLE, "JPEG encoder unavailable")
+    def test_jpeg_encoder_outputs_jpeg_stream(self):
+        """JPEG encoding type 21 payload must be a raw JPEG stream."""
+        encoder = JPEGEncoder(quality=70)
+        # 32x32 in server-native BGRX layout (blue-ish color)
+        width, height, bpp = 32, 32, 4
+        pixels = bytes([200, 120, 40, 0] * (width * height))
+        encoded = encoder.encode(pixels, width, height, bpp)
+
+        self.assertGreater(len(encoded), 4)
+        self.assertEqual(encoded[:2], b"\xFF\xD8")
+        self.assertEqual(encoded[-2:], b"\xFF\xD9")
 
     def test_rre_large_region_falls_back_to_raw(self):
         """Large region should avoid expensive RRE path."""

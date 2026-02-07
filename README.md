@@ -61,6 +61,8 @@ python -m pip install -r requirements.txt
 ## Quick Start
 
 1. Review `config.json` and set at least `host`, `port`, and `password`.
+   The shipped default is currently tuned for LAN quality/performance
+   (`network_profile_override` is set to `"lan"`).
 2. Start the server:
 
 ```bash
@@ -72,6 +74,9 @@ python vnc_server.py
 ```bash
 vncviewer localhost:5900
 ```
+
+If you want automatic profile detection (`localhost`/`lan`/`wan`) instead of
+forced LAN mode, set `"network_profile_override": null` in `config.json`.
 
 ## Browser Access (WebSocket + noVNC)
 
@@ -109,7 +114,7 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `enable_request_coalescing` | `bool` | Drops stale framebuffer requests to reduce lag |
 | `lan_raw_area_threshold` | `float` | Area ratio below which Raw is preferred on LAN |
 | `lan_raw_max_pixels` | `int` | Maximum rectangle size (pixels) eligible for Raw on LAN |
-| `lan_prefer_zlib` | `bool` | Prefer Zlib (encoding 6) for larger LAN updates (default `false`) |
+| `lan_prefer_zlib` | `bool` | Prefer Zlib (encoding 6) for larger LAN updates |
 | `lan_zlib_area_threshold` | `float` | Area ratio above which Zlib is preferred on LAN |
 | `lan_zlib_min_pixels` | `int` | Minimum rectangle size for Zlib consideration on LAN |
 | `lan_zlib_compression_level` | `int` | Zlib compression level used in LAN mode |

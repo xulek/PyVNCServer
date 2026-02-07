@@ -384,6 +384,48 @@ class HextileEncoder:
         return bytes(result)
 
 
+class ZlibEncoder:
+    """
+    Zlib encoding (type 6, non-standard but widely supported extension).
+
+    Rectangle payload format:
+    - 4-byte big-endian length
+    - zlib-compressed raw pixel bytes
+    """
+
+    ENCODING_TYPE = 6
+
+    def __init__(self, compression_level: int = 1):
+        self.compression_level = max(1, min(9, int(compression_level)))
+        self._compressor = zlib.compressobj(level=self.compression_level)
+        self.logger = logging.getLogger(__name__)
+
+    def encode(self, pixel_data: PixelData, width: int, height: int,
+               bytes_per_pixel: int) -> EncodedData:
+        if pixel_data is None:
+            pixel_data = b''
+
+        # Keep one zlib stream per client/encoder instance as expected by
+        # the Zlib encoding extension. Sync flush preserves stream state
+        # while framing each rectangle independently.
+        compressed = (
+            self._compressor.compress(pixel_data)
+            + self._compressor.flush(zlib.Z_SYNC_FLUSH)
+        )
+        result = struct.pack(">I", len(compressed)) + compressed
+        self.logger.debug(
+            f"Zlib: {len(pixel_data)} -> {len(compressed)} bytes (level={self.compression_level})"
+        )
+        return result
+
+    def set_compression_level(self, level: int):
+        """Update compression level and reset stream state safely."""
+        new_level = max(1, min(9, int(level)))
+        if new_level != self.compression_level:
+            self.compression_level = new_level
+            self._compressor = zlib.compressobj(level=self.compression_level)
+
+
 class ZRLEEncoder:
     """
     ZRLE (Zlib Run-Length Encoding) - RFC 6143 Section 7.6.6
@@ -400,6 +442,7 @@ class ZRLEEncoder:
             compression_level: zlib compression level (1-9)
         """
         self.compression_level = compression_level
+        self._compressor = zlib.compressobj(level=self.compression_level)
         self.logger = logging.getLogger(__name__)
 
     def encode(self, pixel_data: PixelData, width: int, height: int,
@@ -411,7 +454,10 @@ class ZRLEEncoder:
         3. Prepend length header
         """
         if not pixel_data:
-            compressed = zlib.compress(b'', level=self.compression_level)
+            compressed = (
+                self._compressor.compress(b'')
+                + self._compressor.flush(zlib.Z_SYNC_FLUSH)
+            )
             return struct.pack(">I", len(compressed)) + compressed
 
         # Convert to CPIXEL format (compact pixel format)
@@ -420,8 +466,11 @@ class ZRLEEncoder:
         # Apply run-length encoding
         rle_data = self._apply_rle(cpixel_data, cpixel_bpp)
 
-        # Compress with zlib
-        compressed = zlib.compress(rle_data, level=self.compression_level)
+        # Compress with persistent zlib stream (warm dictionary improves ratio)
+        compressed = (
+            self._compressor.compress(rle_data)
+            + self._compressor.flush(zlib.Z_SYNC_FLUSH)
+        )
 
         # Prepend length (4 bytes, big-endian)
         result = struct.pack(">I", len(compressed)) + compressed
@@ -516,6 +565,7 @@ class EncoderManager:
             1: CopyRectEncoder(),  # CopyRect for scrolling/movement
             2: RREEncoder(),
             5: HextileEncoder(),
+            6: ZlibEncoder(),
             16: ZRLEEncoder(),
         }
 
@@ -581,7 +631,7 @@ class EncoderManager:
                 # Current Hextile implementation is tile-raw and typically slower than
                 # Raw while barely reducing payload size. For low-latency LAN usage,
                 # prefer Raw first and keep compressed encoders as fallback.
-                preference_order = [0, 16, 2, 5]  # Raw, ZRLE, RRE, Hextile
+                preference_order = [0, 6, 2, 5, 16]  # Raw, Zlib, RRE, Hextile, ZRLE
             case "static":
                 # For static content, prefer compression
                 preference_order = [7, 16, 5, 2, 0]  # Tight, ZRLE, Hextile, RRE, Raw

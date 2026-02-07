@@ -105,6 +105,22 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `password` | `str` | Empty string disables auth |
 | `frame_rate` | `int` | Target FPS for WAN profile |
 | `lan_frame_rate` | `int` | Target FPS for LAN profile |
+| `enable_lan_adaptive_encoding` | `bool` | Adaptive Raw/JPEG/ZRLE strategy for LAN |
+| `enable_request_coalescing` | `bool` | Drops stale framebuffer requests to reduce lag |
+| `lan_raw_area_threshold` | `float` | Area ratio below which Raw is preferred on LAN |
+| `lan_raw_max_pixels` | `int` | Maximum rectangle size (pixels) eligible for Raw on LAN |
+| `lan_prefer_zlib` | `bool` | Prefer Zlib (encoding 6) for larger LAN updates (default `false`) |
+| `lan_zlib_area_threshold` | `float` | Area ratio above which Zlib is preferred on LAN |
+| `lan_zlib_min_pixels` | `int` | Minimum rectangle size for Zlib consideration on LAN |
+| `lan_zlib_compression_level` | `int` | Zlib compression level used in LAN mode |
+| `lan_zlib_warmup_requests` | `int` | Initial framebuffer requests served without Zlib |
+| `lan_zlib_disable_if_request_gap_ms` | `int` | Auto-disable Zlib for client if request gaps are too large |
+| `lan_jpeg_area_threshold` | `float` | Area ratio above which JPEG is preferred on LAN |
+| `lan_jpeg_min_pixels` | `int` | Minimum rectangle size for JPEG consideration |
+| `lan_jpeg_quality_initial` | `int` | Initial JPEG quality in adaptive LAN mode |
+| `lan_jpeg_quality_min` | `int` | Lower bound for adaptive JPEG quality |
+| `lan_jpeg_quality_max` | `int` | Upper bound for adaptive JPEG quality |
+| `lan_zrle_compression_level` | `int` | ZRLE compression level used in LAN mode |
 | `network_profile_override` | `null \| "localhost" \| "lan" \| "wan"` | Forces profile, bypasses auto-detection |
 | `scale_factor` | `float` | Capture scaling factor |
 | `max_connections` | `int` | Max simultaneous clients |
@@ -128,9 +144,15 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `log_level` | `str` | Python logging level |
 | `log_file` | `str \| null` | Optional file logging target |
 
-## Programmatic Startup
+## CLI And Programmatic Startup
 
-`vnc_server.py` does not expose CLI flags for config selection. For a custom config path, start it programmatically:
+CLI supports config and log level overrides:
+
+```bash
+python vnc_server.py --config config.production.json --log-level DEBUG
+```
+
+Programmatic startup is also available:
 
 ```python
 from vnc_server import VNCServerV3

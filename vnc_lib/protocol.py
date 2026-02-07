@@ -385,7 +385,7 @@ class RFBProtocol:
             buf += chunk
         return buf
 
-    def _send_large_data(self, sock, data: bytes, chunk_size: int = 262144):
+    def _send_large_data(self, sock, data: bytes, chunk_size: int = 1048576):
         """Send large data in chunks using memoryview to avoid copies"""
         view = memoryview(data)
         total_sent = 0

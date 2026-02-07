@@ -4,8 +4,10 @@ Python 3.13 compatible
 """
 
 import unittest
+import struct
+import zlib
 from vnc_lib.encodings import (
-    RawEncoder, RREEncoder, HextileEncoder, ZRLEEncoder, EncoderManager
+    RawEncoder, RREEncoder, HextileEncoder, ZlibEncoder, ZRLEEncoder, EncoderManager
 )
 
 
@@ -98,6 +100,28 @@ class TestEncoders(unittest.TestCase):
 
         self.assertIsInstance(result, bytes)
         self.assertGreater(len(result), 4)
+
+    def test_zlib_encoder_round_trip(self):
+        """Zlib encoding should round-trip to original bytes."""
+        encoder = ZlibEncoder(compression_level=3)
+        result1 = encoder.encode(self.mixed_pixels, self.width, self.height, self.bpp)
+        result2 = encoder.encode(self.solid_pixels, self.width, self.height, self.bpp)
+
+        self.assertGreater(len(result1), 4)
+        self.assertGreater(len(result2), 4)
+
+        compressed_len1 = struct.unpack(">I", result1[:4])[0]
+        compressed_len2 = struct.unpack(">I", result2[:4])[0]
+        compressed_data1 = result1[4:]
+        compressed_data2 = result2[4:]
+        self.assertEqual(compressed_len1, len(compressed_data1))
+        self.assertEqual(compressed_len2, len(compressed_data2))
+
+        inflator = zlib.decompressobj()
+        out1 = inflator.decompress(compressed_data1, len(self.mixed_pixels))
+        out2 = inflator.decompress(compressed_data2, len(self.solid_pixels))
+        self.assertEqual(out1, self.mixed_pixels)
+        self.assertEqual(out2, self.solid_pixels)
 
     def test_rre_large_region_falls_back_to_raw(self):
         """Large region should avoid expensive RRE path."""

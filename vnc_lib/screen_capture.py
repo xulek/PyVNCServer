@@ -76,6 +76,24 @@ class ScreenCapture:
         self._rgb_buffer: bytearray | None = None
         self._pixel_buffer: bytearray | None = None
         self._buffer_size: int = 0
+        self._palette_lut_cache: dict[tuple[int, int, int, int, int, int], tuple[bytes, bytes, bytes]] = {}
+        self._numpy_lut_cache: dict[tuple[int, int, int, int, int, int], tuple] = {}
+
+        # Try to load numpy (fast 8bpp conversion)
+        self._numpy_available = False
+        self._np = None
+        self._lazy_load_numpy()
+
+    def _lazy_load_numpy(self):
+        """Lazy load numpy module (fast 8bpp vectorized conversion)"""
+        if not self._numpy_available:
+            try:
+                import numpy
+                self._np = numpy
+                self._numpy_available = True
+            except ImportError as e:
+                self.logger.debug(f"numpy not available, 8bpp conversion will use pure Python: {e}")
+                self._numpy_available = False
 
     def _lazy_load_mss(self):
         """Lazy load mss module (high-performance backend)"""
@@ -413,13 +431,66 @@ class ScreenCapture:
         For BGR0 format (red_shift=16, blue_shift=0), we can skip the swap entirely.
         """
         bpp = pixel_format.get('bits_per_pixel', 0)
-        if bpp != 32 or not pixel_format.get('true_colour_flag', 0):
+        if not pixel_format.get('true_colour_flag', 0):
             return None  # Fall back to standard path
 
         big_endian = pixel_format.get('big_endian_flag', 0)
         red_shift = pixel_format['red_shift']
         green_shift = pixel_format['green_shift']
         blue_shift = pixel_format['blue_shift']
+
+        # Fast path for 8-bit true color (e.g. RGB222/RGB332) directly from BGRA.
+        # This avoids BGRA->RGB conversion and significantly reduces startup cost
+        # for clients that temporarily switch to low color depth.
+        if bpp == 8 and not big_endian:
+            red_max = pixel_format.get('red_max', 0)
+            green_max = pixel_format.get('green_max', 0)
+            blue_max = pixel_format.get('blue_max', 0)
+            if red_max <= 0 or green_max <= 0 or blue_max <= 0:
+                return None
+
+            lut_key = (red_shift, green_shift, blue_shift, red_max, green_max, blue_max)
+            luts = self._palette_lut_cache.get(lut_key)
+            if luts is None:
+                r_lut = bytes((((v * red_max) // 255) << red_shift & 0xFF) for v in range(256))
+                g_lut = bytes((((v * green_max) // 255) << green_shift & 0xFF) for v in range(256))
+                b_lut = bytes((((v * blue_max) // 255) << blue_shift & 0xFF) for v in range(256))
+                luts = (r_lut, g_lut, b_lut)
+                self._palette_lut_cache[lut_key] = luts
+            r_lut, g_lut, b_lut = luts
+
+            # Numpy fast path: vectorized LUT indexing (~5ms vs ~838ms pure Python)
+            if self._numpy_available:
+                np = self._np
+                np_luts = self._numpy_lut_cache.get(lut_key)
+                if np_luts is None:
+                    r_lut_np = np.frombuffer(r_lut, dtype=np.uint8)
+                    g_lut_np = np.frombuffer(g_lut, dtype=np.uint8)
+                    b_lut_np = np.frombuffer(b_lut, dtype=np.uint8)
+                    np_luts = (r_lut_np, g_lut_np, b_lut_np)
+                    self._numpy_lut_cache[lut_key] = np_luts
+                r_lut_np, g_lut_np, b_lut_np = np_luts
+                arr = np.frombuffer(bgra_bytes, dtype=np.uint8).reshape(-1, 4)
+                result = r_lut_np[arr[:, 2]] | g_lut_np[arr[:, 1]] | b_lut_np[arr[:, 0]]
+                return result.tobytes()
+
+            # Pure-Python fallback for when numpy is not available
+            if self._pixel_buffer is None or len(self._pixel_buffer) != num_pixels:
+                self._pixel_buffer = bytearray(num_pixels)
+            out = self._pixel_buffer
+            src = memoryview(bgra_bytes)
+            out_idx = 0
+            for i in range(0, num_pixels * 4, 4):
+                out[out_idx] = (
+                    r_lut[src[i + 2]]
+                    | g_lut[src[i + 1]]
+                    | b_lut[src[i + 0]]
+                )
+                out_idx += 1
+            return bytes(out)
+
+        if bpp != 32:
+            return None  # Fall back to standard path
 
         pixel_size = num_pixels * 4
         if self._pixel_buffer is None or len(self._pixel_buffer) != pixel_size:

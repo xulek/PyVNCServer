@@ -96,17 +96,14 @@ class JPEGEncoder:
             mode = "RGB" if bytes_per_pixel == 3 else "RGBA"
             image = Image.frombytes(mode, (width, height), pixel_data)
 
-            # Convert RGBA to RGB if needed (JPEG doesn't support alpha)
+            # Convert 4bpp to RGB (strip padding byte — our data is BGR0/RGB0, not true RGBA)
             if mode == "RGBA":
-                # Create white background
-                rgb_image = Image.new("RGB", (width, height), (255, 255, 255))
-                rgb_image.paste(image, mask=image.split()[3])  # Use alpha as mask
-                image = rgb_image
+                image = image.convert("RGB")
 
             # Encode as JPEG
             jpeg_buffer = BytesIO()
             image.save(jpeg_buffer, format="JPEG", quality=self.quality,
-                      optimize=True, progressive=False)
+                      optimize=False, progressive=False)
             jpeg_data = jpeg_buffer.getvalue()
 
             # Build Tight encoding format with JPEG sub-encoding
@@ -160,8 +157,10 @@ class JPEGEncoder:
 
     def set_quality(self, quality: int):
         """Update JPEG quality level"""
-        self.quality = max(self.QUALITY_MIN, min(self.QUALITY_MAX, quality))
-        self.logger.info(f"JPEG quality set to {self.quality}")
+        new_quality = max(self.QUALITY_MIN, min(self.QUALITY_MAX, quality))
+        if new_quality != self.quality:
+            self.quality = new_quality
+            self.logger.debug(f"JPEG quality set to {self.quality}")
 
     def is_suitable_for_jpeg(self, pixel_data: PixelData, width: int,
                             height: int, bytes_per_pixel: int) -> bool:

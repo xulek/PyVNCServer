@@ -79,6 +79,53 @@ class VNCServerV3:
         self.enable_cursor_encoding = self.config.get('enable_cursor_encoding', False)
         self.enable_metrics = self.config.get('enable_metrics', True)
         self.enable_websocket = self.config.get('enable_websocket', False)
+        self.enable_lan_adaptive_encoding = self.config.get('enable_lan_adaptive_encoding', True)
+        self.enable_request_coalescing = self.config.get('enable_request_coalescing', True)
+
+        # LAN adaptive encoding tuning
+        self.lan_raw_area_threshold = max(
+            0.01, min(1.0, float(self.config.get('lan_raw_area_threshold', 0.12)))
+        )
+        self.lan_raw_max_pixels = max(
+            1024, int(self.config.get('lan_raw_max_pixels', 65536))
+        )
+        self.lan_prefer_zlib = bool(self.config.get('lan_prefer_zlib', False))
+        self.lan_zlib_area_threshold = max(
+            0.05, min(1.0, float(self.config.get('lan_zlib_area_threshold', 0.20)))
+        )
+        self.lan_zlib_min_pixels = max(
+            4096, int(self.config.get('lan_zlib_min_pixels', 131072))
+        )
+        self.lan_zlib_compression_level = max(
+            1, min(9, int(self.config.get('lan_zlib_compression_level', 3)))
+        )
+        self.lan_zlib_warmup_requests = max(
+            0, int(self.config.get('lan_zlib_warmup_requests', 3))
+        )
+        self.lan_zlib_disable_if_request_gap_ms = max(
+            100, int(self.config.get('lan_zlib_disable_if_request_gap_ms', 1500))
+        )
+        self.lan_jpeg_area_threshold = max(
+            0.05, min(1.0, float(self.config.get('lan_jpeg_area_threshold', 0.25)))
+        )
+        self.lan_jpeg_min_pixels = max(1024, int(self.config.get('lan_jpeg_min_pixels', 32768)))
+        self.lan_jpeg_quality_min = max(
+            1, min(100, int(self.config.get('lan_jpeg_quality_min', 55)))
+        )
+        self.lan_jpeg_quality_max = max(
+            self.lan_jpeg_quality_min,
+            min(100, int(self.config.get('lan_jpeg_quality_max', 90))),
+        )
+        self.lan_jpeg_quality_initial = max(
+            self.lan_jpeg_quality_min,
+            min(
+                self.lan_jpeg_quality_max,
+                int(self.config.get('lan_jpeg_quality_initial', 75)),
+            ),
+        )
+        self.lan_zrle_compression_level = max(
+            1, min(9, int(self.config.get('lan_zrle_compression_level', 2)))
+        )
 
         # Protocol and WebSocket safety limits
         self.max_set_encodings = max(
@@ -293,7 +340,7 @@ class VNCServerV3:
             # Set socket send buffer size based on network profile
             if not is_localhost:
                 try:
-                    sndbuf = 524288 if is_lan else 262144  # 512KB LAN, 256KB WAN
+                    sndbuf = 2097152 if is_lan else 262144  # 2MB LAN, 256KB WAN
                     client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
                 except Exception as e:
                     self.logger.warning(f"Could not set SO_SNDBUF: {e}")
@@ -492,6 +539,23 @@ class VNCServerV3:
             case _:
                 max_frame_rate = self.frame_rate
         throttler = PerformanceThrottler(max_rate=max_frame_rate)
+        lan_adaptive = (
+            network_profile == NetworkProfile.LAN
+            and self.enable_lan_adaptive_encoding
+        )
+        target_frame_time = 1.0 / max_frame_rate if max_frame_rate > 0 else 0.0
+        lan_jpeg_quality = self.lan_jpeg_quality_initial
+        lan_zlib_enabled_runtime = self.lan_prefer_zlib
+        lan_zlib_warmup_requests = max(
+            0, int(getattr(self, 'lan_zlib_warmup_requests', 3))
+        )
+        lan_zlib_disable_gap_s = (
+            max(100, int(getattr(self, 'lan_zlib_disable_if_request_gap_ms', 1500))) / 1000.0
+        )
+        last_fburq_time: float | None = None
+        fburq_count = 0
+        if lan_adaptive:
+            self._configure_lan_encoders(encoder_manager, lan_jpeg_quality)
 
         while not self.shutdown_handler.is_shutting_down():
             try:
@@ -516,7 +580,29 @@ class VNCServerV3:
                         self.logger.info(f"Client encodings: {client_encodings}")
 
                     case protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
+                        now = time.perf_counter()
+                        fburq_count += 1
+                        if (
+                            lan_zlib_enabled_runtime
+                            and last_fburq_time is not None
+                            and (now - last_fburq_time) >= lan_zlib_disable_gap_s
+                        ):
+                            lan_zlib_enabled_runtime = False
+                            self.logger.info(
+                                "Disabling LAN zlib for this client due to slow request cadence "
+                                f"({now - last_fburq_time:.2f}s gap)"
+                            )
+                        last_fburq_time = now
+
                         request = protocol.parse_framebuffer_update_request(client_socket)
+                        if self.enable_request_coalescing:
+                            request = self._coalesce_framebuffer_update_requests(
+                                client_socket, protocol, request
+                            )
+                        prefer_zlib_now = (
+                            lan_zlib_enabled_runtime
+                            and fburq_count > lan_zlib_warmup_requests
+                        )
 
                         # Throttle before expensive capture/encoding work.
                         throttler.throttle()
@@ -570,14 +656,30 @@ class VNCServerV3:
 
                                 # Prepare regions for parallel encoding
                                 regions_to_encode = []
+                                jpeg_original_bytes = 0
+                                jpeg_encoded_bytes = 0
                                 for x, y, w, h in changed_regions:
                                     # Extract region pixel data
                                     region_data = self._extract_region(
                                         result.pixel_data, fb_width, fb_height,
                                         x, y, w, h, bytes_per_pixel
                                     )
-                                    encoding_type, encoder = encoder_manager.get_best_encoder(
-                                        client_encodings, content_type=content_type
+                                    encoding_type, encoder = self._select_encoder_for_update(
+                                        encoder_manager,
+                                        client_encodings,
+                                        network_profile,
+                                        w,
+                                        h,
+                                        fb_width,
+                                        fb_height,
+                                        content_type=content_type,
+                                        allow_jpeg=False,
+                                        allow_zlib=True,
+                                        prefer_zlib_override=prefer_zlib_now,
+                                        bytes_per_pixel=bytes_per_pixel,
+                                    )
+                                    self._prepare_encoder_for_send(
+                                        encoding_type, encoder, lan_jpeg_quality
                                     )
                                     regions_to_encode.append(((x, y, w, h), region_data, encoding_type, encoder))
 
@@ -600,6 +702,19 @@ class VNCServerV3:
                                     conn_metrics.record_frame(
                                         compressed_bytes, encoding_time, total_bytes
                                     )
+                                    if lan_adaptive:
+                                        for r in encoded_results:
+                                            if r.encoding_type == 21:
+                                                jpeg_original_bytes += r.original_size
+                                                jpeg_encoded_bytes += r.compressed_size
+                                        if jpeg_original_bytes > 0:
+                                            lan_jpeg_quality = self._adjust_lan_jpeg_quality(
+                                                lan_jpeg_quality,
+                                                encoding_time,
+                                                jpeg_encoded_bytes,
+                                                jpeg_original_bytes,
+                                                target_frame_time,
+                                            )
                                 continue
 
                             # Non-parallel region encoding fallback
@@ -610,17 +725,34 @@ class VNCServerV3:
                                 rectangles = []
                                 original_total_bytes = 0
                                 compressed_total_bytes = 0
+                                jpeg_original_bytes = 0
+                                jpeg_encoded_bytes = 0
                                 for x, y, w, h in changed_regions:
                                     region_data = self._extract_region(
                                         result.pixel_data, fb_width, fb_height,
                                         x, y, w, h, bytes_per_pixel
                                     )
                                     original_total_bytes += len(region_data)
-                                    encoding_type, encoder = encoder_manager.get_best_encoder(
-                                        client_encodings, content_type=content_type
+                                    encoding_type, encoder = self._select_encoder_for_update(
+                                        encoder_manager,
+                                        client_encodings,
+                                        network_profile,
+                                        w,
+                                        h,
+                                        fb_width,
+                                        fb_height,
+                                        content_type=content_type,
+                                        prefer_zlib_override=prefer_zlib_now,
+                                        bytes_per_pixel=bytes_per_pixel,
+                                    )
+                                    self._prepare_encoder_for_send(
+                                        encoding_type, encoder, lan_jpeg_quality
                                     )
                                     encoded_data = encoder.encode(region_data, w, h, bytes_per_pixel)
                                     compressed_total_bytes += len(encoded_data)
+                                    if encoding_type == 21:
+                                        jpeg_original_bytes += len(region_data)
+                                        jpeg_encoded_bytes += len(encoded_data)
                                     rectangles.append((x, y, w, h, encoding_type, encoded_data))
 
                                 protocol.send_framebuffer_update(client_socket, rectangles)
@@ -632,18 +764,38 @@ class VNCServerV3:
                                         encoding_time,
                                         original_total_bytes,
                                     )
+                                    if lan_adaptive and jpeg_original_bytes > 0:
+                                        lan_jpeg_quality = self._adjust_lan_jpeg_quality(
+                                            lan_jpeg_quality,
+                                            encoding_time,
+                                            jpeg_encoded_bytes,
+                                            jpeg_original_bytes,
+                                            target_frame_time,
+                                        )
                                 continue
 
                         # Select best encoding based on network profile
                         content_type = network_profile.value if network_profile != NetworkProfile.WAN else "dynamic"
-                        encoding_type, encoder = encoder_manager.get_best_encoder(
-                            client_encodings, content_type=content_type
+                        bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
+                        encoding_type, encoder = self._select_encoder_for_update(
+                            encoder_manager,
+                            client_encodings,
+                            network_profile,
+                            req_w,
+                            req_h,
+                            fb_width,
+                            fb_height,
+                            content_type=content_type,
+                            prefer_zlib_override=prefer_zlib_now,
+                            bytes_per_pixel=bytes_per_pixel,
+                        )
+                        self._prepare_encoder_for_send(
+                            encoding_type, encoder, lan_jpeg_quality
                         )
 
                         self.logger.debug(f"Selected encoding: {encoding_type} for content type: {content_type}")
 
                         # Encode pixel data (single-threaded for full frame)
-                        bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
                         full_request = (
                             req_x == 0 and req_y == 0 and req_w == fb_width and req_h == fb_height
                         )
@@ -686,6 +838,14 @@ class VNCServerV3:
                             conn_metrics.record_frame(
                                 len(encoded_data), encoding_time, len(frame_pixels)
                             )
+                            if lan_adaptive and encoding_type == 21:
+                                lan_jpeg_quality = self._adjust_lan_jpeg_quality(
+                                    lan_jpeg_quality,
+                                    encoding_time,
+                                    len(encoded_data),
+                                    len(frame_pixels),
+                                    target_frame_time,
+                                )
 
                     case protocol.MSG_KEY_EVENT:
                         key_event = protocol.parse_key_event(client_socket)
@@ -810,6 +970,215 @@ class VNCServerV3:
         """Capture a frame for a single client connection."""
         return screen_capture.capture_fast(pixel_format)
 
+    def _configure_lan_encoders(self, encoder_manager: EncoderManager,
+                                jpeg_quality: int) -> None:
+        """Apply LAN-specific encoder settings."""
+        zrle_encoder = encoder_manager.encoders.get(16)
+        if zrle_encoder is not None and hasattr(zrle_encoder, 'compression_level'):
+            try:
+                zrle_encoder.compression_level = self.lan_zrle_compression_level
+            except Exception:
+                pass
+
+        zlib_encoder = encoder_manager.encoders.get(6)
+        if zlib_encoder is not None:
+            try:
+                if hasattr(zlib_encoder, 'set_compression_level'):
+                    zlib_encoder.set_compression_level(self.lan_zlib_compression_level)
+                elif hasattr(zlib_encoder, 'compression_level'):
+                    zlib_encoder.compression_level = self.lan_zlib_compression_level
+            except Exception:
+                pass
+
+        jpeg_encoder = encoder_manager.encoders.get(21)
+        if jpeg_encoder is not None and hasattr(jpeg_encoder, 'set_quality'):
+            try:
+                jpeg_encoder.set_quality(jpeg_quality)
+            except Exception:
+                pass
+
+    def _prepare_encoder_for_send(self, encoding_type: int, encoder,
+                                  lan_jpeg_quality: int) -> None:
+        """Prepare encoder before a frame/region encode."""
+        if encoding_type != 21:
+            return
+        if hasattr(encoder, 'set_quality'):
+            try:
+                encoder.set_quality(lan_jpeg_quality)
+            except Exception:
+                pass
+
+    def _select_encoder_for_update(self,
+                                   encoder_manager: EncoderManager,
+                                   client_encodings: set[int],
+                                   network_profile: NetworkProfile,
+                                   width: int,
+                                   height: int,
+                                   fb_width: int,
+                                   fb_height: int,
+                                   content_type: str,
+                                   allow_jpeg: bool = True,
+                                   allow_zlib: bool = True,
+                                   prefer_zlib_override: bool | None = None,
+                                   bytes_per_pixel: int | None = None) -> tuple[int, object]:
+        """
+        Pick encoder with LAN-focused adaptive strategy.
+        """
+        if (
+            network_profile != NetworkProfile.LAN
+            or not self.enable_lan_adaptive_encoding
+        ):
+            return encoder_manager.get_best_encoder(
+                client_encodings, content_type=content_type
+            )
+
+        encoders = encoder_manager.encoders
+        total_area = max(1, fb_width * fb_height)
+        area = max(1, width * height)
+        area_ratio = area / total_area
+        lan_raw_area_threshold = getattr(self, 'lan_raw_area_threshold', 0.12)
+        lan_raw_max_pixels = getattr(self, 'lan_raw_max_pixels', 65536)
+        lan_prefer_zlib = (
+            bool(prefer_zlib_override)
+            if prefer_zlib_override is not None
+            else getattr(self, 'lan_prefer_zlib', False)
+        )
+        lan_zlib_area_threshold = getattr(self, 'lan_zlib_area_threshold', 0.20)
+        lan_zlib_min_pixels = getattr(self, 'lan_zlib_min_pixels', 131072)
+        lan_jpeg_area_threshold = getattr(self, 'lan_jpeg_area_threshold', 0.25)
+        lan_jpeg_min_pixels = getattr(self, 'lan_jpeg_min_pixels', 32768)
+
+        def available(enc_type: int) -> bool:
+            return enc_type in client_encodings and enc_type in encoders
+
+        # Some viewers temporarily request low color depth (e.g., 8bpp) during
+        # startup. Prefer Raw for compatibility and to avoid ZRLE decode issues.
+        if bytes_per_pixel is not None and bytes_per_pixel <= 1:
+            if available(0):
+                return 0, encoders[0]
+            if available(5):
+                return 5, encoders[5]
+            if available(2):
+                return 2, encoders[2]
+
+        # Large updates on LAN: prefer Zlib when available for much lower
+        # transfer size than Raw while preserving broad compatibility.
+        # Note: area_ratio check removed — the min_pixels guard already
+        # prevents Zlib on tiny regions, and parallel-encoded tiles (~3%
+        # of screen each) were incorrectly falling through to Raw.
+        if (
+            allow_zlib
+            and lan_prefer_zlib
+            and available(6)
+            and bytes_per_pixel == 4
+            and area >= lan_zlib_min_pixels
+        ):
+            return 6, encoders[6]
+
+        # Large updates: prefer JPEG (if supported) to reduce transfer time.
+        if (
+            allow_jpeg
+            and available(21)
+            and area >= lan_jpeg_min_pixels
+            and area_ratio >= lan_jpeg_area_threshold
+        ):
+            return 21, encoders[21]
+
+        # Small updates: raw avoids CPU overhead and minimizes input latency.
+        if (
+            available(0)
+            and area_ratio <= lan_raw_area_threshold
+            and area <= lan_raw_max_pixels
+        ):
+            return 0, encoders[0]
+
+        # Medium regions that missed Zlib min_pixels: still use Zlib when
+        # preferred and bpp=4, otherwise fall back to Raw for compatibility.
+        if lan_prefer_zlib and allow_zlib and available(6) and bytes_per_pixel == 4:
+            return 6, encoders[6]
+        if available(0):
+            return 0, encoders[0]
+        if available(2):
+            return 2, encoders[2]
+        if available(5):
+            return 5, encoders[5]
+        if available(16):
+            return 16, encoders[16]
+
+        return encoder_manager.get_best_encoder(
+            client_encodings, content_type=content_type
+        )
+
+    def _adjust_lan_jpeg_quality(self, current_quality: int,
+                                 frame_time: float,
+                                 encoded_bytes: int,
+                                 original_bytes: int,
+                                 target_frame_time: float) -> int:
+        """Adapt JPEG quality based on frame timing and achieved compression."""
+        if target_frame_time <= 0 or original_bytes <= 0:
+            return current_quality
+
+        compression_ratio = encoded_bytes / max(1, original_bytes)
+        next_quality = current_quality
+
+        if frame_time > target_frame_time * 1.35:
+            next_quality -= 5
+        elif frame_time > target_frame_time * 1.10:
+            next_quality -= 2
+        elif frame_time < target_frame_time * 0.70 and compression_ratio < 0.28:
+            next_quality += 3
+        elif frame_time < target_frame_time * 0.85 and compression_ratio < 0.40:
+            next_quality += 1
+
+        return max(self.lan_jpeg_quality_min, min(self.lan_jpeg_quality_max, next_quality))
+
+    def _coalesce_framebuffer_update_requests(self, client_socket,
+                                              protocol: RFBProtocol,
+                                              first_request: dict) -> dict:
+        """
+        Coalesce queued FramebufferUpdateRequest messages and keep only newest.
+        """
+        latest = first_request
+        if not hasattr(client_socket, 'recv'):
+            return latest
+
+        original_timeout = None
+        try:
+            original_timeout = client_socket.gettimeout()
+            client_socket.settimeout(0.0)
+
+            while True:
+                try:
+                    # FramebufferUpdateRequest is 1-byte type + 9-byte payload.
+                    peek = client_socket.recv(10, socket.MSG_PEEK)
+                except (BlockingIOError, InterruptedError, socket.timeout):
+                    break
+                except OSError:
+                    break
+
+                if len(peek) < 10 or peek[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
+                    break
+
+                msg_type_data = protocol._recv_exact(client_socket, 1)
+                if (
+                    not msg_type_data
+                    or msg_type_data[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST
+                ):
+                    break
+
+                latest = protocol.parse_framebuffer_update_request(client_socket)
+        except Exception:
+            # Best-effort optimization; fall back to first request.
+            pass
+        finally:
+            if original_timeout is not None:
+                try:
+                    client_socket.settimeout(original_timeout)
+                except Exception:
+                    pass
+
+        return latest
+
     def _coalesce_pointer_events(self, client_socket,
                                  protocol: RFBProtocol,
                                  first_event: dict) -> dict:
@@ -838,6 +1207,9 @@ class VNCServerV3:
                     break
 
                 if len(peek) < 6 or peek[0] != protocol.MSG_POINTER_EVENT:
+                    break
+                if peek[1] != latest.get('button_mask', peek[1]):
+                    # Preserve button transitions (press/release) as separate events.
                     break
 
                 msg_type_data = protocol._recv_exact(client_socket, 1)

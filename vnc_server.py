@@ -1061,19 +1061,19 @@ class VNCServerV3:
             if available(2):
                 return 2, encoders[2]
 
-        # Large updates on LAN: prefer Zlib when available for much lower
-        # transfer size than Raw while preserving broad compatibility.
-        # Note: area_ratio check removed — the min_pixels guard already
-        # prevents Zlib on tiny regions, and parallel-encoded tiles (~3%
-        # of screen each) were incorrectly falling through to Raw.
+        # Large updates on LAN: prefer Tight (fill/palette sub-encodings give
+        # massive wins for desktop content; basic fallback uses TPIXEL + zlib
+        # which is >= Zlib anyway). Falls back to Zlib if Tight unavailable.
         if (
             allow_zlib
             and lan_prefer_zlib
-            and available(6)
             and bytes_per_pixel == 4
             and area >= lan_zlib_min_pixels
         ):
-            return 6, encoders[6]
+            if available(7):
+                return 7, encoders[7]
+            if available(6):
+                return 6, encoders[6]
 
         # Large updates: prefer JPEG (if supported) to reduce transfer time.
         if (
@@ -1092,10 +1092,13 @@ class VNCServerV3:
         ):
             return 0, encoders[0]
 
-        # Medium regions that missed Zlib min_pixels: still use Zlib when
+        # Medium regions that missed min_pixels: still use Tight/Zlib when
         # preferred and bpp=4, otherwise fall back to Raw for compatibility.
-        if lan_prefer_zlib and allow_zlib and available(6) and bytes_per_pixel == 4:
-            return 6, encoders[6]
+        if lan_prefer_zlib and allow_zlib and bytes_per_pixel == 4:
+            if available(7):
+                return 7, encoders[7]
+            if available(6):
+                return 6, encoders[6]
         if available(0):
             return 0, encoders[0]
         if available(2):

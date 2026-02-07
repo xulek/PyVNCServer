@@ -89,35 +89,34 @@ class TightEncoder:
             self.logger.warning(f"Tight: unsupported bpp {bytes_per_pixel}, using raw")
             return self._encode_raw(pixel_data, width, height, bytes_per_pixel)
 
-        # TEMPORARILY DISABLED FOR TESTING: Use only BASIC compression
-        # Check for solid color fill (common for backgrounds)
-        # if self._is_solid_fill(pixel_data, bytes_per_pixel):
-        #     return self._encode_fill(pixel_data, bytes_per_pixel)
+        # Solid color fill — 4 bytes for entire rectangle
+        if self._is_solid_fill(pixel_data, bytes_per_pixel):
+            return self._encode_fill(pixel_data, bytes_per_pixel)
 
-        # Check for palette-based content (limited colors)
-        # palette = self._extract_palette(pixel_data, bytes_per_pixel, max_colors=256)
-        # if palette and len(palette) <= 2:
-        #     # Very few colors - use palette encoding
-        #     return self._encode_palette(pixel_data, width, height, bytes_per_pixel, palette)
+        # Palette encoding — very efficient for text, buttons, window chrome
+        palette = self._extract_palette(pixel_data, bytes_per_pixel, max_colors=256)
+        if palette and len(palette) <= 256:
+            return self._encode_palette(pixel_data, width, height, bytes_per_pixel, palette)
 
-        # For gradient/photo content, use basic compression with optional filter
+        # Gradient filter disabled — pure-Python nested loop is too CPU-expensive
+        # for LAN targets. _apply_gradient_filter is O(width*height*bpp) per-pixel.
         # if self._has_smooth_gradient(pixel_data, width, height, bytes_per_pixel):
         #     return self._encode_gradient(pixel_data, width, height, bytes_per_pixel)
 
-        # Default: basic zlib compression (TESTING: using only this now)
+        # Default: basic zlib compression (with TPIXEL 3-byte format for 32bpp)
         return self._encode_basic(pixel_data, width, height, bytes_per_pixel)
 
     def _is_solid_fill(self, pixel_data: PixelData, bpp: int,
-                       sample_rate: int = 100) -> bool:
-        """Check if image is solid color (sample-based for speed)"""
+                       num_samples: int = 256) -> bool:
+        """Check if image is solid color (uniform stride sampling for accuracy)"""
         if len(pixel_data) < bpp:
             return True
 
         first_pixel = pixel_data[:bpp]
-        data_len = len(pixel_data)
+        total_pixels = len(pixel_data) // bpp
+        stride = max(1, total_pixels // num_samples)
 
-        # Sample every Nth pixel for speed
-        for i in range(bpp, min(data_len, bpp * sample_rate), bpp):
+        for i in range(stride * bpp, len(pixel_data), stride * bpp):
             if pixel_data[i:i+bpp] != first_pixel:
                 return False
 
@@ -157,12 +156,19 @@ class TightEncoder:
         return result
 
     def _extract_palette(self, pixel_data: PixelData, bpp: int,
-                        max_colors: int = 256) -> list[bytes] | None:
+                        max_colors: int = 256,
+                        max_pixels: int = 65536) -> list[bytes] | None:
         """
         Extract color palette from image
 
-        Returns palette if colors <= max_colors, else None
+        Returns palette if colors <= max_colors, else None.
+        Skips analysis for regions larger than max_pixels to avoid
+        expensive O(n) Python loops on full-frame updates.
         """
+        total_pixels = len(pixel_data) // bpp
+        if total_pixels > max_pixels:
+            return None
+
         unique_colors: set[bytes] = set()
 
         for i in range(0, len(pixel_data), bpp):

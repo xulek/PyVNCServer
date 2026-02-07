@@ -182,7 +182,34 @@ def test_select_encoder_for_update_lan_prefers_jpeg_for_large_rectangles():
     assert enc_type == 21
 
 
-def test_select_encoder_for_update_lan_prefers_zlib_for_large_rectangles():
+def test_select_encoder_for_update_lan_prefers_tight_for_large_rectangles():
+    server = _server_without_init()
+    server.enable_lan_adaptive_encoding = True
+    server.lan_prefer_zlib = True
+    server.lan_zlib_area_threshold = 0.20
+    server.lan_zlib_min_pixels = 131072
+    server.lan_raw_area_threshold = 0.12
+    server.lan_raw_max_pixels = 65536
+    server.lan_jpeg_area_threshold = 0.95
+    server.lan_jpeg_min_pixels = 9999999
+
+    manager = _DummyEncoderManager({0: object(), 6: object(), 7: object(), 16: object()})
+    enc_type, _ = server._select_encoder_for_update(
+        manager,
+        {0, 6, 7, 16},
+        NetworkProfile.LAN,
+        width=1920,
+        height=1080,
+        fb_width=1920,
+        fb_height=1080,
+        content_type="lan",
+        prefer_zlib_override=True,
+        bytes_per_pixel=4,
+    )
+    assert enc_type == 7
+
+
+def test_select_encoder_for_update_lan_falls_back_to_zlib_without_tight():
     server = _server_without_init()
     server.enable_lan_adaptive_encoding = True
     server.lan_prefer_zlib = True

@@ -100,10 +100,10 @@ class TestSecurityNegotiation:
         protocol.version = (3, 8)
         mock_socket = MockSocket(struct.pack("B", 1))  # Client selects type 1
 
-        sec_type, needs_auth = protocol.negotiate_security(mock_socket, password=None)
+        result = protocol.negotiate_security(mock_socket, password=None, allow_tight_security=False)
 
-        assert sec_type == protocol.SECURITY_NONE
-        assert needs_auth is False
+        assert result.security_type == protocol.SECURITY_NONE
+        assert result.needs_auth is False
         # Should send [1, 1] (count, type)
         assert mock_socket.data_sent[:2] == b'\x01\x01'
 
@@ -113,10 +113,10 @@ class TestSecurityNegotiation:
         protocol.version = (3, 8)
         mock_socket = MockSocket(struct.pack("B", 2))  # Client selects type 2
 
-        sec_type, needs_auth = protocol.negotiate_security(mock_socket, password="test")
+        result = protocol.negotiate_security(mock_socket, password="test", allow_tight_security=False)
 
-        assert sec_type == protocol.SECURITY_VNC_AUTH
-        assert needs_auth is True
+        assert result.security_type == protocol.SECURITY_VNC_AUTH
+        assert result.needs_auth is True
 
     def test_security_negotiation_v33(self):
         """Test security with RFB 3.3 (sends type directly)"""
@@ -124,9 +124,9 @@ class TestSecurityNegotiation:
         protocol.version = (3, 3)
         mock_socket = MockSocket()
 
-        sec_type, needs_auth = protocol.negotiate_security(mock_socket, password="test")
+        result = protocol.negotiate_security(mock_socket, password="test")
 
-        assert sec_type == protocol.SECURITY_VNC_AUTH
+        assert result.security_type == protocol.SECURITY_VNC_AUTH
         # Should send 4-byte security type
         assert len(mock_socket.data_sent) == 4
         assert struct.unpack(">I", mock_socket.data_sent)[0] == 2
@@ -138,11 +138,49 @@ class TestSecurityNegotiation:
         mock_socket = MockSocket(struct.pack("B", 42))
 
         with pytest.raises(ConnectionError):
-            protocol.negotiate_security(mock_socket, password="test")
+            protocol.negotiate_security(mock_socket, password="test", allow_tight_security=False)
 
         # Server should send [count, offered_type] and then failure result.
         assert mock_socket.data_sent[:2] == b'\x01\x02'
         assert struct.unpack(">I", mock_socket.data_sent[2:6])[0] == 1
+
+    def test_security_negotiation_tight_with_vnc_auth(self):
+        """Tight security should negotiate tunneling + VNC auth capability."""
+        protocol = RFBProtocol()
+        protocol.version = (3, 8)
+        mock_socket = MockSocket(
+            struct.pack("B", 16) + struct.pack(">I", 2)
+        )
+
+        result = protocol.negotiate_security(mock_socket, password="test")
+
+        assert result.security_type == protocol.SECURITY_TIGHT
+        assert result.auth_type == protocol.SECURITY_VNC_AUTH
+        assert result.needs_auth is True
+        assert result.tight_enabled is True
+        assert mock_socket.data_sent[:3] == b"\x02\x02\x10"
+        assert struct.unpack(">I", mock_socket.data_sent[3:7])[0] == 0
+        assert struct.unpack(">I", mock_socket.data_sent[7:11])[0] == 1
+        assert struct.unpack(">I", mock_socket.data_sent[11:15])[0] == 2
+        assert mock_socket.data_sent[15:19] == b"STDV"
+        assert mock_socket.data_sent[19:27] == b"VNCAUTH_"
+
+    def test_security_negotiation_tight_without_auth(self):
+        """Tight security should allow no-auth mode with zero auth caps."""
+        protocol = RFBProtocol()
+        protocol.version = (3, 8)
+        mock_socket = MockSocket(struct.pack("B", 16))
+
+        result = protocol.negotiate_security(mock_socket, password=None)
+
+        assert result.security_type == protocol.SECURITY_TIGHT
+        assert result.auth_type == protocol.SECURITY_NONE
+        assert result.needs_auth is False
+        assert result.tight_enabled is True
+        assert mock_socket.data_sent[:2] == b"\x02\x01"
+        assert mock_socket.data_sent[2] == 16
+        assert struct.unpack(">I", mock_socket.data_sent[3:7])[0] == 0
+        assert struct.unpack(">I", mock_socket.data_sent[7:11])[0] == 0
 
 
 class TestMessageParsing:

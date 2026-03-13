@@ -5,10 +5,28 @@ Handles protocol version negotiation, security, and message parsing
 
 import struct
 import logging
-from typing import Tuple, Optional, Dict
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict, Iterable
 
 from vnc_lib.exceptions import ConnectionError, ProtocolError
 from vnc_lib.types import is_valid_pixel_format
+
+
+@dataclass(slots=True)
+class SecurityHandshakeResult:
+    security_type: int
+    auth_type: int
+    needs_auth: bool
+    tight_enabled: bool
+    send_security_result_on_success: bool
+    send_security_result_on_failure: bool
+
+
+@dataclass(slots=True)
+class TightCapability:
+    code: int
+    vendor_signature: bytes
+    name_signature: bytes
 
 
 class RFBProtocol:
@@ -24,6 +42,10 @@ class RFBProtocol:
     # Security types (RFC 6143 Section 7.1.2)
     SECURITY_NONE = 1
     SECURITY_VNC_AUTH = 2
+    SECURITY_TIGHT = 16
+
+    TIGHT_VENDOR_STANDARD = b"STDV"
+    TIGHT_AUTH_SIG_VNC = b"VNCAUTH_"
 
     # Encoding types (RFC 6143 Section 7.7)
     ENCODING_RAW = 0
@@ -134,17 +156,21 @@ class RFBProtocol:
 
         return None
 
-    def negotiate_security(self, client_socket, password: Optional[str]) -> Tuple[int, bool]:
+    def negotiate_security(self, client_socket, password: Optional[str],
+                           read_only_password: Optional[str] = None,
+                           allow_tight_security: bool = True) -> SecurityHandshakeResult:
         """
         Negotiate security type (RFC 6143 Section 7.1.2)
 
-        Returns: (security_type, needs_auth)
+        Returns a structured security handshake result.
         """
-        security_type = self.SECURITY_VNC_AUTH if password else self.SECURITY_NONE
+        has_vnc_auth = bool(password or read_only_password)
+        primary_security_type = self.SECURITY_VNC_AUTH if has_vnc_auth else self.SECURITY_NONE
 
         if self.version >= (3, 7):
-            # RFB 003.007 and later: send list of security types
-            security_types = [security_type]
+            security_types = [primary_security_type]
+            if allow_tight_security:
+                security_types.append(self.SECURITY_TIGHT)
             client_socket.sendall(struct.pack("B", len(security_types)))
             for st in security_types:
                 client_socket.sendall(struct.pack("B", st))
@@ -155,7 +181,10 @@ class RFBProtocol:
                 raise ConnectionError("Client disconnected during security negotiation")
 
             selected_type = struct.unpack("B", selected)[0]
-            if selected_type != security_type:
+            if selected_type == self.SECURITY_TIGHT and allow_tight_security:
+                return self._negotiate_tight_security(client_socket, has_vnc_auth)
+
+            if selected_type != primary_security_type:
                 self.logger.warning(f"Client selected unsupported security type: {selected_type}")
                 # Send security result: failed
                 client_socket.sendall(struct.pack(">I", 1))
@@ -163,13 +192,81 @@ class RFBProtocol:
                     f"Client selected unsupported security type: {selected_type}"
                 )
 
-            self.logger.info(f"Security type negotiated: {security_type}")
-            return (security_type, security_type == self.SECURITY_VNC_AUTH)
+            self.logger.info(f"Security type negotiated: {primary_security_type}")
+            return SecurityHandshakeResult(
+                security_type=primary_security_type,
+                auth_type=primary_security_type,
+                needs_auth=primary_security_type == self.SECURITY_VNC_AUTH,
+                tight_enabled=False,
+                send_security_result_on_success=self.version >= (3, 8),
+                send_security_result_on_failure=True,
+            )
         else:
             # RFB 003.003: just send security type as 32-bit value
-            client_socket.sendall(struct.pack(">I", security_type))
-            self.logger.info(f"Security type sent (RFB 003.003): {security_type}")
-            return (security_type, security_type == self.SECURITY_VNC_AUTH)
+            client_socket.sendall(struct.pack(">I", primary_security_type))
+            self.logger.info(f"Security type sent (RFB 003.003): {primary_security_type}")
+            return SecurityHandshakeResult(
+                security_type=primary_security_type,
+                auth_type=primary_security_type,
+                needs_auth=primary_security_type == self.SECURITY_VNC_AUTH,
+                tight_enabled=False,
+                send_security_result_on_success=self.version >= (3, 8),
+                send_security_result_on_failure=True,
+            )
+
+    def _negotiate_tight_security(self, client_socket, has_vnc_auth: bool) -> SecurityHandshakeResult:
+        """Perform TightVNC-style tunneling and auth-type negotiation."""
+        client_socket.sendall(struct.pack(">I", 0))  # no tunneling
+
+        if has_vnc_auth:
+            auth_caps = (
+                TightCapability(
+                    code=self.SECURITY_VNC_AUTH,
+                    vendor_signature=self.TIGHT_VENDOR_STANDARD,
+                    name_signature=self.TIGHT_AUTH_SIG_VNC,
+                ),
+            )
+            client_socket.sendall(struct.pack(">I", len(auth_caps)))
+            self._send_tight_caps(client_socket, auth_caps)
+            selected_auth = self._recv_exact(client_socket, 4)
+            if not selected_auth:
+                raise ConnectionError("Client disconnected during Tight auth negotiation")
+            auth_type = struct.unpack(">I", selected_auth)[0]
+            if auth_type != self.SECURITY_VNC_AUTH:
+                client_socket.sendall(struct.pack(">I", 1))
+                raise ConnectionError(
+                    f"Client selected unsupported Tight auth type: {auth_type}"
+                )
+            self.logger.info("Security type negotiated: Tight (16) with VNC auth")
+            return SecurityHandshakeResult(
+                security_type=self.SECURITY_TIGHT,
+                auth_type=self.SECURITY_VNC_AUTH,
+                needs_auth=True,
+                tight_enabled=True,
+                send_security_result_on_success=True,
+                send_security_result_on_failure=True,
+            )
+
+        client_socket.sendall(struct.pack(">I", 0))
+        self.logger.info("Security type negotiated: Tight (16) with no auth")
+        return SecurityHandshakeResult(
+            security_type=self.SECURITY_TIGHT,
+            auth_type=self.SECURITY_NONE,
+            needs_auth=False,
+            tight_enabled=True,
+            send_security_result_on_success=self.version >= (3, 8),
+            send_security_result_on_failure=True,
+        )
+
+    def _send_tight_caps(
+        self, client_socket, caps: Iterable[TightCapability]
+    ) -> None:
+        for cap in caps:
+            if len(cap.vendor_signature) != 4 or len(cap.name_signature) != 8:
+                raise ProtocolError("Invalid Tight capability signature length")
+            client_socket.sendall(struct.pack(">I", cap.code))
+            client_socket.sendall(cap.vendor_signature)
+            client_socket.sendall(cap.name_signature)
 
     def send_security_result(self, client_socket, success: bool):
         """Send security handshake result (RFC 6143 Section 7.1.3)"""
@@ -214,6 +311,29 @@ class RFBProtocol:
         msg = struct.pack(">HH", width, height) + pf_data + struct.pack(">I", name_length) + name_bytes
         client_socket.sendall(msg)
         self.logger.info(f"Sent ServerInit: {width}x{height}, name='{name}'")
+
+    def send_tight_interaction_caps(
+        self,
+        client_socket,
+        server_to_client: Iterable[TightCapability] = (),
+        client_to_server: Iterable[TightCapability] = (),
+        encoding_caps: Iterable[TightCapability] = (),
+    ) -> None:
+        server_to_client = tuple(server_to_client)
+        client_to_server = tuple(client_to_server)
+        encoding_caps = tuple(encoding_caps)
+        client_socket.sendall(
+            struct.pack(
+                ">HHHH",
+                len(server_to_client),
+                len(client_to_server),
+                len(encoding_caps),
+                0,
+            )
+        )
+        self._send_tight_caps(client_socket, server_to_client)
+        self._send_tight_caps(client_socket, client_to_server)
+        self._send_tight_caps(client_socket, encoding_caps)
 
     def parse_set_pixel_format(self, client_socket) -> Dict:
         """Parse SetPixelFormat message (RFC 6143 Section 7.5.1)"""

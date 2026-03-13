@@ -151,6 +151,32 @@ class TestVNCAuth:
         data = auth._recv_exact(mock_socket, 100)
         assert data is None
 
+    def test_read_only_password_sets_view_only(self):
+        """Read-only password should authenticate and mark the session view-only."""
+        challenge = b"\x01" * 16
+        auth = VNCAuth("primary", read_only_password="readonly")
+        read_only_response = auth._encrypt_challenge(challenge, password="readonly")
+        mock_socket = MockSocket(read_only_response)
+
+        with patch("os.urandom", return_value=challenge):
+            success, view_only = auth.authenticate_with_access(mock_socket)
+
+        assert success is True
+        assert view_only is True
+
+    def test_primary_password_not_view_only(self):
+        """Primary password should authenticate with full access."""
+        challenge = b"\x02" * 16
+        auth = VNCAuth("primary", read_only_password="readonly")
+        response = auth._encrypt_challenge(challenge, password="primary")
+        mock_socket = MockSocket(response)
+
+        with patch("os.urandom", return_value=challenge):
+            success, view_only = auth.authenticate_with_access(mock_socket)
+
+        assert success is True
+        assert view_only is False
+
 
 class TestGracefulShutdown:
     """Test graceful shutdown handler"""

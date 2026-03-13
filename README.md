@@ -69,6 +69,7 @@ python -m pyvncserver --help
 ## Quick Start
 
 1. Review `config/pyvncserver.toml` and set at least `host`, `port`, and `password`.
+   Optionally set `read_only_password` for a TightVNC-style view-only login.
    The shipped default is currently tuned for LAN quality/performance
    (`network_profile_override` is set to `"lan"`).
 2. Start the server:
@@ -124,8 +125,10 @@ The repository ships with a ready-to-edit `config/pyvncserver.toml`. Runtime key
 | `host` | `str` | Bind address |
 | `port` | `int` | VNC port |
 | `password` | `str` | Empty string disables auth |
+| `read_only_password` | `str` | Optional secondary password that authenticates the client as view-only |
 | `frame_rate` | `int` | Target FPS for WAN profile |
 | `lan_frame_rate` | `int` | Target FPS for LAN profile |
+| `enable_tight_security` | `bool` | Advertise Tight security type 16 and perform TightVNC-style auth negotiation |
 | `enable_lan_adaptive_encoding` | `bool` | LAN tuning for encoder parameters and transport behavior; encoding order still follows client preference |
 | `enable_request_coalescing` | `bool` | Drops stale framebuffer requests to reduce lag |
 | `lan_raw_area_threshold` | `float` | Area ratio below which Raw is preferred on LAN |

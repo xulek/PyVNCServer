@@ -4,6 +4,7 @@
 host = "0.0.0.0"
 port = 5900
 password = ""
+read_only_password = ""
 frame_rate = 30
 lan_frame_rate = 90
 network_profile_override = "lan"
@@ -18,6 +19,7 @@ enable_metrics = true
 enable_request_coalescing = true
 enable_lan_adaptive_encoding = true
 enable_websocket = false
+enable_tight_security = true
 enable_cursor_encoding = false
 enable_tight_encoding = true
 enable_jpeg_encoding = true
@@ -58,4 +60,3 @@ ultravnc_tight_warmup_seconds = 2.5
 [logging]
 log_level = "INFO"
 log_file = ""
-

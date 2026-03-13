@@ -412,3 +412,4 @@ class SecurityTypes:
     INVALID: SecurityType = 0
     NONE: SecurityType = 1
     VNC_AUTH: SecurityType = 2
+    TIGHT: SecurityType = 16

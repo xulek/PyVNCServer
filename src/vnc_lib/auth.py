@@ -4,7 +4,6 @@ Implements proper DES-based VNC authentication
 """
 
 import os
-import struct
 import logging
 from typing import Optional
 
@@ -21,7 +20,7 @@ class VNCAuth:
 
     CHALLENGE_SIZE = 16
 
-    def __init__(self, password: str):
+    def __init__(self, password: str, read_only_password: str = ""):
         """
         Initialize VNC authentication
 
@@ -29,6 +28,7 @@ class VNCAuth:
             password: VNC password (max 8 characters, per RFC)
         """
         self.password = password
+        self.read_only_password = read_only_password
         self.logger = logging.getLogger(__name__)
 
         if not CRYPTO_AVAILABLE:
@@ -36,6 +36,11 @@ class VNCAuth:
                             "Install it with: pip install pycryptodome")
 
     def authenticate(self, client_socket) -> bool:
+        """Backward-compatible boolean result."""
+        success, _ = self.authenticate_with_access(client_socket)
+        return success
+
+    def authenticate_with_access(self, client_socket) -> tuple[bool, bool]:
         """
         Perform VNC authentication challenge-response
 
@@ -44,7 +49,8 @@ class VNCAuth:
         2. Client encrypts challenge with DES using password as key
         3. Server verifies the response
 
-        Returns: True if authentication successful
+        Returns:
+            tuple[success, view_only]
         """
         try:
             # Generate random challenge
@@ -58,26 +64,35 @@ class VNCAuth:
             response = self._recv_exact(client_socket, self.CHALLENGE_SIZE)
             if not response:
                 self.logger.warning("Failed to receive authentication response")
-                return False
+                return False, False
 
             self.logger.debug(f"Received response: {response.hex()}")
 
-            # Verify response
-            expected_response = self._encrypt_challenge(challenge)
-            self.logger.debug(f"Expected response: {expected_response.hex()}")
-
-            if response == expected_response:
+            if self._response_matches_password(challenge, response, self.password):
                 self.logger.info("VNC authentication successful")
-                return True
-            else:
-                self.logger.warning("VNC authentication failed - incorrect password")
-                return False
+                return True, False
+
+            if self.read_only_password and self._response_matches_password(
+                challenge, response, self.read_only_password
+            ):
+                self.logger.info("VNC authentication successful (read-only)")
+                return True, True
+
+            self.logger.warning("VNC authentication failed - incorrect password")
+            return False, False
 
         except Exception as e:
             self.logger.error(f"Authentication error: {e}")
-            return False
+            return False, False
 
-    def _encrypt_challenge(self, challenge: bytes) -> bytes:
+    def _response_matches_password(
+        self, challenge: bytes, response: bytes, password: str
+    ) -> bool:
+        expected_response = self._encrypt_challenge(challenge, password=password)
+        self.logger.debug(f"Expected response: {expected_response.hex()}")
+        return response == expected_response
+
+    def _encrypt_challenge(self, challenge: bytes, password: str | None = None) -> bytes:
         """
         Encrypt challenge using VNC's DES algorithm
 
@@ -85,7 +100,8 @@ class VNCAuth:
         This is a historical artifact of the original VNC implementation.
         """
         # Prepare password key (max 8 bytes, pad with nulls)
-        key = (self.password[:8] + '\x00' * 8)[:8].encode('latin-1')
+        effective_password = self.password if password is None else password
+        key = (effective_password[:8] + '\x00' * 8)[:8].encode('latin-1')
 
         # VNC quirk: reverse the bits in each byte of the key
         key = bytes([self._reverse_bits(b) for b in key])

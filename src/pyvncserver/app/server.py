@@ -65,6 +65,7 @@ class VNCServerV3:
         self.host = self.config.get('host', self.DEFAULT_HOST)
         self.port = self.config.get('port', self.DEFAULT_PORT)
         self.password = self.config.get('password', '')
+        self.read_only_password = self.config.get('read_only_password', '')
         self.frame_rate = max(1, min(60, self.config.get('frame_rate', self.DEFAULT_FRAME_RATE)))
         self.lan_frame_rate = max(1, min(120, self.config.get('lan_frame_rate', 30)))
         self.network_profile_override = self.config.get('network_profile_override', None)
@@ -80,6 +81,7 @@ class VNCServerV3:
         self.enable_cursor_encoding = False
         self.enable_metrics = self.config.get('enable_metrics', True)
         self.enable_websocket = self.config.get('enable_websocket', False)
+        self.enable_tight_security = self.config.get('enable_tight_security', True)
         self.enable_lan_adaptive_encoding = self.config.get('enable_lan_adaptive_encoding', True)
         self.enable_request_coalescing = self.config.get('enable_request_coalescing', True)
         if requested_cursor_encoding:
@@ -421,15 +423,20 @@ class VNCServerV3:
 
             # Step 2: Security Handshake
             with PerformanceMonitor("Security negotiation", self.logger):
-                security_type, needs_auth = protocol.negotiate_security(
-                    client_socket, self.password
+                security = protocol.negotiate_security(
+                    client_socket,
+                    self.password,
+                    read_only_password=self.read_only_password,
+                    allow_tight_security=self.enable_tight_security,
                 )
 
             # Step 3: Authentication
-            if needs_auth:
-                auth_handler = VNCAuth(self.password)
-                auth_success = auth_handler.authenticate(client_socket)
-                protocol.send_security_result(client_socket, auth_success)
+            view_only_session = False
+            if security.needs_auth:
+                auth_handler = VNCAuth(self.password, self.read_only_password)
+                auth_success, view_only_session = auth_handler.authenticate_with_access(client_socket)
+                if auth_success or security.send_security_result_on_failure:
+                    protocol.send_security_result(client_socket, auth_success)
 
                 if not auth_success:
                     self.logger.warning(f"Client {addr} authentication failed")
@@ -437,10 +444,12 @@ class VNCServerV3:
                         self.metrics.record_failed_auth()
                     return
             else:
-                if protocol.version >= (3, 8):
+                if security.send_security_result_on_success:
                     protocol.send_security_result(client_socket, True)
 
             self.logger.info(f"Client {addr} authenticated successfully")
+            if view_only_session:
+                self.logger.info("Client %s authenticated with read-only access", client_id)
 
             # Step 4: ClientInit
             shared_flag = protocol.receive_client_init(client_socket)
@@ -489,6 +498,8 @@ class VNCServerV3:
                 client_socket, width, height,
                 current_pixel_format, "Python VNC Server v3.0"
             )
+            if security.tight_enabled:
+                protocol.send_tight_interaction_caps(client_socket)
 
             # Initialize encoders and change detection
             # Enable advanced encodings from config
@@ -1016,7 +1027,12 @@ class VNCServerV3:
 
                     case protocol.MSG_KEY_EVENT:
                         key_event = protocol.parse_key_event(client_socket)
-                        if self._try_acquire_input_control(client_id):
+                        if view_only_session:
+                            self.logger.info(
+                                "Ignoring key event from read-only client %s",
+                                client_id,
+                            )
+                        elif self._try_acquire_input_control(client_id):
                             input_handler.handle_key_event(
                                 key_event['down_flag'],
                                 key_event['key']
@@ -1029,7 +1045,12 @@ class VNCServerV3:
                         pointer_event = self._coalesce_pointer_events(
                             client_socket, protocol, pointer_event
                         )
-                        if self._try_acquire_input_control(client_id):
+                        if view_only_session:
+                            self.logger.info(
+                                "Ignoring pointer event from read-only client %s",
+                                client_id,
+                            )
+                        elif self._try_acquire_input_control(client_id):
                             input_handler.handle_pointer_event(
                                 pointer_event['button_mask'],
                                 pointer_event['x'],
@@ -1040,12 +1061,18 @@ class VNCServerV3:
 
                     case protocol.MSG_CLIENT_CUT_TEXT:
                         text = protocol.parse_client_cut_text(client_socket)
-                        preview = sanitize_clipboard_text(text, max_length=80).replace('\n', '\\n')
-                        self.logger.info(
-                            "Client cut text received (%d chars): %s",
-                            len(text),
-                            preview,
-                        )
+                        if view_only_session:
+                            self.logger.info(
+                                "Ignoring client cut text from read-only client %s",
+                                client_id,
+                            )
+                        else:
+                            preview = sanitize_clipboard_text(text, max_length=80).replace('\n', '\\n')
+                            self.logger.info(
+                                "Client cut text received (%d chars): %s",
+                                len(text),
+                                preview,
+                            )
 
                     case _:
                         self.logger.warning(f"Unknown message type: {msg_type}")

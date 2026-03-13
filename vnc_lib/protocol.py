@@ -7,6 +7,9 @@ import struct
 import logging
 from typing import Tuple, Optional, Dict, Set
 
+from vnc_lib.exceptions import ConnectionError, ProtocolError
+from vnc_lib.types import is_valid_pixel_format
+
 
 class RFBProtocol:
     """Handles RFB protocol operations according to RFC 6143"""
@@ -240,6 +243,9 @@ class RFBProtocol:
                         f"depth={pixel_format['depth']}, "
                         f"true_color={pixel_format['true_colour_flag']}")
 
+        if not is_valid_pixel_format(pixel_format):
+            raise ProtocolError(f"Unsupported or malformed pixel format: {pixel_format}")
+
         return pixel_format
 
     def parse_set_encodings(self, client_socket) -> Set[int]:
@@ -377,13 +383,20 @@ class RFBProtocol:
 
     def _recv_exact(self, sock, n: int) -> Optional[bytes]:
         """Receive exactly n bytes from socket"""
-        buf = b''
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
+        if n == 0:
+            return b''
+
+        buf = bytearray(n)
+        view = memoryview(buf)
+        total_received = 0
+        while total_received < n:
+            chunk = sock.recv(n - total_received)
             if not chunk:
                 return None
-            buf += chunk
-        return buf
+            chunk_len = len(chunk)
+            view[total_received:total_received + chunk_len] = chunk
+            total_received += chunk_len
+        return bytes(buf)
 
     def _send_large_data(self, sock, data: bytes, chunk_size: int = 1048576):
         """Send large data in chunks using memoryview to avoid copies"""

@@ -20,6 +20,8 @@ from vnc_lib.encodings import EncoderManager, encoding_name, format_encoding_lis
 from vnc_lib.change_detector import AdaptiveChangeDetector
 from vnc_lib.cursor import CursorEncoder
 from vnc_lib.metrics import ServerMetrics, ConnectionMetrics, PerformanceMonitor
+from vnc_lib.types import is_valid_pixel_format
+from vnc_lib.clipboard import sanitize_clipboard_text
 from vnc_lib.server_utils import (
     GracefulShutdown, HealthChecker, ConnectionPool, PerformanceThrottler,
     NetworkProfile, detect_network_profile
@@ -170,6 +172,27 @@ class VNCServerV3:
                 )
             ),
         )
+        self.websocket_allowed_origins = self._coerce_allowed_origins(
+            self.config.get('websocket_allowed_origins', [])
+        )
+
+        input_policy = str(
+            self.config.get('input_control_policy', 'single-controller')
+        ).strip().lower()
+        if input_policy not in {'single-controller', 'shared'}:
+            self.logger.warning(
+                f"Invalid input_control_policy '{input_policy}', using single-controller"
+            )
+            input_policy = 'single-controller'
+        self.input_control_policy = input_policy
+        self._input_control_lock = threading.Lock()
+        self._input_controller_client_id: str | None = None
+        self._input_control_rejections_logged: set[str] = set()
+
+        # Shared OS-facing services. Capture is internally locked to avoid
+        # racing its backend state across client threads.
+        self.screen_capture = ScreenCapture(scale_factor=self.scale_factor)
+        self.input_handler = InputHandler(scale_factor=self.scale_factor)
 
         # Server components
         self.shutdown_handler = GracefulShutdown()
@@ -237,11 +260,19 @@ class VNCServerV3:
         # Add file logging if configured
         log_file = self.config.get('log_file')
         if log_file:
-            handler = logging.FileHandler(log_file)
-            handler.setFormatter(logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            ))
-            logging.getLogger().addHandler(handler)
+            root_logger = logging.getLogger()
+            target_path = str(Path(log_file).resolve())
+            existing = [
+                handler for handler in root_logger.handlers
+                if isinstance(handler, logging.FileHandler)
+                and Path(getattr(handler, 'baseFilename', '')).resolve() == Path(target_path)
+            ]
+            if not existing:
+                handler = logging.FileHandler(log_file)
+                handler.setFormatter(logging.Formatter(
+                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                ))
+                root_logger.addHandler(handler)
 
     def _setup_health_checks(self):
         """Setup health check functions"""
@@ -371,6 +402,7 @@ class VNCServerV3:
                             client_socket,
                             max_handshake_bytes=self.websocket_max_handshake_bytes,
                             max_payload_bytes=self.websocket_max_payload_bytes,
+                            allowed_origins=self.websocket_allowed_origins,
                             max_buffer_bytes=self.websocket_max_buffer_bytes,
                         )
                 except Exception as e:
@@ -415,8 +447,8 @@ class VNCServerV3:
             self.logger.debug(f"Client shared flag: {shared_flag}")
 
             # Step 5: ServerInit
-            screen_capture = ScreenCapture(scale_factor=self.scale_factor)
-            input_handler = InputHandler(scale_factor=self.scale_factor)
+            screen_capture = self.screen_capture
+            input_handler = self.input_handler
 
             # Default pixel format: BGR0 matches native Windows BGRA capture
             # (zero-copy path: ~33ms vs ~89ms with channel swapping at 1080p)
@@ -495,7 +527,7 @@ class VNCServerV3:
                 client_socket, protocol, screen_capture, input_handler,
                 current_pixel_format, client_encodings, width, height,
                 encoder_manager, change_detector, cursor_encoder, conn_metrics,
-                is_localhost, parallel_encoder, network_profile
+                client_id, is_localhost, parallel_encoder, network_profile
             )
 
         except Exception as e:
@@ -508,7 +540,11 @@ class VNCServerV3:
                     parallel_encoder.shutdown(wait=False)
                 except Exception:
                     pass
-            client_socket.close()
+            try:
+                client_socket.close()
+            except Exception:
+                pass
+            self._release_input_control(client_id)
             if self.metrics:
                 self.metrics.unregister_connection(client_id)
             self.logger.info(f"Client {addr} disconnected")
@@ -517,16 +553,17 @@ class VNCServerV3:
                             protocol: RFBProtocol,
                             screen_capture: ScreenCapture,
                             input_handler: InputHandler,
-                            current_pixel_format: dict,
-                            client_encodings: set[int],
-                            fb_width: int, fb_height: int,
-                            encoder_manager: EncoderManager,
-                            change_detector: AdaptiveChangeDetector | None,
-                            cursor_encoder: CursorEncoder | None,
-                            conn_metrics: ConnectionMetrics | None,
-                            is_localhost: bool = False,
-                            parallel_encoder = None,
-                            network_profile: NetworkProfile = NetworkProfile.WAN):
+                             current_pixel_format: dict,
+                             client_encodings: set[int],
+                             fb_width: int, fb_height: int,
+                             encoder_manager: EncoderManager,
+                             change_detector: AdaptiveChangeDetector | None,
+                             cursor_encoder: CursorEncoder | None,
+                             conn_metrics: ConnectionMetrics | None,
+                             client_id: str,
+                             is_localhost: bool = False,
+                             parallel_encoder = None,
+                             network_profile: NetworkProfile = NetworkProfile.WAN):
         """
         Enhanced client message handling loop with network-aware optimization
 
@@ -586,6 +623,10 @@ class VNCServerV3:
                 match msg_type:
                     case protocol.MSG_SET_PIXEL_FORMAT:
                         new_format = protocol.parse_set_pixel_format(client_socket)
+                        if not self._is_supported_pixel_format(new_format):
+                            raise ProtocolError(
+                                f"Unsupported client pixel format requested: {new_format}"
+                            )
                         current_pixel_format.update(new_format)
                         self.logger.info(f"Pixel format updated: {new_format}")
 
@@ -725,6 +766,7 @@ class VNCServerV3:
 
                                 # Prepare regions for parallel encoding
                                 regions_to_encode = []
+                                parallel_safe = True
                                 jpeg_original_bytes = 0
                                 jpeg_encoded_bytes = 0
                                 for x, y, w, h in changed_regions:
@@ -750,6 +792,9 @@ class VNCServerV3:
                                     self._prepare_encoder_for_send(
                                         encoding_type, encoder, lan_jpeg_quality
                                     )
+                                    parallel_safe = parallel_safe and self._is_parallel_safe_encoding(
+                                        encoding_type
+                                    )
                                     regions_to_encode.append(((x, y, w, h), region_data, encoding_type, encoder))
                                 if self.logger.isEnabledFor(logging.DEBUG):
                                     enc_counts: dict[int, int] = {}
@@ -761,44 +806,49 @@ class VNCServerV3:
                                     )
                                     self.logger.debug(f"Selected region encodings: {enc_summary}")
 
-                                # Encode regions in parallel
-                                encoded_results = parallel_encoder.encode_regions(regions_to_encode, bytes_per_pixel)
-
-                                # Build rectangles from results
-                                rectangles = [
-                                    (r.x, r.y, r.width, r.height, r.encoding_type, r.encoded_data)
-                                    for r in encoded_results
-                                ]
-
-                                self.logger.debug(
-                                    "Sending framebuffer update with %d rectangle(s)",
-                                    len(rectangles),
-                                )
-                                protocol.send_framebuffer_update(client_socket, rectangles)
-                                self.logger.debug("Framebuffer update sent successfully")
-
-                                # Record metrics
-                                if conn_metrics:
-                                    encoding_time = time.perf_counter() - start_time
-                                    total_bytes = sum(r.original_size for r in encoded_results)
-                                    compressed_bytes = sum(r.compressed_size for r in encoded_results)
-                                    conn_metrics.record_frame(
-                                        compressed_bytes, encoding_time, total_bytes
+                                if not parallel_safe:
+                                    self.logger.debug(
+                                        "Falling back to sequential region encoding due to stateful encoder selection"
                                     )
-                                    if lan_adaptive:
-                                        for r in encoded_results:
-                                            if r.encoding_type == 21:
-                                                jpeg_original_bytes += r.original_size
-                                                jpeg_encoded_bytes += r.compressed_size
-                                        if jpeg_original_bytes > 0:
-                                            lan_jpeg_quality = self._adjust_lan_jpeg_quality(
-                                                lan_jpeg_quality,
-                                                encoding_time,
-                                                jpeg_encoded_bytes,
-                                                jpeg_original_bytes,
-                                                target_frame_time,
-                                            )
-                                continue
+                                else:
+                                    # Encode regions in parallel
+                                    encoded_results = parallel_encoder.encode_regions(regions_to_encode, bytes_per_pixel)
+
+                                    # Build rectangles from results
+                                    rectangles = [
+                                        (r.x, r.y, r.width, r.height, r.encoding_type, r.encoded_data)
+                                        for r in encoded_results
+                                    ]
+
+                                    self.logger.debug(
+                                        "Sending framebuffer update with %d rectangle(s)",
+                                        len(rectangles),
+                                    )
+                                    protocol.send_framebuffer_update(client_socket, rectangles)
+                                    self.logger.debug("Framebuffer update sent successfully")
+
+                                    # Record metrics
+                                    if conn_metrics:
+                                        encoding_time = time.perf_counter() - start_time
+                                        total_bytes = sum(r.original_size for r in encoded_results)
+                                        compressed_bytes = sum(r.compressed_size for r in encoded_results)
+                                        conn_metrics.record_frame(
+                                            compressed_bytes, encoding_time, total_bytes
+                                        )
+                                        if lan_adaptive:
+                                            for r in encoded_results:
+                                                if r.encoding_type == 21:
+                                                    jpeg_original_bytes += r.original_size
+                                                    jpeg_encoded_bytes += r.compressed_size
+                                            if jpeg_original_bytes > 0:
+                                                lan_jpeg_quality = self._adjust_lan_jpeg_quality(
+                                                    lan_jpeg_quality,
+                                                    encoding_time,
+                                                    jpeg_encoded_bytes,
+                                                    jpeg_original_bytes,
+                                                    target_frame_time,
+                                                )
+                                    continue
 
                             # Non-parallel region encoding fallback
                             if changed_regions is not None and len(changed_regions) > 0:
@@ -949,29 +999,36 @@ class VNCServerV3:
 
                     case protocol.MSG_KEY_EVENT:
                         key_event = protocol.parse_key_event(client_socket)
-                        input_handler.handle_key_event(
-                            key_event['down_flag'],
-                            key_event['key']
-                        )
-                        if conn_metrics:
-                            conn_metrics.record_input('key')
+                        if self._try_acquire_input_control(client_id):
+                            input_handler.handle_key_event(
+                                key_event['down_flag'],
+                                key_event['key']
+                            )
+                            if conn_metrics:
+                                conn_metrics.record_input('key')
 
                     case protocol.MSG_POINTER_EVENT:
                         pointer_event = protocol.parse_pointer_event(client_socket)
                         pointer_event = self._coalesce_pointer_events(
                             client_socket, protocol, pointer_event
                         )
-                        input_handler.handle_pointer_event(
-                            pointer_event['button_mask'],
-                            pointer_event['x'],
-                            pointer_event['y']
-                        )
-                        if conn_metrics:
-                            conn_metrics.record_input('pointer')
+                        if self._try_acquire_input_control(client_id):
+                            input_handler.handle_pointer_event(
+                                pointer_event['button_mask'],
+                                pointer_event['x'],
+                                pointer_event['y']
+                            )
+                            if conn_metrics:
+                                conn_metrics.record_input('pointer')
 
                     case protocol.MSG_CLIENT_CUT_TEXT:
                         text = protocol.parse_client_cut_text(client_socket)
-                        self.logger.info(f"Client cut text: {text[:50]}...")
+                        preview = sanitize_clipboard_text(text, max_length=80).replace('\n', '\\n')
+                        self.logger.info(
+                            "Client cut text received (%d chars): %s",
+                            len(text),
+                            preview,
+                        )
 
                     case _:
                         self.logger.warning(f"Unknown message type: {msg_type}")
@@ -1021,6 +1078,91 @@ class VNCServerV3:
         if warmup_seconds > 0 and first_fburq_time is not None:
             return (now - first_fburq_time) < warmup_seconds
         return False
+
+    def _coerce_allowed_origins(self, raw_origins) -> tuple[str, ...]:
+        """Normalize configured WebSocket origins into an immutable tuple."""
+        if raw_origins is None:
+            return ()
+        if isinstance(raw_origins, str):
+            items = [raw_origins]
+        else:
+            items = list(raw_origins)
+        normalized = []
+        for origin in items:
+            text = str(origin).strip().rstrip('/').lower()
+            if text:
+                normalized.append(text)
+        return tuple(dict.fromkeys(normalized))
+
+    def _is_supported_pixel_format(self, pixel_format: dict) -> bool:
+        """Restrict runtime to formats the server can actually encode correctly."""
+        if not is_valid_pixel_format(pixel_format):
+            return False
+        if int(pixel_format.get('true_colour_flag', 0)) != 1:
+            return False
+        if int(pixel_format.get('big_endian_flag', 0)) != 0:
+            return False
+
+        bpp = int(pixel_format.get('bits_per_pixel', 0))
+        depth = int(pixel_format.get('depth', 0))
+        if bpp == 32 and depth != 24:
+            return False
+        if bpp not in (8, 16, 32):
+            return False
+
+        for max_key, shift_key in (
+            ('red_max', 'red_shift'),
+            ('green_max', 'green_shift'),
+            ('blue_max', 'blue_shift'),
+        ):
+            channel_max = int(pixel_format.get(max_key, 0))
+            channel_shift = int(pixel_format.get(shift_key, -1))
+            if channel_shift < 0:
+                return False
+            if channel_max.bit_length() + channel_shift > bpp:
+                return False
+
+        return True
+
+    def _is_parallel_safe_encoding(self, encoding_type: int) -> bool:
+        """Allow parallel encoding only for stateless encoder implementations."""
+        return encoding_type in {0, 2, 5}
+
+    def _try_acquire_input_control(self, client_id: str) -> bool:
+        """Grant input control to exactly one client unless policy allows sharing."""
+        if self.input_control_policy != 'single-controller':
+            return True
+
+        with self._input_control_lock:
+            if self._input_controller_client_id in (None, client_id):
+                newly_assigned = self._input_controller_client_id is None
+                self._input_controller_client_id = client_id
+                if newly_assigned:
+                    self._input_control_rejections_logged.discard(client_id)
+                    self.logger.info("Input control assigned to %s", client_id)
+                return True
+
+            controller = self._input_controller_client_id
+
+        if client_id not in self._input_control_rejections_logged:
+            self._input_control_rejections_logged.add(client_id)
+            self.logger.info(
+                "Ignoring input from %s because %s currently controls the server",
+                client_id,
+                controller,
+            )
+        return False
+
+    def _release_input_control(self, client_id: str) -> None:
+        """Release single-controller input ownership on disconnect."""
+        if self.input_control_policy != 'single-controller':
+            return
+
+        with self._input_control_lock:
+            self._input_control_rejections_logged.discard(client_id)
+            if self._input_controller_client_id == client_id:
+                self._input_controller_client_id = None
+                self.logger.info("Input control released from %s", client_id)
 
     def handle_multiple_clients_batch(self, client_data: list[tuple[socket.socket, tuple, str]]) -> None:
         """

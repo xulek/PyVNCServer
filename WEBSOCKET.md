@@ -15,11 +15,14 @@ PyVNCServer can accept browser connections over WebSocket (for noVNC and custom 
 
 ```json
 {
-  "enable_websocket": true
+  "enable_websocket": true,
+  "websocket_allowed_origins": ["http://localhost:8000"]
 }
 ```
 
-Note: In the repository's current `config.json`, this flag is set to `false`, so you need to enable it manually.
+`websocket_allowed_origins` is required for browser clients. If it is empty, browser handshakes with an `Origin` header are rejected by default.
+
+Note: In the repository's current `config.json`, WebSocket is disabled by default, so you need to enable it manually.
 
 ### 2. Start the server
 
@@ -58,9 +61,10 @@ No `websockify` is required for plain WebSocket because PyVNCServer already supp
 ```html
 <script type="module">
   import RFB from './noVNC/core/rfb.js';
+  const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
   const rfb = new RFB(
     document.getElementById('screen'),
-    'ws://localhost:5900',
+    `${scheme}://localhost:5900`,
     { credentials: { password: '' } }
   );
   rfb.scaleViewport = true;
@@ -88,6 +92,7 @@ location / {
 ### Browser page loads but cannot connect
 
 - Verify `"enable_websocket": true` in `config.json`.
+- Verify `"websocket_allowed_origins"` contains the origin serving the page, for example `http://localhost:8000`.
 - Ensure VNC server is running on the target host/port.
 - Check that firewalls allow inbound TCP on the VNC port.
 

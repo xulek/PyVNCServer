@@ -4,6 +4,8 @@ Targeted unit tests for VNCServerV3 helper logic.
 
 import struct
 import socket
+import threading
+import logging
 
 from vnc_lib.protocol import RFBProtocol
 from vnc_lib.server_utils import NetworkProfile
@@ -12,7 +14,13 @@ from vnc_server import VNCServerV3
 
 def _server_without_init() -> VNCServerV3:
     """Create server instance without opening sockets."""
-    return VNCServerV3.__new__(VNCServerV3)
+    server = VNCServerV3.__new__(VNCServerV3)
+    server.input_control_policy = 'single-controller'
+    server._input_control_lock = threading.Lock()
+    server._input_controller_client_id = None
+    server._input_control_rejections_logged = set()
+    server.logger = logging.getLogger("test.vnc_server")
+    return server
 
 
 def test_normalize_request_region_clamps_to_framebuffer():
@@ -538,6 +546,68 @@ def test_configure_tight_compatibility_for_ultravnc_like_client():
 
     server._configure_tight_compatibility(manager, {0, 7, 16})
     assert tight.enabled_values[-1] is False
+
+
+def test_supported_pixel_format_accepts_common_32bit_true_color():
+    server = _server_without_init()
+
+    assert server._is_supported_pixel_format({
+        'bits_per_pixel': 32,
+        'depth': 24,
+        'big_endian_flag': 0,
+        'true_colour_flag': 1,
+        'red_max': 255,
+        'green_max': 255,
+        'blue_max': 255,
+        'red_shift': 16,
+        'green_shift': 8,
+        'blue_shift': 0,
+    }) is True
+
+
+def test_supported_pixel_format_rejects_big_endian():
+    server = _server_without_init()
+
+    assert server._is_supported_pixel_format({
+        'bits_per_pixel': 32,
+        'depth': 24,
+        'big_endian_flag': 1,
+        'true_colour_flag': 1,
+        'red_max': 255,
+        'green_max': 255,
+        'blue_max': 255,
+        'red_shift': 16,
+        'green_shift': 8,
+        'blue_shift': 0,
+    }) is False
+
+
+def test_try_acquire_input_control_assigns_single_controller():
+    server = _server_without_init()
+
+    assert server._try_acquire_input_control("client-a") is True
+    assert server._try_acquire_input_control("client-a") is True
+    assert server._try_acquire_input_control("client-b") is False
+
+
+def test_release_input_control_allows_next_client():
+    server = _server_without_init()
+
+    assert server._try_acquire_input_control("client-a") is True
+    server._release_input_control("client-a")
+
+    assert server._try_acquire_input_control("client-b") is True
+
+
+def test_parallel_safe_encoding_whitelist():
+    server = _server_without_init()
+
+    assert server._is_parallel_safe_encoding(0) is True
+    assert server._is_parallel_safe_encoding(2) is True
+    assert server._is_parallel_safe_encoding(5) is True
+    assert server._is_parallel_safe_encoding(6) is False
+    assert server._is_parallel_safe_encoding(7) is False
+    assert server._is_parallel_safe_encoding(16) is False
 
 
 class _FakeSocket:

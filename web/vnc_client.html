@@ -354,7 +354,6 @@
 
         let rfb = null;
         let frameCount = 0;
-        let bytesReceived = 0;
         let lastStatsUpdate = Date.now();
         let desktopName = '';
         const viewOnlyToggle = document.getElementById('view-only');
@@ -384,7 +383,8 @@
             updateStatus('connecting');
 
             try {
-                const url = `ws://${host}:${port}`;
+                const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+                const url = `${scheme}://${host}:${port}`;
                 const target = document.getElementById('vnc-screen');
 
                 // Dispose old connection if any
@@ -410,8 +410,10 @@
                     document.getElementById('disconnect-btn').disabled = false;
                     document.getElementById('loading').className = 'loading';
                     frameCount = 0;
-                    bytesReceived = 0;
                     lastStatsUpdate = Date.now();
+                    updateResolution();
+                    document.getElementById('encoding').textContent = 'Auto';
+                    document.getElementById('bandwidth').textContent = '-';
                 });
 
                 rfb.addEventListener('disconnect', (e) => {
@@ -435,13 +437,13 @@
 
                 rfb.addEventListener('desktopname', (e) => {
                     desktopName = e.detail.name;
-                    const resolution = `${rfb._fbWidth}x${rfb._fbHeight}`;
-                    document.getElementById('resolution').textContent = resolution;
+                    updateResolution();
                 });
 
                 // Track stats
                 rfb.addEventListener('fbupdated', () => {
                     frameCount++;
+                    updateResolution();
                     updateStats();
                 });
 
@@ -481,15 +483,16 @@
 
                 document.getElementById('fps').textContent = fps.toFixed(1);
 
-                // Update encoding info if available
-                if (rfb && rfb._fbDepth) {
-                    document.getElementById('encoding').textContent = 'Raw';
-                }
-
                 frameCount = 0;
-                bytesReceived = 0;
                 lastStatsUpdate = now;
             }
+        }
+
+        function updateResolution() {
+            const target = document.getElementById('vnc-screen');
+            const canvas = target.querySelector('canvas');
+            document.getElementById('resolution').textContent =
+                canvas ? `${canvas.width}x${canvas.height}` : '-';
         }
 
         // Initialize status indicator

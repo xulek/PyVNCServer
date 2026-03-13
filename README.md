@@ -81,19 +81,21 @@ forced LAN mode, set `"network_profile_override": null` in `config.json`.
 ## Browser Access (WebSocket + noVNC)
 
 1. Set `"enable_websocket": true` in `config.json`.
-2. Start the VNC server:
+2. Set `"websocket_allowed_origins"` to the browser origins that may connect.
+   Example: `["http://localhost:8000"]`.
+3. Start the VNC server:
 
 ```bash
 python vnc_server.py
 ```
 
-3. Serve web assets from project root:
+4. Serve web assets from project root:
 
 ```bash
 python -m http.server 8000
 ```
 
-4. Open:
+5. Open:
 
 `http://localhost:8000/web/vnc_client.html`
 
@@ -142,10 +144,12 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `enable_parallel_encoding` | `bool` | Parallel region encoding |
 | `encoding_threads` | `int \| null` | Worker count for parallel encoding |
 | `enable_websocket` | `bool` | WebSocket transport support |
+| `websocket_allowed_origins` | `list[str]` | Allowed browser `Origin` values for WebSocket upgrade |
 | `websocket_detect_timeout` | `float` | Timeout for WebSocket request detection |
 | `websocket_max_handshake_bytes` | `int` | Max HTTP upgrade header size |
 | `websocket_max_payload_bytes` | `int` | Max inbound WebSocket frame payload size |
 | `websocket_max_buffer_bytes` | `int` | Max adapter receive buffer size |
+| `input_control_policy` | `"single-controller" \| "shared"` | Multi-client input arbitration policy |
 | `max_set_encodings` | `int` | Max SetEncodings items accepted from client |
 | `max_client_cut_text` | `int` | Max ClientCutText payload accepted from client |
 | `log_level` | `str` | Python logging level |

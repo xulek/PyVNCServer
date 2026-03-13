@@ -8,8 +8,10 @@ import base64
 import hashlib
 import logging
 import socket
-from typing import Optional
+from typing import Iterable, Optional
 from enum import IntEnum
+
+from vnc_lib.exceptions import ConnectionError, ProtocolError
 
 
 class WebSocketOpcode(IntEnum):
@@ -43,7 +45,8 @@ class WebSocketWrapper:
 
     def __init__(self, client_socket: socket.socket,
                  max_handshake_bytes: int = DEFAULT_MAX_HANDSHAKE_BYTES,
-                 max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES):
+                 max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+                 allowed_origins: Iterable[str] | None = None):
         """
         Initialize WebSocket wrapper
 
@@ -57,6 +60,11 @@ class WebSocketWrapper:
         self.max_payload_bytes = max(1024, int(max_payload_bytes))
         self._fragment_buffer = bytearray()
         self._fragment_opcode: int | None = None
+        self.allowed_origins = frozenset(
+            self._normalize_origin(origin)
+            for origin in (allowed_origins or ())
+            if origin
+        )
 
     def do_handshake(self) -> bool:
         """
@@ -180,7 +188,23 @@ class WebSocketWrapper:
             self.logger.warning(f"Unsupported Sec-WebSocket-Version: {version}")
             return False
 
+        origin = headers.get('origin')
+        if origin:
+            normalized_origin = self._normalize_origin(origin)
+            if not self.allowed_origins:
+                self.logger.warning(
+                    "Rejecting browser WebSocket connection because no allowed origins are configured"
+                )
+                return False
+            if normalized_origin not in self.allowed_origins:
+                self.logger.warning(f"Rejected WebSocket origin: {origin}")
+                return False
+
         return True
+
+    def _normalize_origin(self, origin: str) -> str:
+        """Normalize Origin header values for exact-match checks."""
+        return origin.strip().rstrip('/').lower()
 
     def _calculate_accept_key(self, ws_key: str) -> str:
         """Calculate Sec-WebSocket-Accept key (RFC 6455)"""
@@ -220,6 +244,8 @@ class WebSocketWrapper:
 
                 # Check if masked
                 masked = (byte2 & 0x80) != 0
+                if not masked:
+                    raise ProtocolError("Client WebSocket frames must be masked")
 
                 # Get payload length
                 payload_len = byte2 & 0x7F
@@ -241,6 +267,17 @@ class WebSocketWrapper:
                         f"WebSocket payload too large: {payload_len} > {self.max_payload_bytes}"
                     )
                     return None
+
+                is_control_frame = opcode in (
+                    WebSocketOpcode.CLOSE,
+                    WebSocketOpcode.PING,
+                    WebSocketOpcode.PONG,
+                )
+                if is_control_frame:
+                    if not fin:
+                        raise ProtocolError("Control WebSocket frames must not be fragmented")
+                    if payload_len > 125:
+                        raise ProtocolError("Control WebSocket frame payload too large")
 
                 # Read masking key
                 masking_key = None
@@ -270,13 +307,7 @@ class WebSocketWrapper:
 
                 if opcode == WebSocketOpcode.CONTINUATION:
                     if self._fragment_opcode is None:
-                        # Broken client: continuation without a start frame.
-                        self.logger.warning("WebSocket continuation frame without active fragment")
-                        if fin:
-                            return payload
-                        self._fragment_opcode = WebSocketOpcode.BINARY
-                        self._fragment_buffer = bytearray(payload)
-                        continue
+                        raise ProtocolError("Continuation frame without active fragment")
 
                     self._fragment_buffer.extend(payload)
                     if fin:
@@ -293,14 +324,10 @@ class WebSocketWrapper:
                     return None
 
                 if opcode == WebSocketOpcode.TEXT:
-                    self.logger.warning("Received text frame, expected binary")
+                    raise ProtocolError("Received text frame on binary VNC channel")
 
                 if self._fragment_opcode is not None:
-                    self.logger.warning(
-                        "WebSocket fragment stream reset due to unexpected new data frame"
-                    )
-                    self._fragment_buffer.clear()
-                    self._fragment_opcode = None
+                    raise ProtocolError("Unexpected new data frame during fragmented message")
 
                 if fin:
                     return payload
@@ -393,12 +420,16 @@ class WebSocketWrapper:
         """Receive exactly n bytes"""
         if n == 0:
             return b''
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = self.socket.recv(n - len(buf))
+        buf = bytearray(n)
+        view = memoryview(buf)
+        total_received = 0
+        while total_received < n:
+            chunk = self.socket.recv(n - total_received)
             if not chunk:
                 return None
-            buf.extend(chunk)
+            chunk_len = len(chunk)
+            view[total_received:total_received + chunk_len] = chunk
+            total_received += chunk_len
         return bytes(buf)
 
     def close(self):
@@ -408,12 +439,12 @@ class WebSocketWrapper:
                 # Send close frame
                 close_frame = self._create_frame(b'', WebSocketOpcode.CLOSE)
                 self.socket.sendall(close_frame)
-            except:
+            except Exception:
                 pass
 
         try:
             self.socket.close()
-        except:
+        except Exception:
             pass
 
         self.logger.info("WebSocket connection closed")
@@ -429,6 +460,7 @@ class WebSocketVNCAdapter:
     def __init__(self, client_socket: socket.socket, do_handshake: bool = True,
                  max_handshake_bytes: int = WebSocketWrapper.DEFAULT_MAX_HANDSHAKE_BYTES,
                  max_payload_bytes: int = WebSocketWrapper.DEFAULT_MAX_PAYLOAD_BYTES,
+                 allowed_origins: Iterable[str] | None = None,
                  max_buffer_bytes: int = 16 * 1024 * 1024):
         """
         Initialize WebSocket VNC adapter
@@ -441,6 +473,7 @@ class WebSocketVNCAdapter:
             client_socket,
             max_handshake_bytes=max_handshake_bytes,
             max_payload_bytes=max_payload_bytes,
+            allowed_origins=allowed_origins,
         )
         self.logger = logging.getLogger(__name__)
         self.recv_buffer = bytearray()
@@ -486,7 +519,7 @@ class WebSocketVNCAdapter:
         """Socket option setter (pass-through)"""
         try:
             self.ws.socket.setsockopt(level, optname, value)
-        except:
+        except Exception:
             pass  # Ignore errors for WebSocket
 
     def settimeout(self, value):

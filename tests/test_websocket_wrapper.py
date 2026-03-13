@@ -69,6 +69,20 @@ def _make_client_frame(opcode: int, payload: bytes, *, fin: bool = True,
     return bytes(frame)
 
 
+def _make_handshake(origin: str | None = "http://localhost:8000") -> bytes:
+    lines = [
+        "GET / HTTP/1.1",
+        "Host: localhost:5900",
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+        "Sec-WebSocket-Version: 13",
+    ]
+    if origin is not None:
+        lines.append(f"Origin: {origin}")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
+
+
 def test_fragmented_binary_frames_are_reassembled():
     incoming = (
         _make_client_frame(WebSocketOpcode.BINARY, b"hel", fin=False)
@@ -117,3 +131,35 @@ def test_is_websocket_request_restores_timeout():
 
     assert is_websocket_request(sock, peek_timeout=0.05)
     assert sock.gettimeout() == 9.0
+
+
+def test_handshake_rejects_browser_origin_when_not_configured():
+    sock = FakeSocket(_make_handshake())
+    ws = WebSocketWrapper(sock)
+
+    assert ws.do_handshake() is False
+
+
+def test_handshake_accepts_allowed_origin():
+    sock = FakeSocket(_make_handshake())
+    ws = WebSocketWrapper(sock, allowed_origins=["http://localhost:8000"])
+
+    assert ws.do_handshake() is True
+
+
+def test_recv_rejects_unmasked_client_frame():
+    incoming = bytes([0x82, 0x05]) + b"hello"
+    sock = FakeSocket(incoming)
+    ws = WebSocketWrapper(sock)
+    ws.handshake_complete = True
+
+    assert ws.recv(1024) is None
+
+
+def test_recv_rejects_text_frame():
+    incoming = _make_client_frame(WebSocketOpcode.TEXT, b"hello", fin=True)
+    sock = FakeSocket(incoming)
+    ws = WebSocketWrapper(sock)
+    ws.handshake_complete = True
+
+    assert ws.recv(1024) is None

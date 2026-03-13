@@ -8,11 +8,12 @@ Set in `config.json`:
 
 ```json
 {
-  "enable_websocket": true
+  "enable_websocket": true,
+  "websocket_allowed_origins": ["http://localhost:8000"]
 }
 ```
 
-Important: current repository default is `false`, so this must be enabled explicitly.
+Important: current repository default is `false`, so this must be enabled explicitly. Browser access also requires `websocket_allowed_origins` to include the origin that serves the page.
 
 ## 2. Start PyVNCServer
 
@@ -54,9 +55,10 @@ PyVNCServer already supports WebSocket on the same port as VNC, so `websockify` 
 <script type="module">
   import RFB from './noVNC/core/rfb.js';
 
+  const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
   const rfb = new RFB(
     document.getElementById('screen'),
-    'ws://localhost:5900',
+    `${scheme}://localhost:5900`,
     { credentials: { password: '' } }
   );
 

@@ -8,6 +8,7 @@ import struct
 import socket
 from unittest.mock import Mock, MagicMock
 from vnc_lib.protocol import RFBProtocol
+from vnc_lib.exceptions import ProtocolError
 
 
 class MockSocket:
@@ -168,6 +169,25 @@ class TestMessageParsing:
         assert pixel_format['bits_per_pixel'] == 32
         assert pixel_format['depth'] == 24
         assert pixel_format['true_colour_flag'] == 1
+
+    def test_parse_set_pixel_format_rejects_invalid_definition(self):
+        """Reject malformed pixel formats before applying them to the session."""
+        protocol = RFBProtocol()
+
+        pf_data = struct.pack(
+            ">xxxBBBBHHHBBB3x",
+            24,  # bits_per_pixel unsupported
+            32,  # depth cannot exceed bpp
+            0,
+            1,
+            255, 255, 255,
+            0, 8, 16,
+        )
+
+        mock_socket = MockSocket(pf_data)
+
+        with pytest.raises(ProtocolError):
+            protocol.parse_set_pixel_format(mock_socket)
 
     def test_parse_set_encodings(self):
         """Test parsing SetEncodings with signed integers"""

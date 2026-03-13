@@ -7,6 +7,7 @@ Enhanced with Python 3.13 features and high-performance mss backend
 import logging
 import struct
 import time
+import threading
 from typing import NamedTuple, TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -41,11 +42,12 @@ class ScreenCapture:
         self.monitor = monitor
         self.logger = logging.getLogger(__name__)
         self.last_checksum: bytes | None = None
+        self._capture_lock = threading.RLock()
+        self._thread_local = threading.local()
 
         # Try to load mss (high performance backend)
         self._mss_available = False
         self._mss = None
-        self._sct = None
         self._lazy_load_mss()
 
         # Fallback: Lazy load PIL (only when needed)
@@ -101,11 +103,26 @@ class ScreenCapture:
             try:
                 import mss
                 self._mss = mss
-                self._sct = mss.mss()
                 self._mss_available = True
             except ImportError as e:
                 self.logger.debug(f"mss not available: {e}")
                 self._mss_available = False
+
+    def _get_mss_session(self):
+        """
+        Get an mss session bound to the current thread.
+
+        MSS keeps backend state in thread-local storage on Windows, so a
+        session created in one thread cannot be safely reused from another.
+        """
+        if not self._mss_available or self._mss is None:
+            return None
+
+        session = getattr(self._thread_local, 'sct', None)
+        if session is None:
+            session = self._mss.mss()
+            self._thread_local.sct = session
+        return session
 
     def _lazy_load_pil(self):
         """Lazy load PIL modules (fallback backend)"""
@@ -126,6 +143,16 @@ class ScreenCapture:
                 "No screen capture backend available. Please install mss or Pillow:\n"
                 "pip install mss  # Recommended: high-performance\n"
                 "pip install Pillow  # Alternative: fallback backend\n"
+            )
+
+    def _ensure_pil(self):
+        """Ensure PIL backend is available for region capture/scaling helpers."""
+        if not self._pil_available:
+            self._lazy_load_pil()
+        if not self._pil_available or self._ImageGrab is None or self._Image is None:
+            raise RuntimeError(
+                "Pillow is required for this screen capture operation. "
+                "Install it with: pip install Pillow"
             )
 
     def capture(self, pixel_format: dict) -> tuple[bytes | None, bytes | None, int, int]:
@@ -183,8 +210,11 @@ class ScreenCapture:
             return None, 0, 0
 
         try:
-            monitor = self._sct.monitors[self.monitor] if self.monitor < len(self._sct.monitors) else self._sct.monitors[0]
-            sct_img = self._sct.grab(monitor)
+            sct = self._get_mss_session()
+            if sct is None:
+                return None, 0, 0
+            monitor = sct.monitors[self.monitor] if self.monitor < len(sct.monitors) else sct.monitors[0]
+            sct_img = sct.grab(monitor)
             width = sct_img.width
             height = sct_img.height
             bgra_bytes = bytes(sct_img.raw)
@@ -211,71 +241,72 @@ class ScreenCapture:
         Returns:
             CaptureResult with capture data and metadata
         """
-        try:
-            self._ensure_capture_backend()
-            start_time = time.perf_counter()
+        with self._capture_lock:
+            try:
+                self._ensure_capture_backend()
+                start_time = time.perf_counter()
 
             # Fast path: for 32-bit formats with mss, work directly with BGRA
             # to avoid the expensive intermediate RGB conversion
-            if self._mss_available and self.scale_factor == 1.0:
-                bgra_bytes, width, height = self._grab_screen_bgra()
-                if bgra_bytes is not None:
-                    num_pixels = width * height
-                    pixel_data = self._convert_bgra_to_pixel_format(
-                        bgra_bytes, width, height, num_pixels, pixel_format
-                    )
-                    if pixel_data is not None:
-                        elapsed = time.perf_counter() - start_time
-                        self.logger.debug(
-                            f"Screen capture (BGRA fast path): {width}x{height}, "
-                            f"{len(pixel_data)} bytes, {elapsed*1000:.2f}ms"
+                if self._mss_available and self.scale_factor == 1.0:
+                    bgra_bytes, width, height = self._grab_screen_bgra()
+                    if bgra_bytes is not None:
+                        num_pixels = width * height
+                        pixel_data = self._convert_bgra_to_pixel_format(
+                            bgra_bytes, width, height, num_pixels, pixel_format
                         )
-                        return CaptureResult(pixel_data, None, width, height, elapsed)
+                        if pixel_data is not None:
+                            elapsed = time.perf_counter() - start_time
+                            self.logger.debug(
+                                f"Screen capture (BGRA fast path): {width}x{height}, "
+                                f"{len(pixel_data)} bytes, {elapsed*1000:.2f}ms"
+                            )
+                            return CaptureResult(pixel_data, None, width, height, elapsed)
 
             # Standard path: grab as RGB, then convert
-            rgb_bytes, width, height = self._grab_screen_rgb()
-            if rgb_bytes is None:
-                return CaptureResult(None, None, 0, 0, 0.0)
-
-            # Apply scaling if needed
-            if self.scale_factor != 1.0:
-                scaled_width = int(width * self.scale_factor)
-                scaled_height = int(height * self.scale_factor)
-
-                if scaled_width < 1 or scaled_height < 1:
-                    self.logger.warning("Scale factor too small")
+                rgb_bytes, width, height = self._grab_screen_rgb()
+                if rgb_bytes is None:
                     return CaptureResult(None, None, 0, 0, 0.0)
 
-                # For scaling, we need PIL
-                if self._mss_available and not self._pil_available:
-                    self._lazy_load_pil()
+            # Apply scaling if needed
+                if self.scale_factor != 1.0:
+                    scaled_width = int(width * self.scale_factor)
+                    scaled_height = int(height * self.scale_factor)
 
-                if self._pil_available:
-                    from PIL import Image
-                    img = Image.frombytes('RGB', (width, height), rgb_bytes)
-                    img = img.resize(
-                        (scaled_width, scaled_height),
-                        Image.Resampling.BILINEAR
-                    )
-                    rgb_bytes = img.tobytes()
-                    width, height = scaled_width, scaled_height
-                else:
-                    self.logger.warning("Cannot scale without PIL, using original size")
+                    if scaled_width < 1 or scaled_height < 1:
+                        self.logger.warning("Scale factor too small")
+                        return CaptureResult(None, None, 0, 0, 0.0)
+
+                # For scaling, we need PIL
+                    if self._mss_available and not self._pil_available:
+                        self._lazy_load_pil()
+
+                    if self._pil_available:
+                        from PIL import Image
+                        img = Image.frombytes('RGB', (width, height), rgb_bytes)
+                        img = img.resize(
+                            (scaled_width, scaled_height),
+                            Image.Resampling.BILINEAR
+                        )
+                        rgb_bytes = img.tobytes()
+                        width, height = scaled_width, scaled_height
+                    else:
+                        self.logger.warning("Cannot scale without PIL, using original size")
 
             # Convert to requested pixel format
-            pixel_data = self._convert_rgb_to_pixel_format(rgb_bytes, width, height, pixel_format)
+                pixel_data = self._convert_rgb_to_pixel_format(rgb_bytes, width, height, pixel_format)
 
-            elapsed = time.perf_counter() - start_time
-            self.logger.debug(
-                f"Screen capture: {width}x{height}, "
-                f"{len(pixel_data)} bytes, {elapsed*1000:.2f}ms"
-            )
+                elapsed = time.perf_counter() - start_time
+                self.logger.debug(
+                    f"Screen capture: {width}x{height}, "
+                    f"{len(pixel_data)} bytes, {elapsed*1000:.2f}ms"
+                )
 
-            return CaptureResult(pixel_data, None, width, height, elapsed)
+                return CaptureResult(pixel_data, None, width, height, elapsed)
 
-        except Exception as e:
-            self.logger.error(f"Screen capture error: {e}", exc_info=True)
-            return CaptureResult(None, None, 0, 0, 0.0)
+            except Exception as e:
+                self.logger.error(f"Screen capture error: {e}", exc_info=True)
+                return CaptureResult(None, None, 0, 0, 0.0)
 
     def _grab_screen_rgb(self) -> tuple[bytes | None, int, int]:
         """
@@ -296,9 +327,12 @@ class ScreenCapture:
         # Capture new screenshot using mss (preferred) or PIL (fallback)
         try:
             if self._mss_available:
+                sct = self._get_mss_session()
+                if sct is None:
+                    return None, 0, 0
                 # High-performance mss backend
-                monitor = self._sct.monitors[self.monitor] if self.monitor < len(self._sct.monitors) else self._sct.monitors[0]
-                sct_img = self._sct.grab(monitor)
+                monitor = sct.monitors[self.monitor] if self.monitor < len(sct.monitors) else sct.monitors[0]
+                sct_img = sct.grab(monitor)
 
                 # mss returns BGRA, convert to RGB
                 width = sct_img.width
@@ -398,28 +432,29 @@ class ScreenCapture:
         Returns:
             Pixel data for region or None on error
         """
-        try:
-            self._ensure_pil()
-            # Grab specific region
-            bbox = (x, y, x + width, y + height)
-            screenshot = self._ImageGrab.grab(bbox=bbox)
+        with self._capture_lock:
+            try:
+                self._ensure_pil()
+                # Grab specific region
+                bbox = (x, y, x + width, y + height)
+                screenshot = self._ImageGrab.grab(bbox=bbox)
 
             # Apply scaling if needed
-            if self.scale_factor != 1.0:
-                scaled_width = int(width * self.scale_factor)
-                scaled_height = int(height * self.scale_factor)
-                screenshot = screenshot.resize(
-                    (scaled_width, scaled_height),
-                    self._Image.Resampling.BILINEAR
-                )
+                if self.scale_factor != 1.0:
+                    scaled_width = int(width * self.scale_factor)
+                    scaled_height = int(height * self.scale_factor)
+                    screenshot = screenshot.resize(
+                        (scaled_width, scaled_height),
+                        self._Image.Resampling.BILINEAR
+                    )
 
             # Convert to pixel format
-            pixel_data = self._convert_to_pixel_format(screenshot, pixel_format)
-            return pixel_data
+                pixel_data = self._convert_to_pixel_format(screenshot, pixel_format)
+                return pixel_data
 
-        except Exception as e:
-            self.logger.error(f"Region capture error: {e}")
-            return None
+            except Exception as e:
+                self.logger.error(f"Region capture error: {e}")
+                return None
 
     def _convert_bgra_to_pixel_format(self, bgra_bytes: bytes, width: int, height: int,
                                       num_pixels: int, pixel_format: dict) -> bytes | None:

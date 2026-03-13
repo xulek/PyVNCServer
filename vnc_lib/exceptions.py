@@ -3,6 +3,7 @@ VNC Server Exception Definitions
 Python 3.13 with Exception Groups (PEP 654)
 """
 
+import builtins
 from typing import Sequence
 
 
@@ -32,7 +33,7 @@ class ScreenCaptureError(VNCError):
     pass
 
 
-class ConnectionError(VNCError):
+class ConnectionError(VNCError, builtins.ConnectionError):
     """Connection-related errors"""
     pass
 

@@ -46,10 +46,14 @@
 
   "_websocket_support": "Browser-based VNC access with noVNC",
   "enable_websocket": false,
+  "websocket_allowed_origins": [],
   "websocket_detect_timeout": 0.5,
   "websocket_max_handshake_bytes": 65536,
   "websocket_max_payload_bytes": 8388608,
   "websocket_max_buffer_bytes": 16777216,
+
+  "_input_control": "Input arbitration for multiple connected clients",
+  "input_control_policy": "single-controller",
 
   "_protocol_limits": "Defensive limits for client-controlled payload sizes",
   "max_set_encodings": 1024,
@@ -91,10 +95,12 @@
     "enable_parallel_encoding": "2-4x faster encoding on multi-core CPUs",
     "encoding_threads": "null = auto-detect (CPU count - 1), or specify number",
     "enable_websocket": "Enable browser-based access via noVNC (disabled by default, set to true to enable)",
+    "websocket_allowed_origins": "List of allowed browser Origin values for WebSocket upgrade, e.g. ['http://localhost:8000']",
     "websocket_detect_timeout": "Peek timeout (seconds) used to detect WebSocket handshakes",
     "websocket_max_handshake_bytes": "Maximum HTTP upgrade header size in bytes",
     "websocket_max_payload_bytes": "Maximum inbound WebSocket frame payload size in bytes",
     "websocket_max_buffer_bytes": "Maximum adapter receive buffer size in bytes",
+    "input_control_policy": "'single-controller' = first client with input wins, 'shared' = all clients may send input",
     "max_set_encodings": "Maximum number of encodings accepted in SetEncodings",
     "max_client_cut_text": "Maximum ClientCutText payload size in bytes"
   },

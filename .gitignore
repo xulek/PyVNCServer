@@ -193,3 +193,4 @@ captured_frames/
 connection_logs/
 .claude
 .history
+docs/

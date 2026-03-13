@@ -114,13 +114,20 @@ class VNCAuth:
 
     def _recv_exact(self, sock, n: int) -> Optional[bytes]:
         """Receive exactly n bytes from socket"""
-        buf = b''
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
+        if n == 0:
+            return b''
+
+        buf = bytearray(n)
+        view = memoryview(buf)
+        total_received = 0
+        while total_received < n:
+            chunk = sock.recv(n - total_received)
             if not chunk:
                 return None
-            buf += chunk
-        return buf
+            chunk_len = len(chunk)
+            view[total_received:total_received + chunk_len] = chunk
+            total_received += chunk_len
+        return bytes(buf)
 
 
 class NoAuth:

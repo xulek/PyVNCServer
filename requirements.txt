@@ -2,6 +2,6 @@ mss>=10.1.0
 Pillow>=12.1.0
 pyautogui>=0.9.54
 pycryptodome>=3.23.0
-numpy>=2.4.2
+numpy>=2.0,<2.3
 pytest>=9.0.2
 pytest-cov>=7.0.0

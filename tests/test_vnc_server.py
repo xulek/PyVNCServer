@@ -1,5 +1,5 @@
 """
-Targeted unit tests for VNCServerV3 helper logic.
+Targeted unit tests for the packaged VNC server runtime.
 """
 
 import struct
@@ -9,7 +9,7 @@ import logging
 
 from vnc_lib.protocol import RFBProtocol
 from vnc_lib.server_utils import NetworkProfile
-from vnc_server import VNCServerV3
+from pyvncserver import VNCServerV3
 
 
 def _server_without_init() -> VNCServerV3:

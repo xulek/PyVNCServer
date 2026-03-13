@@ -14,11 +14,11 @@
 ## Build, Test, and Development Commands
 
 - `python -m pip install -e .[dev]`: install the package in editable mode with test dependencies.
+- `$env:PYTHONPATH="src"; python -m pyvncserver --help`: run the packaged module directly from a checkout without installing it.
 - `pyvncserver serve --config config/pyvncserver.toml`: run the packaged server entrypoint.
-- `python vnc_server.py`: run the legacy compatibility wrapper.
 - `python -m pytest tests -q`: run the full test suite.
-- `python -m pytest tests/test_vnc_server.py -q`: run one focused test module.
-- `python -m py_compile vnc_server.py src\pyvncserver\app\server.py`: quick syntax validation before a larger run.
+- `python -m pytest tests/test_packaging.py tests/test_vnc_server.py -q`: run focused packaging and server regressions.
+- `python -m py_compile src\pyvncserver\app\server.py src\pyvncserver\cli.py`: quick syntax validation before a larger run.
 
 ## Coding Style & Naming Conventions
 
@@ -49,5 +49,5 @@
 ## Security & Configuration Tips
 
 - Do not expose the server without authentication or network protections.
-- Prefer `config/pyvncserver.toml`; keep `config.json` only for legacy compatibility.
+- Use `config/pyvncserver.toml` as the only supported runtime config.
 - Treat WebSocket origin allowlists and protocol limits as production settings, not optional cleanup.

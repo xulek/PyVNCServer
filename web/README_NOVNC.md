@@ -4,13 +4,14 @@ This project includes a browser client (`web/vnc_client.html`) built on top of t
 
 ## 1. Enable WebSocket in server config
 
-Set in `config.json`:
+Set in `config/pyvncserver.toml`:
 
-```json
-{
-  "enable_websocket": true,
-  "websocket_allowed_origins": ["http://localhost:8000"]
-}
+```toml
+[features]
+enable_websocket = true
+
+[websocket]
+allowed_origins = ["http://localhost:8000"]
 ```
 
 Important: current repository default is `false`, so this must be enabled explicitly. Browser access also requires `websocket_allowed_origins` to include the origin that serves the page.
@@ -18,7 +19,7 @@ Important: current repository default is `false`, so this must be enabled explic
 ## 2. Start PyVNCServer
 
 ```bash
-python vnc_server.py
+pyvncserver serve --config config/pyvncserver.toml
 ```
 
 ## 3. Serve the web assets
@@ -39,7 +40,7 @@ Do not open the HTML directly with `file://`; ES module imports for noVNC requir
 
 - Host: `localhost`
 - Port: `5900` (or your configured server port)
-- Password: if configured in `config.json`
+- Password: if configured in `config/pyvncserver.toml`
 
 ## Using upstream noVNC UI
 

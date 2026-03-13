@@ -5,22 +5,20 @@
 
 PyVNCServer is an RFB (VNC) server implementation in Python. The repository combines:
 - a packaged runtime in `src/pyvncserver/`
-- a legacy compatibility entrypoint in `vnc_server.py`
 - reusable protocol/encoding modules
 - browser client assets (`web/`)
 - demos, tests, and benchmarks
 
 ## Scope
 
-The preferred entrypoint is now the packaged CLI in `pyvncserver`. The legacy `vnc_server.py`
-wrapper remains available for compatibility.
+The supported entrypoint is the packaged CLI in `pyvncserver`.
 
 The `src/pyvncserver/` package is the new source of truth for runtime structure.
-The legacy `vnc_lib/` package is retained during the migration and still backs many internals.
+The packaged `src/vnc_lib/` modules still back parts of the runtime during the migration.
 
 ## Implemented Capabilities
 
-### Server Runtime (`vnc_server.py`)
+### Server Runtime (`pyvncserver`)
 - RFB protocol negotiation for versions 3.3, 3.7, and 3.8
 - Security: `None` and `VNC Authentication`
 - Encodings: Raw, RRE, Hextile, Zlib
@@ -61,15 +59,29 @@ python -m pip install --upgrade pip
 python -m pip install -e .[dev]
 ```
 
+For a checkout-only workflow without installation, point Python at `src/` first:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m pyvncserver --help
+```
+
 ## Quick Start
 
-1. Review `config.json` and set at least `host`, `port`, and `password`.
+1. Review `config/pyvncserver.toml` and set at least `host`, `port`, and `password`.
    The shipped default is currently tuned for LAN quality/performance
    (`network_profile_override` is set to `"lan"`).
 2. Start the server:
 
 ```bash
 pyvncserver serve --config config/pyvncserver.toml
+```
+
+Without `pip install -e .`, use:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m pyvncserver serve --config config/pyvncserver.toml
 ```
 
 3. Connect with a VNC client (example):
@@ -79,17 +91,16 @@ vncviewer localhost:5900
 ```
 
 If you want automatic profile detection (`localhost`/`lan`/`wan`) instead of
-forced LAN mode, set `"network_profile_override": null` in `config.json`.
+forced LAN mode, set `network_profile_override = ""` or remove that key in `config/pyvncserver.toml`.
 
 ## Browser Access (WebSocket + noVNC)
 
-1. Set `"enable_websocket": true` in `config.json`.
-2. Set `"websocket_allowed_origins"` to the browser origins that may connect.
-   Example: `["http://localhost:8000"]`.
+1. Set `enable_websocket = true` in `[features]`.
+2. Set `allowed_origins = ["http://localhost:8000"]` in `[websocket]`.
 3. Start the VNC server:
 
 ```bash
-python vnc_server.py
+pyvncserver serve --config config/pyvncserver.toml
 ```
 
 4. Serve web assets from project root:
@@ -106,7 +117,7 @@ Additional details are documented in `WEBSOCKET.md` and `web/README_NOVNC.md`.
 
 ## Configuration
 
-The repository ships with a ready-to-edit `config.json`. Key fields:
+The repository ships with a ready-to-edit `config/pyvncserver.toml`. Runtime keys map to the following values:
 
 | Key | Type | Description |
 |---|---|---|
@@ -163,7 +174,8 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 CLI supports config and log level overrides:
 
 ```bash
-python vnc_server.py serve --config config/pyvncserver.toml --log-level DEBUG
+pyvncserver serve --config config/pyvncserver.toml --log-level DEBUG
+python -m pyvncserver serve --config config/pyvncserver.toml --log-level DEBUG
 ```
 
 Programmatic startup is also available:
@@ -201,14 +213,13 @@ python -m pytest tests/ -v --cov=vnc_lib --cov-report=term-missing
 
 ```text
 benchmarks/          Performance and latency scripts
-config/              Preferred runtime configuration files
+config/              Runtime configuration files
 docs/                Project and architecture documentation
 examples/            Runnable demo scripts
 src/pyvncserver/     Packaged application and library code
+src/vnc_lib/         Supporting modules still used internally
 tests/               Unit tests
-vnc_lib/             Legacy modules retained during migration
 web/                 Browser client assets and noVNC integration
-vnc_server.py        Legacy compatibility entrypoint
 ```
 
 ## Security Notes

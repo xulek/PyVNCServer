@@ -11,23 +11,22 @@ PyVNCServer can accept browser connections over WebSocket (for noVNC and custom 
 
 ## Quick Start
 
-### 1. Enable WebSocket in `config.json`
+### 1. Enable WebSocket in `config/pyvncserver.toml`
 
-```json
-{
-  "enable_websocket": true,
-  "websocket_allowed_origins": ["http://localhost:8000"]
-}
+```toml
+[features]
+enable_websocket = true
+
+[websocket]
+allowed_origins = ["http://localhost:8000"]
 ```
 
-`websocket_allowed_origins` is required for browser clients. If it is empty, browser handshakes with an `Origin` header are rejected by default.
-
-Note: In the repository's current `config.json`, WebSocket is disabled by default, so you need to enable it manually.
+`allowed_origins` is required for browser clients. If it is empty, browser handshakes with an `Origin` header are rejected by default.
 
 ### 2. Start the server
 
 ```bash
-python vnc_server.py
+pyvncserver serve --config config/pyvncserver.toml
 ```
 
 ### 3. Serve the bundled web client
@@ -46,7 +45,7 @@ The page imports modules from `web/noVNC`, so use HTTP/HTTPS (not `file://`).
 
 - Host: `localhost`
 - Port: `5900` (or your configured VNC port)
-- Password: according to `config.json`
+- Password: according to `config/pyvncserver.toml`
 
 ## Upstream noVNC UI
 
@@ -91,8 +90,8 @@ location / {
 
 ### Browser page loads but cannot connect
 
-- Verify `"enable_websocket": true` in `config.json`.
-- Verify `"websocket_allowed_origins"` contains the origin serving the page, for example `http://localhost:8000`.
+- Verify `enable_websocket = true` in `[features]`.
+- Verify `allowed_origins` contains the origin serving the page, for example `http://localhost:8000`.
 - Ensure VNC server is running on the target host/port.
 - Check that firewalls allow inbound TCP on the VNC port.
 

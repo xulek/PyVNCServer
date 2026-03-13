@@ -26,6 +26,18 @@ def test_default_toml_config_loads():
     assert config["log_file"] is None
 
 
+def test_json_config_is_not_supported_anymore(tmp_path):
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text("{}", encoding="utf-8")
+
+    try:
+        load_config_file(legacy)
+    except ValueError as exc:
+        assert "Unsupported config format" in str(exc)
+    else:
+        raise AssertionError("JSON config should no longer be supported")
+
+
 def test_cli_parser_defaults_to_packaged_config():
     parser = build_parser()
     args = parser.parse_args(["serve"])

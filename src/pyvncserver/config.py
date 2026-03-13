@@ -7,12 +7,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-import json
 import tomllib
 
 
 DEFAULT_CONFIG_PATH = Path("config/pyvncserver.toml")
-LEGACY_CONFIG_PATH = Path("config.json")
 
 
 @dataclass(slots=True)
@@ -34,21 +32,18 @@ def _coerce_path(path: str | Path | None) -> Path:
 
 
 def load_config_file(path: str | Path | None = None) -> dict[str, Any]:
-    """Load configuration from TOML or legacy JSON."""
+    """Load configuration from TOML."""
     config_path = _coerce_path(path)
-    if not config_path.exists() and config_path == DEFAULT_CONFIG_PATH and LEGACY_CONFIG_PATH.exists():
-        config_path = LEGACY_CONFIG_PATH
 
     if not config_path.exists():
         return {}
 
-    if config_path.suffix.lower() == ".toml":
-        with config_path.open("rb") as fh:
-            data = tomllib.load(fh)
-        return _normalize_config(_flatten_toml_settings(data))
+    if config_path.suffix.lower() != ".toml":
+        raise ValueError(f"Unsupported config format for {config_path}; use TOML")
 
-    with config_path.open("r", encoding="utf-8") as fh:
-        return _normalize_config(json.load(fh))
+    with config_path.open("rb") as fh:
+        data = tomllib.load(fh)
+    return _normalize_config(_flatten_toml_settings(data))
 
 
 def _flatten_toml_settings(data: dict[str, Any]) -> dict[str, Any]:

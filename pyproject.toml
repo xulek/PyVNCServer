@@ -12,10 +12,10 @@ license = { file = "LICENSE" }
 authors = [{ name = "PyVNCServer contributors" }]
 dependencies = [
   "mss>=10.1.0",
-  "Pillow>=12.1.1",
+  "Pillow>=12.1.0",
   "pyautogui>=0.9.54",
   "pycryptodome>=3.23.0",
-  "numpy>=2.4.3",
+  "numpy>=2.0,<2.3",
 ]
 
 [project.optional-dependencies]
@@ -32,4 +32,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

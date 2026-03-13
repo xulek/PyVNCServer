@@ -137,25 +137,25 @@ The repository ships with a ready-to-edit `config/pyvncserver.toml`. Runtime key
 | `lan_zlib_area_threshold` | `float` | Area ratio above which Zlib is preferred on LAN |
 | `lan_zlib_min_pixels` | `int` | Minimum rectangle size for Zlib consideration on LAN |
 | `lan_zlib_compression_level` | `int` | Zlib compression level used in LAN mode |
-| `lan_zlib_warmup_requests` | `int` | Initial framebuffer requests served without Zlib |
 | `lan_zlib_disable_if_request_gap_ms` | `int` | Auto-disable Zlib for client if request gaps are too large |
 | `lan_jpeg_area_threshold` | `float` | Area ratio above which JPEG is preferred on LAN |
 | `lan_jpeg_min_pixels` | `int` | Minimum rectangle size for JPEG consideration |
 | `lan_jpeg_quality_initial` | `int` | Initial JPEG quality in adaptive LAN mode |
 | `lan_jpeg_quality_min` | `int` | Lower bound for adaptive JPEG quality |
 | `lan_jpeg_quality_max` | `int` | Upper bound for adaptive JPEG quality |
-| `lan_zrle_compression_level` | `int` | Reserved legacy setting; ZRLE is not negotiated by default |
+| `lan_zrle_compression_level` | `int` | ZRLE compression level used when clients prefer ZRLE |
 | `network_profile_override` | `null \| "localhost" \| "lan" \| "wan"` | Forces profile, bypasses auto-detection |
 | `scale_factor` | `float` | Capture scaling factor |
 | `max_connections` | `int` | Max simultaneous clients |
 | `client_socket_timeout` | `float` | Per-client read timeout in seconds |
 | `enable_region_detection` | `bool` | Incremental update optimization |
 | `enable_cursor_encoding` | `bool` | Enables Windows RichCursor and PointerPos pseudo-encodings when the client advertises them |
+| `enable_copyrect_encoding` | `bool` | Enables CopyRect negotiation and conservative server-side copy detection |
+| `enable_zrle_encoding` | `bool` | Enables RFC 6143 ZRLE negotiation with 64x64 tiled zlib encoding |
 | `enable_metrics` | `bool` | Internal metrics collection |
 | `enable_tight_encoding` | `bool` | Tight encoder availability |
 | `tight_disable_for_ultravnc` | `bool` | Legacy hard-disable for Tight on UltraVNC-like clients; default `false` |
-| `ultravnc_tight_warmup_requests` | `int` | Delay Tight for UltraVNC-like clients for initial framebuffer requests |
-| `ultravnc_tight_warmup_seconds` | `float` | Delay Tight for UltraVNC-like clients for initial connection seconds |
+| `tight_stream_reset_for_ultravnc` | `bool` | Explicit opt-in Tight stream-reset mode; leave `false` unless a specific decoder requires it |
 | `enable_jpeg_encoding` | `bool` | JPEG encoder availability |
 | `enable_h264_encoding` | `bool` | H.264 encoder availability (requires optional deps) |
 | `enable_parallel_encoding` | `bool` | Parallel region encoding |

@@ -125,6 +125,7 @@ class CopyRectEncoder:
         self.previous_frame: PixelData | None = None
         self.frame_width: int = 0
         self.frame_height: int = 0
+        self.bytes_per_pixel: int = 0
 
     def encode(self, pixel_data: PixelData, width: int, height: int,
                bytes_per_pixel: int) -> EncodedData:
@@ -133,21 +134,22 @@ class CopyRectEncoder:
 
         Returns: struct.pack(">HH", src_x, src_y) if match found, else pixel_data
         """
-        # Store current frame for next comparison
         if self.previous_frame is None or width != self.frame_width or height != self.frame_height:
-            self.previous_frame = pixel_data
-            self.frame_width = width
-            self.frame_height = height
+            self.commit_frame(pixel_data, width, height, bytes_per_pixel)
             # First frame - no copy possible
             return pixel_data
 
-        # Try to find matching rectangle in previous frame
-        match = self._find_matching_region(
-            pixel_data, self.previous_frame, width, height, bytes_per_pixel
+        match = self.find_source_for_region(
+            pixel_data,
+            width,
+            height,
+            0,
+            0,
+            width,
+            height,
+            bytes_per_pixel,
         )
-
-        # Update previous frame
-        self.previous_frame = pixel_data
+        self.commit_frame(pixel_data, width, height, bytes_per_pixel)
 
         if match:
             src_x, src_y = match
@@ -156,6 +158,243 @@ class CopyRectEncoder:
 
         # No match found, fallback to raw
         return pixel_data
+
+    def reset(self) -> None:
+        """Drop cached framebuffer state."""
+        self.previous_frame = None
+        self.frame_width = 0
+        self.frame_height = 0
+        self.bytes_per_pixel = 0
+
+    def commit_frame(self, pixel_data: PixelData, width: int, height: int,
+                     bytes_per_pixel: int) -> None:
+        """Store the framebuffer last known to be present on the client."""
+        self.previous_frame = pixel_data
+        self.frame_width = width
+        self.frame_height = height
+        self.bytes_per_pixel = bytes_per_pixel
+
+    def find_source_for_region(
+        self,
+        current_frame: PixelData,
+        fb_width: int,
+        fb_height: int,
+        target_x: int,
+        target_y: int,
+        target_width: int,
+        target_height: int,
+        bytes_per_pixel: int,
+        request_region: Rectangle | None = None,
+    ) -> tuple[int, int] | None:
+        """
+        Find a safe CopyRect source in the previous framebuffer for the target region.
+
+        Returns a `(src_x, src_y)` pair only when the exact region already exists in the
+        previous framebuffer and the copy stays within the requested client region.
+        """
+        if (
+            self.previous_frame is None
+            or fb_width != self.frame_width
+            or fb_height != self.frame_height
+            or bytes_per_pixel != self.bytes_per_pixel
+            or target_width <= 0
+            or target_height <= 0
+        ):
+            return None
+
+        target_region = self._extract_region(
+            current_frame,
+            fb_width,
+            fb_height,
+            target_x,
+            target_y,
+            target_width,
+            target_height,
+            bytes_per_pixel,
+        )
+        if not target_region:
+            return None
+
+        for src_x, src_y in self._candidate_sources(
+            fb_width,
+            fb_height,
+            target_x,
+            target_y,
+            target_width,
+            target_height,
+        ):
+            if request_region is not None and not self._region_within_request(
+                src_x, src_y, target_width, target_height, request_region
+            ):
+                continue
+            if src_x == target_x and src_y == target_y:
+                continue
+            if self._region_matches_previous(
+                target_region,
+                src_x,
+                src_y,
+                fb_width,
+                fb_height,
+                target_width,
+                target_height,
+                bytes_per_pixel,
+            ):
+                return src_x, src_y
+
+        return None
+
+    def encode_copyrect(
+        self,
+        current_frame: PixelData,
+        fb_width: int,
+        fb_height: int,
+        target_x: int,
+        target_y: int,
+        target_width: int,
+        target_height: int,
+        bytes_per_pixel: int,
+        request_region: Rectangle | None = None,
+    ) -> bytes | None:
+        """Encode a CopyRect payload for a specific target rectangle, or return None."""
+        match = self.find_source_for_region(
+            current_frame,
+            fb_width,
+            fb_height,
+            target_x,
+            target_y,
+            target_width,
+            target_height,
+            bytes_per_pixel,
+            request_region=request_region,
+        )
+        if match is None:
+            return None
+        src_x, src_y = match
+        self.logger.debug(
+            "CopyRect: target (%d, %d, %d, %d) <- source (%d, %d)",
+            target_x,
+            target_y,
+            target_width,
+            target_height,
+            src_x,
+            src_y,
+        )
+        return struct.pack(">HH", src_x, src_y)
+
+    def _extract_region(self, pixel_data: PixelData, fb_width: int, fb_height: int,
+                        x: int, y: int, width: int, height: int, bpp: int) -> bytes:
+        if (
+            width <= 0
+            or height <= 0
+            or bpp <= 0
+            or x < 0
+            or y < 0
+            or x + width > fb_width
+            or y + height > fb_height
+        ):
+            return b""
+
+        row_size = width * bpp
+        result = bytearray(height * row_size)
+        dst_offset = 0
+        for row in range(height):
+            src_offset = ((y + row) * fb_width + x) * bpp
+            result[dst_offset:dst_offset + row_size] = pixel_data[src_offset:src_offset + row_size]
+            dst_offset += row_size
+        return bytes(result)
+
+    def _region_within_request(self, src_x: int, src_y: int, width: int, height: int,
+                               request_region: Rectangle) -> bool:
+        req_x, req_y, req_width, req_height = request_region
+        return (
+            src_x >= req_x
+            and src_y >= req_y
+            and src_x + width <= req_x + req_width
+            and src_y + height <= req_y + req_height
+        )
+
+    def _candidate_sources(self, fb_width: int, fb_height: int,
+                           target_x: int, target_y: int,
+                           target_width: int, target_height: int) -> list[tuple[int, int]]:
+        """
+        Generate conservative candidate sources for window moves and scrolling.
+
+        CopyRect support here is intentionally conservative: prefer common local shifts
+        and full-width/full-height scroll regions over expensive exhaustive search.
+        """
+        candidates: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+
+        def add_candidate(src_x: int, src_y: int) -> None:
+            if (
+                src_x < 0
+                or src_y < 0
+                or src_x + target_width > fb_width
+                or src_y + target_height > fb_height
+            ):
+                return
+            candidate = (src_x, src_y)
+            if candidate in seen:
+                return
+            seen.add(candidate)
+            candidates.append(candidate)
+
+        # Common scroll/window-move deltas near the current position.
+        deltas = (
+            -128, -96, -64, -48, -32, -24, -16, -12, -10, -8, -6, -5, -4, -3, -2, -1,
+            1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 96, 128,
+        )
+        for delta in deltas:
+            add_candidate(target_x + delta, target_y)
+            add_candidate(target_x, target_y + delta)
+
+        # Full-width and full-height regions are common scroll cases; search more broadly.
+        if target_width == fb_width:
+            lower = max(0, target_y - min(256, fb_height))
+            upper = min(fb_height - target_height, target_y + min(256, fb_height - target_height))
+            for src_y in range(lower, upper + 1):
+                add_candidate(0, src_y)
+        if target_height == fb_height:
+            lower = max(0, target_x - min(256, fb_width))
+            upper = min(fb_width - target_width, target_x + min(256, fb_width - target_width))
+            for src_x in range(lower, upper + 1):
+                add_candidate(src_x, 0)
+
+        return candidates
+
+    def _region_matches_previous(
+        self,
+        target_region: bytes,
+        src_x: int,
+        src_y: int,
+        fb_width: int,
+        fb_height: int,
+        target_width: int,
+        target_height: int,
+        bpp: int,
+    ) -> bool:
+        prev_region = self._extract_region(
+            self.previous_frame or b"",
+            fb_width,
+            fb_height,
+            src_x,
+            src_y,
+            target_width,
+            target_height,
+            bpp,
+        )
+        if not prev_region or len(prev_region) != len(target_region):
+            return False
+
+        row_size = target_width * bpp
+        if row_size <= 0:
+            return False
+
+        if prev_region[:row_size] != target_region[:row_size]:
+            return False
+        if prev_region[-row_size:] != target_region[-row_size:]:
+            return False
+        return prev_region == target_region
 
     def _find_matching_region(self, current: PixelData, previous: PixelData,
                               width: int, height: int, bpp: int,
@@ -513,44 +752,73 @@ class ZRLEEncoder:
         self.compression_level = compression_level
         self._compressor = zlib.compressobj(level=self.compression_level)
         self.logger = logging.getLogger(__name__)
+        self.tile_size = 64
 
     def encode(self, pixel_data: PixelData, width: int, height: int,
-               bytes_per_pixel: int) -> EncodedData:
+               bytes_per_pixel: int, pixel_format: dict | None = None) -> EncodedData:
         """
         ZRLE encoding:
-        1. Encode pixel data using run-length encoding
-        2. Compress with zlib
-        3. Prepend length header
+        1. Convert pixels to CPIXEL format when required by RFC 6143
+        2. Encode 64x64 tiles using TRLE-compatible subencodings
+        3. Compress with a persistent zlib stream
+        4. Prepend a 4-byte length header
         """
-        if not pixel_data:
-            compressed = (
-                self._compressor.compress(b'')
-                + self._compressor.flush(zlib.Z_SYNC_FLUSH)
-            )
-            return struct.pack(">I", len(compressed)) + compressed
-
-        # Convert to CPIXEL format (compact pixel format)
-        cpixel_data, cpixel_bpp = self._convert_to_cpixel(pixel_data, bytes_per_pixel)
-
-        # Apply run-length encoding
-        rle_data = self._apply_rle(cpixel_data, cpixel_bpp)
-
-        # Compress with persistent zlib stream (warm dictionary improves ratio)
+        encoded_tiles = self._encode_tiles(pixel_data, width, height, bytes_per_pixel, pixel_format)
         compressed = (
-            self._compressor.compress(rle_data)
+            self._compressor.compress(encoded_tiles)
             + self._compressor.flush(zlib.Z_SYNC_FLUSH)
         )
-
-        # Prepend length (4 bytes, big-endian)
-        result = struct.pack(">I", len(compressed)) + compressed
-
         self.logger.debug(
-            f"ZRLE: {len(pixel_data)} -> {len(rle_data)} -> {len(compressed)} bytes"
+            "ZRLE: %d -> %d -> %d bytes",
+            len(pixel_data),
+            len(encoded_tiles),
+            len(compressed),
         )
+        return struct.pack(">I", len(compressed)) + compressed
 
-        return result
+    def _encode_tiles(self, pixel_data: PixelData, width: int, height: int,
+                      bytes_per_pixel: int, pixel_format: dict | None) -> bytes:
+        if width <= 0 or height <= 0 or bytes_per_pixel <= 0 or not pixel_data:
+            return b""
 
-    def _convert_to_cpixel(self, pixel_data: PixelData, bpp: int) -> tuple[bytes, int]:
+        result = bytearray()
+        for tile_y in range(0, height, self.tile_size):
+            tile_height = min(self.tile_size, height - tile_y)
+            for tile_x in range(0, width, self.tile_size):
+                tile_width = min(self.tile_size, width - tile_x)
+                tile_data = self._extract_tile(
+                    pixel_data,
+                    width,
+                    tile_x,
+                    tile_y,
+                    tile_width,
+                    tile_height,
+                    bytes_per_pixel,
+                )
+                cpixel_data, cpixel_bpp = self._convert_to_cpixel(
+                    tile_data,
+                    bytes_per_pixel,
+                    pixel_format=pixel_format,
+                )
+                result.extend(
+                    self._encode_tile(cpixel_data, tile_width, tile_height, cpixel_bpp)
+                )
+        return bytes(result)
+
+    def _extract_tile(self, pixel_data: PixelData, fb_width: int,
+                      tile_x: int, tile_y: int, tile_width: int,
+                      tile_height: int, bpp: int) -> bytes:
+        tile = bytearray(tile_width * tile_height * bpp)
+        row_size = tile_width * bpp
+        dst_offset = 0
+        for row in range(tile_height):
+            src_offset = ((tile_y + row) * fb_width + tile_x) * bpp
+            tile[dst_offset:dst_offset + row_size] = pixel_data[src_offset:src_offset + row_size]
+            dst_offset += row_size
+        return bytes(tile)
+
+    def _convert_to_cpixel(self, pixel_data: PixelData, bpp: int,
+                           pixel_format: dict | None = None) -> tuple[bytes, int]:
         """
         Convert to CPIXEL format
         For 32-bit pixels, use 3 bytes (RGB) instead of 4 (RGBA)
@@ -559,65 +827,167 @@ class ZRLEEncoder:
             return pixel_data, bpp
 
         if bpp == 4:
-            # Keep channel ordering, only drop padding byte.
+            byte_offset = self._cpixel_byte_offset(pixel_format)
+            if byte_offset is None:
+                return pixel_data, bpp
+
             num_pixels = len(pixel_data) // 4
             result = bytearray(num_pixels * 3)
             src_view = memoryview(pixel_data)
             dst_view = memoryview(result)
-            dst_view[0::3] = src_view[0::4]
-            dst_view[1::3] = src_view[1::4]
-            dst_view[2::3] = src_view[2::4]
+            dst_view[0::3] = src_view[byte_offset + 0::4]
+            dst_view[1::3] = src_view[byte_offset + 1::4]
+            dst_view[2::3] = src_view[byte_offset + 2::4]
             return bytes(result), 3
 
         self.logger.warning(f"ZRLE: unsupported bpp {bpp}, treating as single-byte pixels")
         return pixel_data, 1
 
-    def _apply_rle(self, pixel_data: PixelData, pixel_size: int) -> bytes:
-        """
-        Apply run-length encoding
+    def _cpixel_byte_offset(self, pixel_format: dict | None) -> int | None:
+        if not pixel_format:
+            return 0
 
-        ZRLE uses a tile-based approach (64x64 tiles)
-        For simplicity, this implementation works on the whole image
-        """
-        if pixel_size <= 0:
-            return b''
+        bits = []
+        for max_key, shift_key in (
+            ("red_max", "red_shift"),
+            ("green_max", "green_shift"),
+            ("blue_max", "blue_shift"),
+        ):
+            channel_max = int(pixel_format.get(max_key, 0))
+            channel_shift = int(pixel_format.get(shift_key, 0))
+            if channel_max <= 0:
+                return None
+            bits.append(channel_shift + channel_max.bit_length())
+
+        if max(bits) <= 24:
+            return 0
+        if min(int(pixel_format.get(key, 0)) for key in ("red_shift", "green_shift", "blue_shift")) >= 8:
+            return 1
+        return None
+
+    def _encode_tile(self, pixel_data: PixelData, width: int, height: int,
+                     pixel_size: int) -> bytes:
         if not pixel_data:
-            return b''
-        if len(pixel_data) < pixel_size:
-            return b''
+            return b"\x00"
 
-        if len(pixel_data) % pixel_size != 0:
-            # Keep decoder state valid even for malformed buffers.
-            usable_len = len(pixel_data) - (len(pixel_data) % pixel_size)
-            pixel_data = pixel_data[:usable_len]
-            if not pixel_data:
-                return b''
+        pixels = self._split_pixels(pixel_data, pixel_size)
+        if not pixels:
+            return b"\x00"
+
+        palette = self._palette_in_order(pixels, limit=127)
+        if len(palette) == 1:
+            return bytes([1]) + palette[0]
+
+        raw_candidate = bytes([0]) + pixel_data
+        best = raw_candidate
+
+        plain_rle_payload = self._encode_plain_rle(pixels)
+        plain_rle_candidate = bytes([128]) + plain_rle_payload
+        if len(plain_rle_candidate) < len(best):
+            best = plain_rle_candidate
+
+        if 2 <= len(palette) <= 16:
+            packed_payload = self._encode_packed_palette(pixels, palette, width, height)
+            packed_candidate = bytes([len(palette)]) + b"".join(palette) + packed_payload
+            if len(packed_candidate) < len(best):
+                best = packed_candidate
+
+        if 2 <= len(palette) <= 127:
+            palette_rle_payload = self._encode_palette_rle(pixels, palette)
+            palette_rle_candidate = (
+                bytes([128 + len(palette)]) + b"".join(palette) + palette_rle_payload
+            )
+            if len(palette_rle_candidate) < len(best):
+                best = palette_rle_candidate
+
+        return best
+
+    def _split_pixels(self, pixel_data: PixelData, pixel_size: int) -> list[bytes]:
+        usable = len(pixel_data) - (len(pixel_data) % pixel_size)
+        return [
+            bytes(pixel_data[offset:offset + pixel_size])
+            for offset in range(0, usable, pixel_size)
+        ]
+
+    def _palette_in_order(self, pixels: list[bytes], limit: int) -> list[bytes]:
+        palette: list[bytes] = []
+        seen: dict[bytes, int] = {}
+        for pixel in pixels:
+            if pixel in seen:
+                continue
+            seen[pixel] = len(palette)
+            palette.append(pixel)
+            if len(palette) > limit:
+                return []
+        return palette
+
+    def _encode_plain_rle(self, pixels: list[bytes]) -> bytes:
+        result = bytearray()
+        index = 0
+        while index < len(pixels):
+            pixel = pixels[index]
+            run_length = 1
+            while index + run_length < len(pixels) and pixels[index + run_length] == pixel:
+                run_length += 1
+            result.extend(pixel)
+            result.extend(self._encode_run_length(run_length))
+            index += run_length
+        return bytes(result)
+
+    def _encode_palette_rle(self, pixels: list[bytes], palette: list[bytes]) -> bytes:
+        palette_index = {pixel: idx for idx, pixel in enumerate(palette)}
+        result = bytearray()
+        index = 0
+        while index < len(pixels):
+            pixel = pixels[index]
+            run_length = 1
+            while index + run_length < len(pixels) and pixels[index + run_length] == pixel:
+                run_length += 1
+            idx = palette_index[pixel]
+            if run_length == 1:
+                result.append(idx)
+            else:
+                result.append(idx + 128)
+                result.extend(self._encode_run_length(run_length))
+            index += run_length
+        return bytes(result)
+
+    def _encode_run_length(self, run_length: int) -> bytes:
+        remaining = max(0, run_length - 1)
+        encoded = bytearray()
+        while remaining >= 255:
+            encoded.append(255)
+            remaining -= 255
+        encoded.append(remaining)
+        return bytes(encoded)
+
+    def _encode_packed_palette(self, pixels: list[bytes], palette: list[bytes],
+                               width: int, height: int) -> bytes:
+        palette_index = {pixel: idx for idx, pixel in enumerate(palette)}
+        palette_size = len(palette)
+        if palette_size == 2:
+            bits_per_index = 1
+        elif palette_size <= 4:
+            bits_per_index = 2
+        else:
+            bits_per_index = 4
 
         result = bytearray()
-
-        i = 0
-        while i < len(pixel_data):
-            pixel = pixel_data[i:i+pixel_size]
-            run_length = 1
-
-            # Count consecutive identical pixels
-            while (i + run_length * pixel_size < len(pixel_data) and
-                   pixel_data[i+run_length*pixel_size:i+(run_length+1)*pixel_size] == pixel):
-                run_length += 1
-                if run_length >= 255:  # Max run length
-                    break
-
-            if run_length > 1:
-                # Encoded as: pixel value + run length
-                result.extend(pixel)
-                result.append(run_length)
-            else:
-                # Single pixel
-                result.extend(pixel)
-                result.append(1)
-
-            i += run_length * pixel_size
-
+        pixel_iter = iter(pixels)
+        for _ in range(height):
+            current_byte = 0
+            used_bits = 0
+            for _ in range(width):
+                idx = palette_index[next(pixel_iter)]
+                current_byte = (current_byte << bits_per_index) | idx
+                used_bits += bits_per_index
+                if used_bits == 8:
+                    result.append(current_byte)
+                    current_byte = 0
+                    used_bits = 0
+            if used_bits:
+                current_byte <<= (8 - used_bits)
+                result.append(current_byte)
         return bytes(result)
 
 

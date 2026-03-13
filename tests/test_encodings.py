@@ -104,6 +104,10 @@ class TestEncoders(unittest.TestCase):
         # Result format: 4 bytes (length) + compressed data
         self.assertIsInstance(result, bytes)
         self.assertGreater(len(result), 4)  # At least header
+        payload_len = struct.unpack(">I", result[:4])[0]
+        self.assertEqual(payload_len, len(result) - 4)
+        decoded = zlib.decompressobj().decompress(result[4:])
+        self.assertEqual(decoded, b"\x01\xff\x00\x00")
 
     def test_zrle_encoder_16bit_pixels(self):
         """ZRLE should work with 16-bit pixel streams (bpp=2)."""
@@ -113,6 +117,8 @@ class TestEncoders(unittest.TestCase):
 
         self.assertIsInstance(result, bytes)
         self.assertGreater(len(result), 4)
+        decoded = zlib.decompressobj().decompress(result[4:])
+        self.assertEqual(decoded, b"\x01\x12\x34")
 
     def test_zrle_encoder_8bit_pixels(self):
         """ZRLE should work with 8-bit pixel streams (bpp=1)."""

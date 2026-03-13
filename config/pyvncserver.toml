@@ -21,10 +21,13 @@ enable_lan_adaptive_encoding = true
 enable_websocket = false
 enable_tight_security = true
 enable_cursor_encoding = false
+enable_copyrect_encoding = true
+enable_zrle_encoding = true
 enable_tight_encoding = true
 enable_jpeg_encoding = true
 enable_h264_encoding = false
 enable_parallel_encoding = true
+tight_stream_reset_for_ultravnc = false
 
 [lan]
 raw_area_threshold = 0.10
@@ -33,7 +36,6 @@ prefer_zlib = true
 zlib_area_threshold = 0.08
 zlib_min_pixels = 8192
 zlib_compression_level = 2
-zlib_warmup_requests = 2
 zlib_disable_if_request_gap_ms = 1500
 jpeg_area_threshold = 0.20
 jpeg_min_pixels = 16384
@@ -54,8 +56,6 @@ max_set_encodings = 1024
 max_client_cut_text = 16777216
 encoding_threads = 0
 tight_disable_for_ultravnc = false
-ultravnc_tight_warmup_requests = 16
-ultravnc_tight_warmup_seconds = 2.5
 
 [logging]
 log_level = "INFO"

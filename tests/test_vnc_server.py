@@ -8,6 +8,7 @@ import threading
 import logging
 
 from vnc_lib.cursor import CursorData
+from vnc_lib.encodings import CopyRectEncoder, ZRLEEncoder
 from vnc_lib.protocol import RFBProtocol
 from vnc_lib.server_utils import NetworkProfile
 from pyvncserver import VNCServerV3
@@ -17,6 +18,7 @@ def _server_without_init() -> VNCServerV3:
     """Create server instance without opening sockets."""
     server = VNCServerV3.__new__(VNCServerV3)
     server.input_control_policy = 'single-controller'
+    server.tight_stream_reset_for_ultravnc = False
     server._input_control_lock = threading.Lock()
     server._input_controller_client_id = None
     server._input_control_rejections_logged = set()
@@ -176,57 +178,6 @@ def test_collapse_regions_to_bounding_box_handles_single_region():
     assert collapsed == [(10, 10, 20, 20)]
 
 
-def test_should_delay_tight_for_ultravnc_by_request_count():
-    server = _server_without_init()
-    server.ultravnc_tight_warmup_requests = 5
-    server.ultravnc_tight_warmup_seconds = 0.0
-
-    assert server._should_delay_tight_for_ultravnc(
-        ultravnc_like_client=True,
-        fburq_count=3,
-        first_fburq_time=10.0,
-        now=11.0,
-    ) is True
-    assert server._should_delay_tight_for_ultravnc(
-        ultravnc_like_client=True,
-        fburq_count=6,
-        first_fburq_time=10.0,
-        now=11.0,
-    ) is False
-
-
-def test_should_delay_tight_for_ultravnc_by_time_window():
-    server = _server_without_init()
-    server.ultravnc_tight_warmup_requests = 0
-    server.ultravnc_tight_warmup_seconds = 2.0
-
-    assert server._should_delay_tight_for_ultravnc(
-        ultravnc_like_client=True,
-        fburq_count=50,
-        first_fburq_time=100.0,
-        now=101.5,
-    ) is True
-    assert server._should_delay_tight_for_ultravnc(
-        ultravnc_like_client=True,
-        fburq_count=50,
-        first_fburq_time=100.0,
-        now=102.1,
-    ) is False
-
-
-def test_should_delay_tight_for_ultravnc_false_for_non_ultravnc():
-    server = _server_without_init()
-    server.ultravnc_tight_warmup_requests = 50
-    server.ultravnc_tight_warmup_seconds = 10.0
-
-    assert server._should_delay_tight_for_ultravnc(
-        ultravnc_like_client=False,
-        fburq_count=1,
-        first_fburq_time=0.0,
-        now=0.1,
-    ) is False
-
-
 def test_extract_region_handles_bounds_safely():
     server = _server_without_init()
     pixel_data = bytes(range(12))  # 4x3, bpp=1
@@ -253,6 +204,26 @@ def test_extract_region_handles_bounds_safely():
         height=1,
         bytes_per_pixel=1,
     ) == b''
+
+
+def test_split_rectangles_for_tight_matches_reference_style_limits():
+    server = _server_without_init()
+
+    split = server._split_rectangles_for_encoding(7, 0, 0, 1920, 1080)
+
+    assert len(split) > 1
+    assert split[0] == (0, 0, 256, 64)
+    assert split[1] == (256, 0, 256, 64)
+    assert split[-1][2] <= 256
+    assert split[-1][3] <= 64
+
+
+def test_split_rectangles_for_non_tight_keeps_original_rectangle():
+    server = _server_without_init()
+
+    split = server._split_rectangles_for_encoding(16, 10, 20, 300, 200)
+
+    assert split == [(10, 20, 300, 200)]
 
 
 def test_coalesce_pointer_events_keeps_latest():
@@ -552,15 +523,17 @@ def test_adjust_lan_jpeg_quality_reacts_to_timing():
     assert raised >= lowered
 
 
-def test_configure_tight_compatibility_for_ultravnc_like_client():
+def test_configure_tight_compatibility_is_explicit():
     server = _server_without_init()
     tight = _TightModeRecorder()
     manager = _DummyEncoderManager({7: tight})
 
-    server._configure_tight_compatibility(manager, {0, 7, 9, 10})
+    server.tight_stream_reset_for_ultravnc = True
+    server._configure_tight_compatibility(manager)
     assert tight.enabled_values[-1] is True
 
-    server._configure_tight_compatibility(manager, {0, 7, 16})
+    server.tight_stream_reset_for_ultravnc = False
+    server._configure_tight_compatibility(manager)
     assert tight.enabled_values[-1] is False
 
 
@@ -601,8 +574,8 @@ def test_supported_pixel_format_rejects_big_endian():
 def test_encoding_supported_for_pixel_format_disables_non_compliant_encodings():
     server = _server_without_init()
 
-    assert server._encoding_supported_for_pixel_format(1, _native_bgr0_pixel_format()) is False
-    assert server._encoding_supported_for_pixel_format(16, _native_bgr0_pixel_format()) is False
+    assert server._encoding_supported_for_pixel_format(1, _native_bgr0_pixel_format()) is True
+    assert server._encoding_supported_for_pixel_format(16, _native_bgr0_pixel_format()) is True
     assert server._encoding_supported_for_pixel_format(7, _native_bgr0_pixel_format()) is True
     assert server._encoding_supported_for_pixel_format(7, {
         **_native_bgr0_pixel_format(),
@@ -689,6 +662,91 @@ def test_parallel_safe_encoding_whitelist():
     assert server._is_parallel_safe_encoding(16) is False
 
 
+def test_encode_rectangle_for_update_uses_copyrect_when_source_is_available():
+    server = _server_without_init()
+    manager = _DummyEncoderManager({0: object(), 1: CopyRectEncoder()})
+    previous_frame = bytes([1, 0, 0, 0] * 8 + [2, 0, 0, 0] * 8)
+    current_frame = bytes([0, 0, 0, 0] * 8 + [1, 0, 0, 0] * 8)
+    manager.encoders[1].commit_frame(previous_frame, 8, 2, 4)
+
+    enc_type, _, encoded = server._encode_rectangle_for_update(
+        manager,
+        [1, 0],
+        NetworkProfile.LAN,
+        x=0,
+        y=1,
+        width=8,
+        height=1,
+        fb_width=8,
+        fb_height=2,
+        content_type="scrolling",
+        pixel_data=current_frame[8 * 4:],
+        full_frame=current_frame,
+        request_region=(0, 0, 8, 2),
+        bytes_per_pixel=4,
+        pixel_format=_native_bgr0_pixel_format(),
+    )
+
+    assert enc_type == 1
+    assert encoded == struct.pack(">HH", 0, 0)
+
+
+def test_encode_rectangle_for_update_falls_back_when_copyrect_has_no_safe_source():
+    server = _server_without_init()
+    raw_encoder = _RawRecorder()
+    manager = _DummyEncoderManager({0: raw_encoder, 1: CopyRectEncoder()})
+    current_frame = bytes([1, 2, 3, 0] * 8)
+
+    enc_type, _, encoded = server._encode_rectangle_for_update(
+        manager,
+        [1, 0],
+        NetworkProfile.LAN,
+        x=0,
+        y=0,
+        width=8,
+        height=1,
+        fb_width=8,
+        fb_height=1,
+        content_type="scrolling",
+        pixel_data=current_frame,
+        full_frame=current_frame,
+        request_region=(0, 0, 8, 1),
+        bytes_per_pixel=4,
+        pixel_format=_native_bgr0_pixel_format(),
+    )
+
+    assert enc_type == 0
+    assert encoded == current_frame
+
+
+def test_encode_rectangle_for_update_uses_zrle_payload():
+    server = _server_without_init()
+    zrle = ZRLEEncoder()
+    manager = _DummyEncoderManager({0: _RawRecorder(), 16: zrle})
+    pixel_data = bytes([5, 0, 0, 0] * 64)
+
+    enc_type, _, encoded = server._encode_rectangle_for_update(
+        manager,
+        [16, 0],
+        NetworkProfile.LAN,
+        x=0,
+        y=0,
+        width=8,
+        height=8,
+        fb_width=8,
+        fb_height=8,
+        content_type="static",
+        pixel_data=pixel_data,
+        full_frame=pixel_data,
+        request_region=(0, 0, 8, 8),
+        bytes_per_pixel=4,
+        pixel_format=_native_bgr0_pixel_format(),
+    )
+
+    assert enc_type == 16
+    assert len(encoded) > 4
+
+
 class _FakeSocket:
     """Socket-like object for MSG_PEEK tests."""
 
@@ -726,6 +784,11 @@ class _DummyEncoderManager:
             return 0, self.encoders[0]
         first_key = next(iter(self.encoders))
         return first_key, self.encoders[first_key]
+
+
+class _RawRecorder:
+    def encode(self, pixel_data, width, height, bytes_per_pixel):
+        return pixel_data
 
 
 class _TightModeRecorder:

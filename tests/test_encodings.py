@@ -58,10 +58,10 @@ class TestEncoders(unittest.TestCase):
         self.assertEqual(encoding_name(123456), "Unknown(123456)")
 
     def test_format_encoding_list_human_readable(self):
-        formatted = format_encoding_list({7, 0, -24})
+        formatted = format_encoding_list([7, 0, -24, 7])
         self.assertEqual(
             formatted,
-            "JPEGQualityLevel8 (-24), Raw (0), Tight (7)"
+            "Tight (7), Raw (0), JPEGQualityLevel8 (-24)"
         )
         self.assertEqual(format_encoding_list(set()), "none")
 
@@ -254,28 +254,29 @@ class TestEncoders(unittest.TestCase):
         manager = EncoderManager()
 
         # Test with different client encodings
-        encodings_raw = {0}
+        encodings_raw = [0]
         enc_type, encoder = manager.get_best_encoder(encodings_raw)
         self.assertEqual(enc_type, 0)
         self.assertIsInstance(encoder, RawEncoder)
 
-        # Test with ZRLE support
-        encodings_zrle = {0, 16}
+        # Experimental ZRLE is disabled by default; manager should fall back to Raw.
+        encodings_zrle = [16, 0]
         enc_type, encoder = manager.get_best_encoder(encodings_zrle)
-        self.assertEqual(enc_type, 16)
-        self.assertIsInstance(encoder, ZRLEEncoder)
-
-        # Test with all encodings
-        encodings_all = {0, 2, 5, 16}
-        enc_type, encoder = manager.get_best_encoder(encodings_all)
-        self.assertIn(enc_type, encodings_all)
-
-    def test_encoder_manager_lan_prefers_raw(self):
-        """LAN profile should prioritize low-latency raw encoding."""
-        manager = EncoderManager()
-        encodings_lan = {0, 2, 5, 16}
-        enc_type, _ = manager.get_best_encoder(encodings_lan, content_type="lan")
         self.assertEqual(enc_type, 0)
+        self.assertIsInstance(encoder, RawEncoder)
+
+        # Test with ordered encodings - manager should respect first supported value.
+        encodings_all = [5, 2, 0, 16]
+        enc_type, encoder = manager.get_best_encoder(encodings_all)
+        self.assertEqual(enc_type, 5)
+        self.assertIsInstance(encoder, HextileEncoder)
+
+    def test_encoder_manager_respects_client_order_across_content_types(self):
+        """Client order takes precedence over server-side content heuristics."""
+        manager = EncoderManager()
+        encodings_lan = [2, 0, 5, 16]
+        enc_type, _ = manager.get_best_encoder(encodings_lan, content_type="lan")
+        self.assertEqual(enc_type, 2)
 
 
 class TestEncoderPerformance(unittest.TestCase):

@@ -20,7 +20,7 @@ The `vnc_lib/` package contains additional modules (for example session recordin
 ### Server Runtime (`vnc_server.py`)
 - RFB protocol negotiation for versions 3.3, 3.7, and 3.8
 - Security: `None` and `VNC Authentication`
-- Encodings: Raw, CopyRect, RRE, Hextile, ZRLE
+- Encodings: Raw, RRE, Hextile, Zlib
 - Optional encoders: Tight, JPEG, H.264 (H.264 requires extra dependencies)
 - Incremental updates with adaptive change detection
 - Desktop size update support via pseudo-encoding
@@ -112,11 +112,11 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `password` | `str` | Empty string disables auth |
 | `frame_rate` | `int` | Target FPS for WAN profile |
 | `lan_frame_rate` | `int` | Target FPS for LAN profile |
-| `enable_lan_adaptive_encoding` | `bool` | Adaptive Raw/JPEG/ZRLE strategy for LAN |
+| `enable_lan_adaptive_encoding` | `bool` | LAN tuning for encoder parameters and transport behavior; encoding order still follows client preference |
 | `enable_request_coalescing` | `bool` | Drops stale framebuffer requests to reduce lag |
 | `lan_raw_area_threshold` | `float` | Area ratio below which Raw is preferred on LAN |
 | `lan_raw_max_pixels` | `int` | Maximum rectangle size (pixels) eligible for Raw on LAN |
-| `lan_prefer_zlib` | `bool` | Prefer Zlib (encoding 6) for larger LAN updates |
+| `lan_prefer_zlib` | `bool` | Legacy tuning flag; no longer overrides client encoding order |
 | `lan_zlib_area_threshold` | `float` | Area ratio above which Zlib is preferred on LAN |
 | `lan_zlib_min_pixels` | `int` | Minimum rectangle size for Zlib consideration on LAN |
 | `lan_zlib_compression_level` | `int` | Zlib compression level used in LAN mode |
@@ -127,13 +127,13 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `lan_jpeg_quality_initial` | `int` | Initial JPEG quality in adaptive LAN mode |
 | `lan_jpeg_quality_min` | `int` | Lower bound for adaptive JPEG quality |
 | `lan_jpeg_quality_max` | `int` | Upper bound for adaptive JPEG quality |
-| `lan_zrle_compression_level` | `int` | ZRLE compression level used in LAN mode |
+| `lan_zrle_compression_level` | `int` | Reserved legacy setting; ZRLE is not negotiated by default |
 | `network_profile_override` | `null \| "localhost" \| "lan" \| "wan"` | Forces profile, bypasses auto-detection |
 | `scale_factor` | `float` | Capture scaling factor |
 | `max_connections` | `int` | Max simultaneous clients |
 | `client_socket_timeout` | `float` | Per-client read timeout in seconds |
 | `enable_region_detection` | `bool` | Incremental update optimization |
-| `enable_cursor_encoding` | `bool` | Cursor pseudo-encoding support |
+| `enable_cursor_encoding` | `bool` | Reserved legacy flag; runtime currently disables cursor pseudo-encoding |
 | `enable_metrics` | `bool` | Internal metrics collection |
 | `enable_tight_encoding` | `bool` | Tight encoder availability |
 | `tight_disable_for_ultravnc` | `bool` | Compatibility workaround for UltraVNC-like clients |

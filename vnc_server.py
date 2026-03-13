@@ -18,7 +18,6 @@ from vnc_lib.input_handler import InputHandler
 from vnc_lib.screen_capture import ScreenCapture
 from vnc_lib.encodings import EncoderManager, encoding_name, format_encoding_list
 from vnc_lib.change_detector import AdaptiveChangeDetector
-from vnc_lib.cursor import CursorEncoder
 from vnc_lib.metrics import ServerMetrics, ConnectionMetrics, PerformanceMonitor
 from vnc_lib.types import is_valid_pixel_format
 from vnc_lib.clipboard import sanitize_clipboard_text
@@ -37,12 +36,11 @@ class VNCServerV3:
     RFC 6143 compliant VNC Server - Enhanced Version 3.0
 
     New features:
-    - Multiple encoding support (Raw, RRE, Hextile, ZRLE)
+    - Multiple encoding support (Raw, RRE, Hextile, Zlib, Tight)
     - Region-based change detection
     - Performance metrics and monitoring
     - Graceful shutdown handling
     - Connection pooling
-    - Cursor pseudo-encoding support
     - Health checks
     - Python 3.13 type hints
     """
@@ -78,11 +76,16 @@ class VNCServerV3:
 
         # Features
         self.enable_region_detection = self.config.get('enable_region_detection', True)
-        self.enable_cursor_encoding = self.config.get('enable_cursor_encoding', False)
+        requested_cursor_encoding = bool(self.config.get('enable_cursor_encoding', False))
+        self.enable_cursor_encoding = False
         self.enable_metrics = self.config.get('enable_metrics', True)
         self.enable_websocket = self.config.get('enable_websocket', False)
         self.enable_lan_adaptive_encoding = self.config.get('enable_lan_adaptive_encoding', True)
         self.enable_request_coalescing = self.config.get('enable_request_coalescing', True)
+        if requested_cursor_encoding:
+            self.logger.warning(
+                "Cursor pseudo-encoding is not fully implemented; disabling enable_cursor_encoding"
+            )
 
         # LAN adaptive encoding tuning
         self.lan_raw_area_threshold = max(
@@ -188,6 +191,8 @@ class VNCServerV3:
         self._input_control_lock = threading.Lock()
         self._input_controller_client_id: str | None = None
         self._input_control_rejections_logged: set[str] = set()
+        self._client_registry_lock = threading.Lock()
+        self._authenticated_client_sockets: dict[str, socket.socket] = {}
 
         # Shared OS-facing services. Capture is internally locked to avoid
         # racing its backend state across client threads.
@@ -351,6 +356,7 @@ class VNCServerV3:
         """Handle a single client connection"""
         conn_metrics: ConnectionMetrics | None = None
         parallel_encoder = None
+        registered_client_socket = False
 
         try:
             # Detect network profile for performance optimization
@@ -445,6 +451,14 @@ class VNCServerV3:
             # Step 4: ClientInit
             shared_flag = protocol.receive_client_init(client_socket)
             self.logger.debug(f"Client shared flag: {shared_flag}")
+            self._register_authenticated_client_socket(client_id, client_socket)
+            registered_client_socket = True
+            if shared_flag == 0:
+                self.logger.info(
+                    "Client %s requested exclusive access; disconnecting other clients",
+                    client_id,
+                )
+                self._disconnect_other_authenticated_clients(client_id)
 
             # Step 5: ServerInit
             screen_capture = self.screen_capture
@@ -495,7 +509,7 @@ class VNCServerV3:
                 enable_h264=enable_h264,
                 disable_tight_for_ultravnc=disable_tight_for_ultravnc,
             )
-            client_encodings: set[int] = {0}  # Default: Raw encoding
+            client_encodings: list[int] = [0]  # Default: Raw encoding
             self.logger.info(
                 f"Server rectangle encodings: {format_encoding_list(set(encoder_manager.encoders.keys()))}"
             )
@@ -506,7 +520,6 @@ class VNCServerV3:
             # For localhost, disable change detection (overhead not worth it with high bandwidth)
             use_change_detection = self.enable_region_detection and not is_localhost
             change_detector = AdaptiveChangeDetector(width, height) if use_change_detection else None
-            cursor_encoder = CursorEncoder() if self.enable_cursor_encoding else None
 
             # Initialize parallel encoder for multi-threaded encoding
             use_parallel = self.config.get('enable_parallel_encoding', True)
@@ -526,7 +539,7 @@ class VNCServerV3:
             self._client_message_loop(
                 client_socket, protocol, screen_capture, input_handler,
                 current_pixel_format, client_encodings, width, height,
-                encoder_manager, change_detector, cursor_encoder, conn_metrics,
+                encoder_manager, change_detector, conn_metrics,
                 client_id, is_localhost, parallel_encoder, network_profile
             )
 
@@ -544,6 +557,8 @@ class VNCServerV3:
                 client_socket.close()
             except Exception:
                 pass
+            if registered_client_socket:
+                self._unregister_authenticated_client_socket(client_id)
             self._release_input_control(client_id)
             if self.metrics:
                 self.metrics.unregister_connection(client_id)
@@ -553,16 +568,15 @@ class VNCServerV3:
                             protocol: RFBProtocol,
                             screen_capture: ScreenCapture,
                             input_handler: InputHandler,
-                             current_pixel_format: dict,
-                             client_encodings: set[int],
-                             fb_width: int, fb_height: int,
-                             encoder_manager: EncoderManager,
-                             change_detector: AdaptiveChangeDetector | None,
-                             cursor_encoder: CursorEncoder | None,
-                             conn_metrics: ConnectionMetrics | None,
-                             client_id: str,
-                             is_localhost: bool = False,
-                             parallel_encoder = None,
+                              current_pixel_format: dict,
+                               client_encodings: list[int],
+                              fb_width: int, fb_height: int,
+                              encoder_manager: EncoderManager,
+                              change_detector: AdaptiveChangeDetector | None,
+                              conn_metrics: ConnectionMetrics | None,
+                              client_id: str,
+                              is_localhost: bool = False,
+                              parallel_encoder = None,
                              network_profile: NetworkProfile = NetworkProfile.WAN):
         """
         Enhanced client message handling loop with network-aware optimization
@@ -575,7 +589,7 @@ class VNCServerV3:
 
         LAN optimizations:
         - Up to 60 FPS frame rate (configurable)
-        - Fast encoders (Hextile/ZRLE, skip expensive Tight)
+        - Client-preferred encoding order with LAN-specific transport tuning
         - TCP_NODELAY enabled
         """
 
@@ -628,24 +642,44 @@ class VNCServerV3:
                                 f"Unsupported client pixel format requested: {new_format}"
                             )
                         current_pixel_format.update(new_format)
+                        filtered_after_pf, dropped = self._filter_encodings_for_pixel_format(
+                            client_encodings, encoder_manager, current_pixel_format
+                        )
+                        if dropped:
+                            self.logger.info(
+                                "Pixel format disables negotiated encodings: %s",
+                                format_encoding_list(dropped),
+                            )
+                            self.logger.info(
+                                "Filtered usable encodings: %s",
+                                format_encoding_list(filtered_after_pf),
+                            )
                         self.logger.info(f"Pixel format updated: {new_format}")
 
                     case protocol.MSG_SET_ENCODINGS:
                         encodings = protocol.parse_set_encodings(client_socket)
-                        client_encodings.clear()
-                        client_encodings.update(encodings)
+                        client_encodings[:] = encodings
                         ultravnc_like_client = 9 in client_encodings or 10 in client_encodings
                         self._configure_tight_compatibility(
                             encoder_manager, client_encodings
                         )
                         self.logger.info(
-                            f"Client encodings (all): {format_encoding_list(client_encodings)}"
+                            f"Client encoding preference order: {format_encoding_list(client_encodings)}"
                         )
-                        server_supported = set(encoder_manager.encoders.keys())
-                        negotiated_rect = server_supported.intersection(client_encodings)
+                        selection_preview, dropped = self._filter_encodings_for_pixel_format(
+                            client_encodings, encoder_manager, current_pixel_format
+                        )
+                        negotiated_rect = [
+                            enc for enc in selection_preview if enc in encoder_manager.encoders
+                        ]
                         self.logger.info(
                             f"Negotiated rectangle encodings: {format_encoding_list(negotiated_rect)}"
                         )
+                        if dropped:
+                            self.logger.info(
+                                "Skipping incompatible negotiated encodings for current pixel format: %s",
+                                format_encoding_list(dropped),
+                            )
                         if ultravnc_like_client:
                             self.logger.info(
                                 "UltraVNC-like client detected; "
@@ -696,15 +730,13 @@ class VNCServerV3:
                                 "UltraVNC compatibility: Tight warm-up finished, Tight is allowed"
                             )
                         ultravnc_tight_delay_active = delay_tight_for_ultravnc
-                        if delay_tight_for_ultravnc and 7 in client_encodings:
-                            selection_encodings = set(client_encodings)
-                            selection_encodings.discard(7)
-                        else:
-                            selection_encodings = client_encodings
-                        prefer_zlib_now = (
-                            lan_zlib_enabled_runtime
-                            and fburq_count > lan_zlib_warmup_requests
+                        selection_encodings, _ = self._filter_encodings_for_pixel_format(
+                            client_encodings, encoder_manager, current_pixel_format
                         )
+                        if delay_tight_for_ultravnc and 7 in selection_encodings:
+                            selection_encodings = [
+                                enc for enc in selection_encodings if enc != 7
+                            ]
 
                         # Throttle before expensive capture/encoding work.
                         throttler.throttle()
@@ -786,8 +818,8 @@ class VNCServerV3:
                                         content_type=content_type,
                                         allow_jpeg=False,
                                         allow_zlib=True,
-                                        prefer_zlib_override=prefer_zlib_now,
                                         bytes_per_pixel=bytes_per_pixel,
+                                        pixel_format=current_pixel_format,
                                     )
                                     self._prepare_encoder_for_send(
                                         encoding_type, encoder, lan_jpeg_quality
@@ -796,16 +828,6 @@ class VNCServerV3:
                                         encoding_type
                                     )
                                     regions_to_encode.append(((x, y, w, h), region_data, encoding_type, encoder))
-                                if self.logger.isEnabledFor(logging.DEBUG):
-                                    enc_counts: dict[int, int] = {}
-                                    for _, _, enc_type, _ in regions_to_encode:
-                                        enc_counts[enc_type] = enc_counts.get(enc_type, 0) + 1
-                                    enc_summary = ", ".join(
-                                        f"{encoding_name(enc)} ({enc}) x{count}"
-                                        for enc, count in sorted(enc_counts.items())
-                                    )
-                                    self.logger.debug(f"Selected region encodings: {enc_summary}")
-
                                 if not parallel_safe:
                                     self.logger.debug(
                                         "Falling back to sequential region encoding due to stateful encoder selection"
@@ -819,6 +841,9 @@ class VNCServerV3:
                                         (r.x, r.y, r.width, r.height, r.encoding_type, r.encoded_data)
                                         for r in encoded_results
                                     ]
+                                    self._log_selected_region_encodings(
+                                        [r.encoding_type for r in encoded_results]
+                                    )
 
                                     self.logger.debug(
                                         "Sending framebuffer update with %d rectangle(s)",
@@ -875,8 +900,8 @@ class VNCServerV3:
                                         fb_width,
                                         fb_height,
                                         content_type=content_type,
-                                        prefer_zlib_override=prefer_zlib_now,
                                         bytes_per_pixel=bytes_per_pixel,
+                                        pixel_format=current_pixel_format,
                                     )
                                     self._prepare_encoder_for_send(
                                         encoding_type, encoder, lan_jpeg_quality
@@ -887,15 +912,9 @@ class VNCServerV3:
                                         jpeg_original_bytes += len(region_data)
                                         jpeg_encoded_bytes += len(encoded_data)
                                     rectangles.append((x, y, w, h, encoding_type, encoded_data))
-                                if self.logger.isEnabledFor(logging.DEBUG):
-                                    enc_counts: dict[int, int] = {}
-                                    for _, _, _, _, enc_type, _ in rectangles:
-                                        enc_counts[enc_type] = enc_counts.get(enc_type, 0) + 1
-                                    enc_summary = ", ".join(
-                                        f"{encoding_name(enc)} ({enc}) x{count}"
-                                        for enc, count in sorted(enc_counts.items())
-                                    )
-                                    self.logger.debug(f"Selected region encodings: {enc_summary}")
+                                self._log_selected_region_encodings(
+                                    [enc_type for _, _, _, _, enc_type, _ in rectangles]
+                                )
 
                                 self.logger.debug(
                                     "Sending framebuffer update with %d rectangle(s)",
@@ -933,17 +952,14 @@ class VNCServerV3:
                             fb_width,
                             fb_height,
                             content_type=content_type,
-                            prefer_zlib_override=prefer_zlib_now,
                             bytes_per_pixel=bytes_per_pixel,
+                            pixel_format=current_pixel_format,
                         )
                         self._prepare_encoder_for_send(
                             encoding_type, encoder, lan_jpeg_quality
                         )
 
-                        self.logger.debug(
-                            f"Selected encoding: {encoding_name(encoding_type)} "
-                            f"({encoding_type}) for content type: {content_type}"
-                        )
+                        self._log_selected_encoding(encoding_type, content_type)
 
                         # Encode pixel data (single-threaded for full frame)
                         full_request = (
@@ -1124,9 +1140,85 @@ class VNCServerV3:
 
         return True
 
+    def _is_native_bgr0_pixel_format(self, pixel_format: dict | None) -> bool:
+        """Return True only for the server's native 32bpp little-endian BGR0 layout."""
+        if not pixel_format:
+            return False
+        return (
+            int(pixel_format.get('bits_per_pixel', 0)) == 32
+            and int(pixel_format.get('depth', 0)) == 24
+            and int(pixel_format.get('true_colour_flag', 0)) == 1
+            and int(pixel_format.get('big_endian_flag', 0)) == 0
+            and int(pixel_format.get('red_max', 0)) == 255
+            and int(pixel_format.get('green_max', 0)) == 255
+            and int(pixel_format.get('blue_max', 0)) == 255
+            and int(pixel_format.get('red_shift', -1)) == 16
+            and int(pixel_format.get('green_shift', -1)) == 8
+            and int(pixel_format.get('blue_shift', -1)) == 0
+        )
+
+    def _encoding_supported_for_pixel_format(self, encoding_type: int,
+                                             pixel_format: dict | None) -> bool:
+        """Limit encoder selection to wire formats the current implementation really supports."""
+        if encoding_type in (1, 16):
+            return False
+        if encoding_type in (7, 21, 50):
+            return self._is_native_bgr0_pixel_format(pixel_format)
+        return True
+
+    def _filter_encodings_for_pixel_format(self, client_encodings: list[int],
+                                           encoder_manager: EncoderManager,
+                                           pixel_format: dict | None) -> tuple[list[int], list[int]]:
+        """Drop server-supported encodings that are incompatible with the current pixel format."""
+        filtered: list[int] = []
+        dropped: list[int] = []
+        for enc_type in client_encodings:
+            if enc_type in encoder_manager.encoders and not self._encoding_supported_for_pixel_format(
+                enc_type, pixel_format
+            ):
+                dropped.append(enc_type)
+                continue
+            filtered.append(enc_type)
+        return filtered, dropped
+
     def _is_parallel_safe_encoding(self, encoding_type: int) -> bool:
         """Allow parallel encoding only for stateless encoder implementations."""
         return encoding_type in {0, 2, 5}
+
+    def _register_authenticated_client_socket(self, client_id: str, client_socket: socket.socket) -> None:
+        """Track authenticated clients so shared-flag=0 can evict peers per RFC 6143."""
+        with self._client_registry_lock:
+            self._authenticated_client_sockets[client_id] = client_socket
+
+    def _unregister_authenticated_client_socket(self, client_id: str) -> None:
+        """Remove a client from the authenticated socket registry."""
+        with self._client_registry_lock:
+            self._authenticated_client_sockets.pop(client_id, None)
+
+    def _disconnect_other_authenticated_clients(self, keep_client_id: str) -> None:
+        """Close all authenticated client sockets except the requesting client."""
+        with self._client_registry_lock:
+            to_close = [
+                (client_id, sock)
+                for client_id, sock in self._authenticated_client_sockets.items()
+                if client_id != keep_client_id
+            ]
+            for client_id, _ in to_close:
+                self._authenticated_client_sockets.pop(client_id, None)
+
+        for client_id, client_socket in to_close:
+            try:
+                self.logger.info(
+                    "Disconnecting client %s due to exclusive shared-flag=0 request",
+                    client_id,
+                )
+                try:
+                    client_socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                client_socket.close()
+            except OSError:
+                pass
 
     def _try_acquire_input_control(self, client_id: str) -> bool:
         """Grant input control to exactly one client unless policy allows sharing."""
@@ -1268,8 +1360,30 @@ class VNCServerV3:
             except Exception:
                 pass
 
+    def _log_selected_region_encodings(self, encoding_types: list[int]) -> None:
+        """Log the actually used region encodings for a framebuffer update."""
+        if not encoding_types:
+            return
+        enc_counts: dict[int, int] = {}
+        for enc_type in encoding_types:
+            enc_counts[enc_type] = enc_counts.get(enc_type, 0) + 1
+        enc_summary = ", ".join(
+            f"{encoding_name(enc)} ({enc}) x{count}"
+            for enc, count in sorted(enc_counts.items())
+        )
+        self.logger.info("Selected region encodings: %s", enc_summary)
+
+    def _log_selected_encoding(self, encoding_type: int, content_type: str) -> None:
+        """Log the actually used rectangle encoding for a framebuffer update."""
+        self.logger.info(
+            "Selected encoding: %s (%d) for content type: %s",
+            encoding_name(encoding_type),
+            encoding_type,
+            content_type,
+        )
+
     def _configure_tight_compatibility(self, encoder_manager: EncoderManager,
-                                       client_encodings: set[int]) -> None:
+                                       client_encodings: list[int]) -> None:
         """Toggle Tight compatibility mode for UltraVNC-like clients."""
         tight_encoder = encoder_manager.encoders.get(7)
         if tight_encoder is None or not hasattr(tight_encoder, 'set_stream_reset_mode'):
@@ -1283,7 +1397,7 @@ class VNCServerV3:
 
     def _select_encoder_for_update(self,
                                    encoder_manager: EncoderManager,
-                                   client_encodings: set[int],
+                                   client_encodings: list[int],
                                    network_profile: NetworkProfile,
                                    width: int,
                                    height: int,
@@ -1292,108 +1406,44 @@ class VNCServerV3:
                                    content_type: str,
                                    allow_jpeg: bool = True,
                                    allow_zlib: bool = True,
-                                   prefer_zlib_override: bool | None = None,
-                                   bytes_per_pixel: int | None = None) -> tuple[int, object]:
+                                   bytes_per_pixel: int | None = None,
+                                   pixel_format: dict | None = None) -> tuple[int, object]:
         """
-        Pick encoder with LAN-focused adaptive strategy.
+        Pick the first usable encoding in client-preferred order.
         """
-        if (
-            network_profile != NetworkProfile.LAN
-            or not self.enable_lan_adaptive_encoding
-        ):
-            return encoder_manager.get_best_encoder(
-                client_encodings, content_type=content_type
-            )
-
-        encoders = encoder_manager.encoders
-        total_area = max(1, fb_width * fb_height)
-        area = max(1, width * height)
-        area_ratio = area / total_area
-        lan_raw_area_threshold = getattr(self, 'lan_raw_area_threshold', 0.12)
-        lan_raw_max_pixels = getattr(self, 'lan_raw_max_pixels', 65536)
-        lan_prefer_zlib = (
-            bool(prefer_zlib_override)
-            if prefer_zlib_override is not None
-            else getattr(self, 'lan_prefer_zlib', False)
+        ordered_client_encodings, _ = self._filter_encodings_for_pixel_format(
+            client_encodings, encoder_manager, pixel_format
         )
-        lan_zlib_area_threshold = getattr(self, 'lan_zlib_area_threshold', 0.20)
-        lan_zlib_min_pixels = getattr(self, 'lan_zlib_min_pixels', 131072)
-        lan_jpeg_area_threshold = getattr(self, 'lan_jpeg_area_threshold', 0.25)
-        lan_jpeg_min_pixels = getattr(self, 'lan_jpeg_min_pixels', 32768)
-        ultravnc_like = 9 in client_encodings or 10 in client_encodings
+        encoders = encoder_manager.encoders
+        ultravnc_like = 9 in ordered_client_encodings or 10 in ordered_client_encodings
         disable_tight_for_ultravnc = bool(
             getattr(encoder_manager, '_disable_tight_for_ultravnc', False)
         )
         tight_allowed = not (ultravnc_like and disable_tight_for_ultravnc)
-        prefer_lan_zlib = (
-            allow_zlib
-            and lan_prefer_zlib
-            and bytes_per_pixel == 4
-            and area >= lan_zlib_min_pixels
-            and area_ratio >= lan_zlib_area_threshold
-        )
 
         def available(enc_type: int) -> bool:
             if enc_type == 7 and not tight_allowed:
                 return False
-            return enc_type in client_encodings and enc_type in encoders
+            if not self._encoding_supported_for_pixel_format(enc_type, pixel_format):
+                return False
+            if enc_type == 21 and not allow_jpeg:
+                return False
+            if enc_type == 6 and not allow_zlib:
+                return False
+            if enc_type == 21 and bytes_per_pixel not in (3, 4):
+                return False
+            return enc_type in encoders
 
-        # Some viewers temporarily request low color depth (e.g., 8bpp) during
-        # startup. Prefer Raw for compatibility and to avoid ZRLE decode issues.
-        if bytes_per_pixel is not None and bytes_per_pixel <= 1:
-            if available(0):
-                return 0, encoders[0]
-            if available(5):
-                return 5, encoders[5]
-            if available(2):
-                return 2, encoders[2]
+        for enc_type in ordered_client_encodings:
+            if available(enc_type):
+                return enc_type, encoders[enc_type]
 
-        # Large updates on LAN: prefer Tight (fill/palette sub-encodings give
-        # massive wins for desktop content; basic fallback uses TPIXEL + zlib
-        # which is >= Zlib anyway). Falls back to Zlib if Tight unavailable.
-        # Guard this with both minimum area and area ratio to avoid introducing
-        # compression latency for medium, interactive updates.
-        if prefer_lan_zlib:
-            if available(7):
-                return 7, encoders[7]
-            if available(6):
-                return 6, encoders[6]
-
-        # Large updates: prefer JPEG (if supported) to reduce transfer time.
-        if (
-            allow_jpeg
-            and available(21)
-            and (bytes_per_pixel is None or bytes_per_pixel in (3, 4))
-            and area >= lan_jpeg_min_pixels
-            and area_ratio >= lan_jpeg_area_threshold
-        ):
-            return 21, encoders[21]
-
-        # Small updates: raw avoids CPU overhead and minimizes input latency.
-        if (
-            available(0)
-            and area_ratio <= lan_raw_area_threshold
-            and area <= lan_raw_max_pixels
-        ):
+        # RFC 6143 allows Raw even if not listed explicitly by the client.
+        if 0 in encoders and self._encoding_supported_for_pixel_format(0, pixel_format):
             return 0, encoders[0]
-
-        # Fallbacks for compatibility.
-        if available(0):
-            return 0, encoders[0]
-        if allow_zlib and lan_prefer_zlib and bytes_per_pixel == 4:
-            if available(7):
-                return 7, encoders[7]
-            if available(6):
-                return 6, encoders[6]
-        if available(2):
-            return 2, encoders[2]
-        if available(5):
-            return 5, encoders[5]
-        if available(16):
-            return 16, encoders[16]
 
         return encoder_manager.get_best_encoder(
-            client_encodings, content_type=content_type
+            ordered_client_encodings, content_type=content_type
         )
 
     def _adjust_lan_jpeg_quality(self, current_quality: int,

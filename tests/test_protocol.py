@@ -207,11 +207,27 @@ class TestMessageParsing:
         mock_socket = MockSocket(encodings_data)
         encodings = protocol.parse_set_encodings(mock_socket)
 
-        assert 0 in encodings
-        assert 2 in encodings
-        assert -223 in encodings  # Pseudo-encoding
-        assert 16 in encodings
-        assert len(encodings) == 4
+        assert encodings == [0, 2, -223, 16]
+
+    def test_parse_set_encodings_preserves_order_and_deduplicates(self):
+        """SetEncodings order is a client preference hint and must be preserved."""
+        protocol = RFBProtocol()
+
+        encodings_data = struct.pack(
+            ">BH" + "i" * 5,
+            0,
+            5,
+            7,
+            6,
+            7,
+            0,
+            -223,
+        )
+
+        mock_socket = MockSocket(encodings_data)
+        encodings = protocol.parse_set_encodings(mock_socket)
+
+        assert encodings == [7, 6, 0, -223]
 
     def test_parse_set_encodings_rejects_too_many(self):
         """Reject oversized SetEncodings list to avoid resource abuse."""

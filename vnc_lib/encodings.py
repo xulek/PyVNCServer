@@ -7,7 +7,7 @@ import struct
 import zlib
 import logging
 from typing import Protocol, TypeAlias
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 
 # Type aliases (Python 3.12+ would use 'type' statement)
@@ -56,14 +56,32 @@ def encoding_name(enc_type: int) -> str:
     return f"Unknown({enc_type})"
 
 
-def format_encoding_list(encodings: set[int] | list[int] | tuple[int, ...]) -> str:
+def _unique_encoding_order(encodings: Iterable[int]) -> list[int]:
+    """
+    Preserve first-seen order for ordered inputs while still deduplicating.
+
+    Sets remain accepted for compatibility, but their iteration order should not
+    be relied on when client preference order matters.
+    """
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for enc in encodings:
+        enc_int = int(enc)
+        if enc_int in seen:
+            continue
+        seen.add(enc_int)
+        ordered.append(enc_int)
+    return ordered
+
+
+def format_encoding_list(encodings: Iterable[int]) -> str:
     """
     Format encoding ids as a readable comma-separated list.
     """
-    unique_sorted = sorted(set(int(e) for e in encodings))
-    if not unique_sorted:
+    unique_ordered = _unique_encoding_order(encodings)
+    if not unique_ordered:
         return "none"
-    return ", ".join(f"{encoding_name(enc)} ({enc})" for enc in unique_sorted)
+    return ", ".join(f"{encoding_name(enc)} ({enc})" for enc in unique_ordered)
 
 
 class Encoder(Protocol):
@@ -609,15 +627,21 @@ class EncoderManager:
     """
 
     def __init__(self, enable_tight: bool = True, enable_h264: bool = False,
-                 enable_jpeg: bool = True, disable_tight_for_ultravnc: bool = True):
+                 enable_jpeg: bool = True, disable_tight_for_ultravnc: bool = True,
+                 enable_copyrect: bool = False, enable_zrle: bool = False):
         self.encoders: dict[int, Encoder] = {
             0: RawEncoder(),
-            1: CopyRectEncoder(),  # CopyRect for scrolling/movement
             2: RREEncoder(),
             5: HextileEncoder(),
             6: ZlibEncoder(),
-            16: ZRLEEncoder(),
         }
+
+        # Keep experimental/non-compliant encoders opt-in only until their
+        # wire-format implementation matches the RFCs we claim to support.
+        if enable_copyrect:
+            self.encoders[1] = CopyRectEncoder()
+        if enable_zrle:
+            self.encoders[16] = ZRLEEncoder()
 
         # Add advanced encoders if enabled
         if enable_tight:
@@ -656,57 +680,30 @@ class EncoderManager:
         self._tight_disabled_for_ultravnc_logged = False
         self._disable_tight_for_ultravnc = disable_tight_for_ultravnc
 
-    def get_best_encoder(self, client_encodings: set[int],
+    def get_best_encoder(self, client_encodings: Iterable[int],
                         content_type: str = "default") -> tuple[int, Encoder]:
         """
-        Select best encoder based on client preferences and content
+        Select best encoder in the order preferred by the client.
 
         Args:
-            client_encodings: Set of encoding types supported by client
-            content_type: Type of content ("static", "dynamic", "scrolling", "localhost", "default")
+            client_encodings: Ordered encoding preference list from the client
+            content_type: Retained for API compatibility; selection is client-first
 
         Returns:
             (encoding_type, encoder) tuple
         """
+        ordered_client_encodings = _unique_encoding_order(client_encodings)
+
         # Detect UltraVNC-style clients: they advertise Ultra (9) and/or TRLE (10)
         # encodings, which typical Tight/TigerVNC viewers do not.
-        is_ultravnc_client = 9 in client_encodings or 10 in client_encodings
-
-        # Preferred order based on content type using pattern matching (Python 3.13)
-        match content_type:
-            case "localhost":
-                # For localhost connections, prefer Raw (maximum speed, no compression overhead)
-                preference_order = [0]  # Raw only - compression unnecessary for localhost
-            case "lan":
-                # Current Hextile implementation is tile-raw and typically slower than
-                # Raw while barely reducing payload size. For low-latency LAN usage,
-                # prefer Raw first and keep compressed encoders as fallback.
-                preference_order = [0, 6, 2, 5, 16]  # Raw, Zlib, RRE, Hextile, ZRLE
-            case "static":
-                # For static content, prefer compression
-                preference_order = [7, 16, 5, 2, 0]  # Tight, ZRLE, Hextile, RRE, Raw
-            case "dynamic":
-                # For dynamic content, prefer speed with good compression
-                preference_order = [7, 5, 2, 16, 0]  # Tight, Hextile, RRE, ZRLE, Raw
-            case "scrolling":
-                # For scrolling, try CopyRect first, then Tight
-                preference_order = [1, 7, 5, 2, 16, 0]  # CopyRect, Tight, Hextile, RRE, ZRLE, Raw
-            case "video":
-                # For video/photos, prefer JPEG or H.264
-                preference_order = [50, 21, 7, 16, 0]  # H.264, JPEG, Tight, ZRLE, Raw
-            case "photo":
-                # For photographic content, prefer JPEG
-                preference_order = [21, 7, 16, 0]  # JPEG, Tight, ZRLE, Raw
-            case _:
-                # Default: balanced (Tight is best overall)
-                preference_order = [7, 16, 5, 2, 1, 0]  # Tight, ZRLE, Hextile, RRE, CopyRect, Raw
+        is_ultravnc_client = 9 in ordered_client_encodings or 10 in ordered_client_encodings
 
         # For UltraVNC viewers, Tight encoding is currently unstable/buggy on the
         # client side even though our implementation passes TigerVNC and LibVNC
         # clients. To maximize compatibility, we can optionally disable Tight for
         # such clients (configurable via tight_disable_for_ultravnc).
         if self._disable_tight_for_ultravnc and is_ultravnc_client and 7 in self.encoders:
-            preference_order = [enc for enc in preference_order if enc != 7]
+            ordered_client_encodings = [enc for enc in ordered_client_encodings if enc != 7]
             if not self._tight_disabled_for_ultravnc_logged:
                 self.logger.info(
                     "Detected UltraVNC-like client (encodings include 9/10); "
@@ -714,10 +711,14 @@ class EncoderManager:
                 )
                 self._tight_disabled_for_ultravnc_logged = True
 
-        # Find first available encoder
-        for enc_type in preference_order:
-            if enc_type in client_encodings and enc_type in self.encoders:
-                self.logger.debug(f"Selected encoding: {enc_type} for content type: {content_type}")
+        # Find first available encoder in client-preferred order.
+        for enc_type in ordered_client_encodings:
+            if enc_type in self.encoders:
+                self.logger.debug(
+                    "Selected encoding %s from client preference order for content type: %s",
+                    enc_type,
+                    content_type,
+                )
                 return enc_type, self.encoders[enc_type]
 
         # Fallback to raw

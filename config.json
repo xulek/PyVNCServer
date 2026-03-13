@@ -65,11 +65,11 @@
   "_performance_notes": {
     "frame_rate": "1-60 FPS (WAN), higher = smoother but more CPU/bandwidth",
     "lan_frame_rate": "1-120 FPS for LAN connections (default 30), localhost always 120",
-    "enable_lan_adaptive_encoding": "Adaptive Raw/JPEG/ZRLE strategy for LAN clients",
+    "enable_lan_adaptive_encoding": "LAN tuning for encoder parameters and transport behavior; encoding order still follows SetEncodings from the client",
     "enable_request_coalescing": "Drop stale framebuffer requests and keep newest one to reduce lag",
     "lan_raw_area_threshold": "Framebuffer area ratio below which Raw is preferred on LAN",
     "lan_raw_max_pixels": "Maximum rectangle pixel count allowed for Raw in LAN mode",
-    "lan_prefer_zlib": "Prefer Zlib encoding (type 6) for larger LAN updates when client supports it",
+    "lan_prefer_zlib": "Legacy tuning flag; no longer overrides client encoding order",
     "lan_zlib_area_threshold": "Framebuffer area ratio above which Zlib is preferred on LAN",
     "lan_zlib_min_pixels": "Minimum rectangle pixel count before selecting Zlib on LAN",
     "lan_zlib_compression_level": "Zlib compression level for LAN mode (1-9)",
@@ -105,7 +105,7 @@
     "max_client_cut_text": "Maximum ClientCutText payload size in bytes"
   },
 
-  "_encoding_priority": "Tight > ZRLE > Hextile > RRE > CopyRect > Raw (auto-selected based on client and content)",
+  "_encoding_priority": "Rectangle encoding order follows the client's SetEncodings preference after server-side compatibility filtering",
 
   "_bandwidth_optimization": {
     "low_bandwidth": "Use Tight encoding with JPEG for photos",

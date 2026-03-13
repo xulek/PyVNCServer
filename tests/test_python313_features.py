@@ -479,51 +479,47 @@ class TestEncoderManagerPatternMatching:
     """Test EncoderManager with pattern matching"""
 
     def test_encoding_selection_static(self):
-        """Test encoding selection for static content"""
+        """Client order should win even for static content."""
         manager = EncoderManager()
-        client_encodings = {0, 2, 5, 16}
+        client_encodings = [5, 2, 0, 16]
 
         enc_type, encoder = manager.get_best_encoder(
             client_encodings, content_type="static"
         )
 
-        # Should prefer ZRLE (16) for static content
-        assert enc_type == 16
+        assert enc_type == 5
 
     def test_encoding_selection_dynamic(self):
-        """Test encoding selection for dynamic content"""
+        """Client order should win even for dynamic content."""
         manager = EncoderManager()
-        client_encodings = {0, 2, 5, 16}
+        client_encodings = [2, 5, 0, 16]
 
         enc_type, encoder = manager.get_best_encoder(
             client_encodings, content_type="dynamic"
         )
 
-        # Should prefer Hextile (5) for dynamic content
-        assert enc_type == 5
+        assert enc_type == 2
 
     def test_encoding_selection_scrolling(self):
-        """Test encoding selection for scrolling"""
+        """Unsupported first choices should be skipped without reordering the rest."""
         manager = EncoderManager()
-        client_encodings = {0, 1, 2, 5, 16}  # Include CopyRect
+        client_encodings = [1, 16, 5, 0]  # CopyRect/ZRLE unsupported, Hextile next
 
         enc_type, encoder = manager.get_best_encoder(
             client_encodings, content_type="scrolling"
         )
 
-        # Should prefer CopyRect (1) for scrolling
-        assert enc_type == 1
+        assert enc_type == 5
 
     def test_encoding_fallback(self):
         """Test encoding fallback when preferred not available"""
         manager = EncoderManager()
-        client_encodings = {0}  # Only Raw
+        client_encodings = [16]  # Only unsupported ZRLE advertised
 
         enc_type, encoder = manager.get_best_encoder(
             client_encodings, content_type="static"
         )
 
-        # Should fallback to Raw (0)
         assert enc_type == 0
 
 

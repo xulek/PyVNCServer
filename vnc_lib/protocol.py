@@ -5,7 +5,7 @@ Handles protocol version negotiation, security, and message parsing
 
 import struct
 import logging
-from typing import Tuple, Optional, Dict, Set
+from typing import Tuple, Optional, Dict
 
 from vnc_lib.exceptions import ConnectionError, ProtocolError
 from vnc_lib.types import is_valid_pixel_format
@@ -248,7 +248,7 @@ class RFBProtocol:
 
         return pixel_format
 
-    def parse_set_encodings(self, client_socket) -> Set[int]:
+    def parse_set_encodings(self, client_socket) -> list[int]:
         """
         Parse SetEncodings message (RFC 6143 Section 7.5.2)
 
@@ -270,8 +270,17 @@ class RFBProtocol:
         if not enc_data:
             raise ConnectionError("Failed to receive encoding types")
 
-        # Use 'i' (signed) not 'I' (unsigned) per RFC 6143
-        encodings = set(struct.unpack(">" + "i" * num_encodings, enc_data))
+        # Use 'i' (signed) not 'I' (unsigned) per RFC 6143.
+        # Preserve the client's order because RFC 6143 defines it as a
+        # preference hint; dedupe repeated values while keeping the first one.
+        raw_encodings = struct.unpack(">" + "i" * num_encodings, enc_data)
+        encodings: list[int] = []
+        seen: set[int] = set()
+        for enc in raw_encodings:
+            if enc in seen:
+                continue
+            seen.add(enc)
+            encodings.append(enc)
 
         self.logger.info(f"Client encodings: {encodings}")
         return encodings

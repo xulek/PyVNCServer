@@ -15,7 +15,7 @@ New in v3.0:
 - Pattern matching (match/case) for message handling
 - Generic type parameters (PEP 695)
 - Exception groups (PEP 654)
-- CopyRect encoding for efficient scrolling
+- Experimental CopyRect/ZRLE encoders available as standalone classes
 - Desktop resize support (ExtendedDesktopSize)
 - Comprehensive type system
 - Enhanced metrics with SlidingWindow

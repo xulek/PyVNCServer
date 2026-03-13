@@ -136,7 +136,7 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 | `enable_cursor_encoding` | `bool` | Reserved legacy flag; runtime currently disables cursor pseudo-encoding |
 | `enable_metrics` | `bool` | Internal metrics collection |
 | `enable_tight_encoding` | `bool` | Tight encoder availability |
-| `tight_disable_for_ultravnc` | `bool` | Compatibility workaround for UltraVNC-like clients |
+| `tight_disable_for_ultravnc` | `bool` | Legacy hard-disable for Tight on UltraVNC-like clients; default `false` |
 | `ultravnc_tight_warmup_requests` | `int` | Delay Tight for UltraVNC-like clients for initial framebuffer requests |
 | `ultravnc_tight_warmup_seconds` | `float` | Delay Tight for UltraVNC-like clients for initial connection seconds |
 | `enable_jpeg_encoding` | `bool` | JPEG encoder availability |

@@ -48,7 +48,7 @@ class TightEncoder:
 
     # Compression streams (0-3, separate zlib streams for better compression)
     STREAM_RAW = 0
-    STREAM_FILL = 1
+    STREAM_MONO = 1
     STREAM_PALETTE = 2
     STREAM_GRADIENT = 3
 
@@ -224,12 +224,11 @@ class TightEncoder:
         # Build palette index map
         palette_map = {color: idx for idx, color in enumerate(palette)}
 
-        # Compression control with explicit PALETTE filter on stream 2.
-        # High nibble: (stream_id | rfbTightExplicitFilter) << 4
-        # Low nibble: reset bit for this stream so the client
-        #             resets its zlib state before decoding.
-        stream_id = self.STREAM_PALETTE
-        reset_mask = 1 << stream_id
+        # Match TightVNC's stream allocation:
+        # - stream 1 for two-color palette rectangles
+        # - stream 2 for indexed palette rectangles
+        stream_id = self.STREAM_MONO if num_colors == 2 else self.STREAM_PALETTE
+        reset_mask = (1 << stream_id) if self._reset_stream_each_rect else 0
         control_nibble = stream_id | 0x04  # rfbTightExplicitFilter
         control = (control_nibble << 4) | reset_mask
 
@@ -251,8 +250,7 @@ class TightEncoder:
             # Tight requires small filtered payloads (<12 bytes) to be sent raw.
             result.extend(indices)
         else:
-            # Compress indices with zlib
-            compressed = self._compress_fresh_stream(indices)
+            compressed = self._compress_with_stream(indices, stream_id)
             # Add compressed length (compact format)
             result.extend(self._encode_compact_length(len(compressed)))
             result.extend(compressed)
@@ -359,7 +357,7 @@ class TightEncoder:
         """
         # Compression control with explicit GRADIENT filter on stream 3.
         stream_id = self.STREAM_GRADIENT
-        reset_mask = 1 << stream_id
+        reset_mask = (1 << stream_id) if self._reset_stream_each_rect else 0
         control_nibble = stream_id | 0x04  # rfbTightExplicitFilter
         control = (control_nibble << 4) | reset_mask
 
@@ -371,7 +369,7 @@ class TightEncoder:
         if len(filtered) < self.MIN_TO_COMPRESS:
             result.extend(filtered)
         else:
-            compressed = self._compress_fresh_stream(filtered)
+            compressed = self._compress_with_stream(filtered, stream_id)
             result.extend(self._encode_compact_length(len(compressed)))
             result.extend(compressed)
 
@@ -421,8 +419,10 @@ class TightEncoder:
                     topleft = pixel_data[topleft_offset:topleft_offset+bpp]
 
                     # Prediction: left + top - topleft
-                    predicted = bytes((l + t - tl) & 0xFF
-                                     for l, t, tl in zip(left, top, topleft))
+                    predicted = bytes(
+                        min(255, max(0, l + t - tl))
+                        for l, t, tl in zip(left, top, topleft)
+                    )
                     diff = bytes((c - p) & 0xFF for c, p in zip(current, predicted))
                     result[offset:offset+bpp] = diff
 
@@ -461,16 +461,11 @@ class TightEncoder:
             # Compatibility mode for UltraVNC-like decoders: reset stream 0
             # before every Tight basic rectangle.
             control = 1 << stream_id
-            # Use a fresh zlib stream with sync flush. This avoids emitting
-            # Z_STREAM_END for each rectangle while still being independent.
             compressed = self._compress_fresh_stream(tight_bytes)
         else:
             # Use persistent zlib stream 0 (LibVNCServer-style).
             control = 0x00  # stream 0, basic, no explicit filter, no reset bits
-            with self._compressor_lock:
-                compressor = self.compressors[stream_id]
-                compressed = compressor.compress(tight_bytes)
-                compressed += compressor.flush(zlib.Z_SYNC_FLUSH)
+            compressed = self._compress_with_stream(tight_bytes, stream_id)
 
         # Build result with compact length
         result = bytearray([control])
@@ -510,6 +505,17 @@ class TightEncoder:
             self.compression_level, zlib.DEFLATED, zlib.MAX_WBITS
         )
         return compressor.compress(payload) + compressor.flush(zlib.Z_SYNC_FLUSH)
+
+    def _compress_with_stream(self, payload: bytes, stream_id: int) -> bytes:
+        """Compress payload using either a persistent or per-rectangle stream."""
+        if self._reset_stream_each_rect:
+            return self._compress_fresh_stream(payload)
+
+        with self._compressor_lock:
+            compressor = self.compressors[stream_id]
+            compressed = compressor.compress(payload)
+            compressed += compressor.flush(zlib.Z_SYNC_FLUSH)
+        return compressed
 
     def _encode_compact_length(self, length: int) -> bytes:
         """

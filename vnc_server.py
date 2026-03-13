@@ -501,7 +501,7 @@ class VNCServerV3:
             enable_tight = self.config.get('enable_tight_encoding', True)
             enable_jpeg = self.config.get('enable_jpeg_encoding', True)
             enable_h264 = self.config.get('enable_h264_encoding', False)
-            disable_tight_for_ultravnc = self.config.get('tight_disable_for_ultravnc', True)
+            disable_tight_for_ultravnc = self.config.get('tight_disable_for_ultravnc', False)
 
             encoder_manager = EncoderManager(
                 enable_tight=enable_tight,
@@ -726,9 +726,14 @@ class VNCServerV3:
                                 f"or first {self.ultravnc_tight_warmup_seconds:.1f}s)"
                             )
                         elif not delay_tight_for_ultravnc and ultravnc_tight_delay_active:
-                            self.logger.info(
-                                "UltraVNC compatibility: Tight warm-up finished, Tight is allowed"
-                            )
+                            if getattr(encoder_manager, '_disable_tight_for_ultravnc', False):
+                                self.logger.info(
+                                    "UltraVNC compatibility: Tight warm-up finished, but Tight remains disabled by configuration"
+                                )
+                            else:
+                                self.logger.info(
+                                    "UltraVNC compatibility: Tight warm-up finished, Tight is allowed"
+                                )
                         ultravnc_tight_delay_active = delay_tight_for_ultravnc
                         selection_encodings, _ = self._filter_encodings_for_pixel_format(
                             client_encodings, encoder_manager, current_pixel_format
@@ -1415,15 +1420,7 @@ class VNCServerV3:
             client_encodings, encoder_manager, pixel_format
         )
         encoders = encoder_manager.encoders
-        ultravnc_like = 9 in ordered_client_encodings or 10 in ordered_client_encodings
-        disable_tight_for_ultravnc = bool(
-            getattr(encoder_manager, '_disable_tight_for_ultravnc', False)
-        )
-        tight_allowed = not (ultravnc_like and disable_tight_for_ultravnc)
-
         def available(enc_type: int) -> bool:
-            if enc_type == 7 and not tight_allowed:
-                return False
             if not self._encoding_supported_for_pixel_format(enc_type, pixel_format):
                 return False
             if enc_type == 21 and not allow_jpeg:

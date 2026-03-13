@@ -627,7 +627,7 @@ class EncoderManager:
     """
 
     def __init__(self, enable_tight: bool = True, enable_h264: bool = False,
-                 enable_jpeg: bool = True, disable_tight_for_ultravnc: bool = True,
+                 enable_jpeg: bool = True, disable_tight_for_ultravnc: bool = False,
                  enable_copyrect: bool = False, enable_zrle: bool = False):
         self.encoders: dict[int, Encoder] = {
             0: RawEncoder(),
@@ -676,8 +676,6 @@ class EncoderManager:
         if not hasattr(self, 'logger'):
             self.logger = logging.getLogger(__name__)
 
-        # Internal flag to avoid logging the same UltraVNC notice repeatedly
-        self._tight_disabled_for_ultravnc_logged = False
         self._disable_tight_for_ultravnc = disable_tight_for_ultravnc
 
     def get_best_encoder(self, client_encodings: Iterable[int],
@@ -693,23 +691,6 @@ class EncoderManager:
             (encoding_type, encoder) tuple
         """
         ordered_client_encodings = _unique_encoding_order(client_encodings)
-
-        # Detect UltraVNC-style clients: they advertise Ultra (9) and/or TRLE (10)
-        # encodings, which typical Tight/TigerVNC viewers do not.
-        is_ultravnc_client = 9 in ordered_client_encodings or 10 in ordered_client_encodings
-
-        # For UltraVNC viewers, Tight encoding is currently unstable/buggy on the
-        # client side even though our implementation passes TigerVNC and LibVNC
-        # clients. To maximize compatibility, we can optionally disable Tight for
-        # such clients (configurable via tight_disable_for_ultravnc).
-        if self._disable_tight_for_ultravnc and is_ultravnc_client and 7 in self.encoders:
-            ordered_client_encodings = [enc for enc in ordered_client_encodings if enc != 7]
-            if not self._tight_disabled_for_ultravnc_logged:
-                self.logger.info(
-                    "Detected UltraVNC-like client (encodings include 9/10); "
-                    "disabling Tight encoding for compatibility"
-                )
-                self._tight_disabled_for_ultravnc_logged = True
 
         # Find first available encoder in client-preferred order.
         for enc_type in ordered_client_encodings:

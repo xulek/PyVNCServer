@@ -211,6 +211,28 @@ class TestEncoders(unittest.TestCase):
         # Small palette payload (<12) must be raw and 1 byte/pixel => 3 bytes.
         self.assertEqual(len(tail), 3)
 
+    def test_tight_two_color_palette_uses_mono_stream_id(self):
+        """Two-color Tight palette rectangles should use stream 1 like TightVNC."""
+        encoder = TightEncoder()
+        width, height, bpp = 8, 2, 4
+        pixels = bytes(([0, 0, 0, 0] * 8) + ([255, 255, 255, 0] * 8))
+        encoded = encoder.encode(pixels, width, height, bpp)
+
+        self.assertEqual(encoded[1], 0x01)
+        self.assertEqual((encoded[0] >> 4) & 0x03, 0x01)
+
+    def test_tight_multi_color_palette_uses_indexed_stream_id(self):
+        """3+ color Tight palette rectangles should use stream 2 like TightVNC."""
+        encoder = TightEncoder()
+        width, height, bpp = 16, 16, 4
+        pixels = bytearray()
+        for i in range(width * height):
+            pixels.extend([i & 0xFF, (i * 3) & 0xFF, (i * 5) & 0xFF, 0])
+        encoded = encoder.encode(bytes(pixels), width, height, bpp)
+
+        self.assertEqual(encoded[1], 0x01)
+        self.assertEqual((encoded[0] >> 4) & 0x03, 0x02)
+
     def test_tight_basic_reset_mode_sets_stream_reset_bit(self):
         """Compatibility mode should set stream reset bit for Tight basic rectangles."""
         encoder = TightEncoder()

@@ -314,10 +314,9 @@ def test_select_encoder_for_update_respects_client_order_for_zlib_over_tight():
     assert enc_type == 6
 
 
-def test_select_encoder_for_update_skips_tight_for_ultravnc_like_client():
+def test_select_encoder_for_update_allows_tight_for_ultravnc_like_client():
     server = _server_without_init()
     manager = _DummyEncoderManager({0: object(), 6: object(), 7: object()})
-    manager._disable_tight_for_ultravnc = True
     enc_type, _ = server._select_encoder_for_update(
         manager,
         [7, 6, 0, 9, 10],  # UltraVNC-like (9/10 present)
@@ -330,7 +329,7 @@ def test_select_encoder_for_update_skips_tight_for_ultravnc_like_client():
         bytes_per_pixel=4,
         pixel_format=_native_bgr0_pixel_format(),
     )
-    assert enc_type == 6
+    assert enc_type == 7
 
 
 def test_select_encoder_for_update_respects_allow_jpeg_false():

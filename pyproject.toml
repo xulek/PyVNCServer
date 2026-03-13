@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyvncserver"
+version = "3.2.0"
+description = "Python VNC/RFB server with packaged CLI and reusable library surface"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { file = "LICENSE" }
+authors = [{ name = "PyVNCServer contributors" }]
+dependencies = [
+  "mss>=10.1.0",
+  "Pillow>=12.1.1",
+  "pyautogui>=0.9.54",
+  "pycryptodome>=3.23.0",
+  "numpy>=2.4.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0.2",
+  "pytest-cov>=7.0.0",
+]
+
+[project.scripts]
+pyvncserver = "pyvncserver.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

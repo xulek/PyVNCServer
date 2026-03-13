@@ -4,16 +4,19 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 PyVNCServer is an RFB (VNC) server implementation in Python. The repository combines:
-- a runnable server (`vnc_server.py`)
-- a reusable protocol/encoding library (`vnc_lib/`)
+- a packaged runtime in `src/pyvncserver/`
+- a legacy compatibility entrypoint in `vnc_server.py`
+- reusable protocol/encoding modules
 - browser client assets (`web/`)
 - demos, tests, and benchmarks
 
 ## Scope
 
-`vnc_server.py` is the main entrypoint and source of truth for runtime behavior.
+The preferred entrypoint is now the packaged CLI in `pyvncserver`. The legacy `vnc_server.py`
+wrapper remains available for compatibility.
 
-The `vnc_lib/` package contains additional modules (for example session recording, clipboard helpers, Prometheus exporter, structured logging, and performance tooling). These modules are available for integration, but not all of them are wired into the default server loop.
+The `src/pyvncserver/` package is the new source of truth for runtime structure.
+The legacy `vnc_lib/` package is retained during the migration and still backs many internals.
 
 ## Implemented Capabilities
 
@@ -55,7 +58,7 @@ The `vnc_lib/` package contains additional modules (for example session recordin
 git clone https://github.com/xulek/PyVNCServer.git
 cd PyVNCServer
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -e .[dev]
 ```
 
 ## Quick Start
@@ -66,7 +69,7 @@ python -m pip install -r requirements.txt
 2. Start the server:
 
 ```bash
-python vnc_server.py
+pyvncserver serve --config config/pyvncserver.toml
 ```
 
 3. Connect with a VNC client (example):
@@ -160,15 +163,15 @@ The repository ships with a ready-to-edit `config.json`. Key fields:
 CLI supports config and log level overrides:
 
 ```bash
-python vnc_server.py --config config.production.json --log-level DEBUG
+python vnc_server.py serve --config config/pyvncserver.toml --log-level DEBUG
 ```
 
 Programmatic startup is also available:
 
 ```python
-from vnc_server import VNCServerV3
+from pyvncserver import VNCServer
 
-server = VNCServerV3(config_file="config.production.json")
+server = VNCServer(config_file="config/pyvncserver.toml")
 server.start()
 ```
 
@@ -198,12 +201,14 @@ python -m pytest tests/ -v --cov=vnc_lib --cov-report=term-missing
 
 ```text
 benchmarks/          Performance and latency scripts
+config/              Preferred runtime configuration files
+docs/                Project and architecture documentation
 examples/            Runnable demo scripts
+src/pyvncserver/     Packaged application and library code
 tests/               Unit tests
-vnc_lib/             Core protocol, encoding, and utility modules
+vnc_lib/             Legacy modules retained during migration
 web/                 Browser client assets and noVNC integration
-vnc_server.py        Server entrypoint
-config.json          Runtime configuration template
+vnc_server.py        Legacy compatibility entrypoint
 ```
 
 ## Security Notes

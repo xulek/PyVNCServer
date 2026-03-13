@@ -1,0 +1,61 @@
+# Default packaged configuration for PyVNCServer.
+
+[server]
+host = "0.0.0.0"
+port = 5900
+password = ""
+frame_rate = 30
+lan_frame_rate = 90
+network_profile_override = "lan"
+scale_factor = 1.0
+max_connections = 10
+client_socket_timeout = 60.0
+input_control_policy = "single-controller"
+
+[features]
+enable_region_detection = true
+enable_metrics = true
+enable_request_coalescing = true
+enable_lan_adaptive_encoding = true
+enable_websocket = false
+enable_cursor_encoding = false
+enable_tight_encoding = true
+enable_jpeg_encoding = true
+enable_h264_encoding = false
+enable_parallel_encoding = true
+
+[lan]
+raw_area_threshold = 0.10
+raw_max_pixels = 65536
+prefer_zlib = true
+zlib_area_threshold = 0.08
+zlib_min_pixels = 8192
+zlib_compression_level = 2
+zlib_warmup_requests = 2
+zlib_disable_if_request_gap_ms = 1500
+jpeg_area_threshold = 0.20
+jpeg_min_pixels = 16384
+jpeg_quality_initial = 84
+jpeg_quality_min = 70
+jpeg_quality_max = 95
+zrle_compression_level = 3
+
+[websocket]
+allowed_origins = []
+detect_timeout = 0.5
+max_handshake_bytes = 65536
+max_payload_bytes = 8388608
+max_buffer_bytes = 16777216
+
+[limits]
+max_set_encodings = 1024
+max_client_cut_text = 16777216
+encoding_threads = 0
+tight_disable_for_ultravnc = false
+ultravnc_tight_warmup_requests = 16
+ultravnc_tight_warmup_seconds = 2.5
+
+[logging]
+log_level = "INFO"
+log_file = ""
+

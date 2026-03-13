@@ -150,7 +150,7 @@ The repository ships with a ready-to-edit `config/pyvncserver.toml`. Runtime key
 | `max_connections` | `int` | Max simultaneous clients |
 | `client_socket_timeout` | `float` | Per-client read timeout in seconds |
 | `enable_region_detection` | `bool` | Incremental update optimization |
-| `enable_cursor_encoding` | `bool` | Reserved legacy flag; runtime currently disables cursor pseudo-encoding |
+| `enable_cursor_encoding` | `bool` | Enables Windows RichCursor and PointerPos pseudo-encodings when the client advertises them |
 | `enable_metrics` | `bool` | Internal metrics collection |
 | `enable_tight_encoding` | `bool` | Tight encoder availability |
 | `tight_disable_for_ultravnc` | `bool` | Legacy hard-disable for Tight on UltraVNC-like clients; default `false` |

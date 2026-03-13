@@ -386,6 +386,7 @@ class EncodingTypes:
     HEXTILE: EncodingType = 5
     ZRLE: EncodingType = 16
     CURSOR: EncodingType = -239
+    POINTER_POS: EncodingType = -232
     DESKTOP_SIZE: EncodingType = -223
     EXTENDED_DESKTOP_SIZE: EncodingType = -308
 

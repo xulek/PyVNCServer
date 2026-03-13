@@ -58,6 +58,7 @@ class RFBProtocol:
 
     # Pseudo-encodings
     ENCODING_CURSOR = -239
+    ENCODING_POINTER_POS = -232
     ENCODING_DESKTOP_SIZE = -223
     ENCODING_JPEG_QUALITY_LOW = -23   # JPEG quality level 0-9 (pseudo-encoding base -23 to -32)
     ENCODING_JPEG_QUALITY_HIGH = -32

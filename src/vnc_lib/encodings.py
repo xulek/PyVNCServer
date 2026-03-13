@@ -30,6 +30,7 @@ _ENCODING_NAME_MAP: dict[int, str] = {
     10: "TRLE",
     -223: "DesktopSize",
     -224: "LastRect",
+    -232: "PointerPos",
     -239: "Cursor",
     -308: "ExtendedDesktopSize",
     -314: "ContinuousUpdates",

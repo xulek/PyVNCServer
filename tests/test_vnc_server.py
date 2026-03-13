@@ -7,6 +7,7 @@ import socket
 import threading
 import logging
 
+from vnc_lib.cursor import CursorData
 from vnc_lib.protocol import RFBProtocol
 from vnc_lib.server_utils import NetworkProfile
 from pyvncserver import VNCServerV3
@@ -40,6 +41,30 @@ def _native_bgr0_pixel_format() -> dict:
     }
 
 
+class _FakeCursorCapture:
+    def __init__(self, cursor_data: CursorData | None, pointer_pos: tuple[int, int] | None):
+        self._cursor_data = cursor_data
+        self._pointer_pos = pointer_pos
+
+    def capture_cursor(self) -> CursorData | None:
+        return self._cursor_data
+
+    def get_pointer_position(self) -> tuple[int, int] | None:
+        return self._pointer_pos
+
+
+class _FakeCursorEncoder:
+    def __init__(self, changed: bool, encoded: bytes = b"cursor"):
+        self.changed = changed
+        self.encoded = encoded
+
+    def has_cursor_changed(self, cursor_data: CursorData) -> bool:
+        return self.changed
+
+    def encode_cursor(self, cursor_data: CursorData, bytes_per_pixel: int = 4):
+        return cursor_data.hotspot_x, cursor_data.hotspot_y, self.encoded
+
+
 def test_normalize_request_region_clamps_to_framebuffer():
     server = _server_without_init()
 
@@ -50,6 +75,61 @@ def test_normalize_request_region_clamps_to_framebuffer():
     )
 
     assert region == (100, 100, 200, 100)
+
+
+def test_build_cursor_pseudo_rectangles_sends_cursor_and_pointer_pos():
+    server = _server_without_init()
+    server.enable_cursor_encoding = True
+    protocol = RFBProtocol()
+    cursor_data = CursorData(
+        width=16,
+        height=16,
+        hotspot_x=3,
+        hotspot_y=4,
+        pixel_data=b"\x00\x00\x00\xff" * 16 * 16,
+        bitmask=b"\xff" * (16 * 16),
+    )
+
+    rectangles, last_pointer_pos = server._build_cursor_pseudo_rectangles(
+        protocol,
+        [protocol.ENCODING_CURSOR, protocol.ENCODING_POINTER_POS],
+        _native_bgr0_pixel_format(),
+        _FakeCursorCapture(cursor_data, (120, 80)),
+        _FakeCursorEncoder(changed=True, encoded=b"encoded-cursor"),
+        None,
+    )
+
+    assert rectangles == [
+        (3, 4, 16, 16, protocol.ENCODING_CURSOR, b"encoded-cursor"),
+        (120, 80, 0, 0, protocol.ENCODING_POINTER_POS, b""),
+    ]
+    assert last_pointer_pos == (120, 80)
+
+
+def test_build_cursor_pseudo_rectangles_suppresses_unchanged_updates():
+    server = _server_without_init()
+    server.enable_cursor_encoding = True
+    protocol = RFBProtocol()
+    cursor_data = CursorData(
+        width=8,
+        height=8,
+        hotspot_x=0,
+        hotspot_y=0,
+        pixel_data=b"\xff\xff\xff\xff" * 64,
+        bitmask=b"\xff" * 64,
+    )
+
+    rectangles, last_pointer_pos = server._build_cursor_pseudo_rectangles(
+        protocol,
+        [protocol.ENCODING_CURSOR, protocol.ENCODING_POINTER_POS],
+        _native_bgr0_pixel_format(),
+        _FakeCursorCapture(cursor_data, (10, 10)),
+        _FakeCursorEncoder(changed=False),
+        (10, 10),
+    )
+
+    assert rectangles == []
+    assert last_pointer_pos == (10, 10)
 
 
 def test_normalize_request_region_rejects_invalid():

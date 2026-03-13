@@ -17,6 +17,7 @@ from vnc_lib.input_handler import InputHandler
 from vnc_lib.screen_capture import ScreenCapture
 from vnc_lib.encodings import EncoderManager, encoding_name, format_encoding_list
 from vnc_lib.change_detector import AdaptiveChangeDetector
+from vnc_lib.cursor import CursorEncoder, SystemCursorCapture
 from vnc_lib.metrics import ServerMetrics, ConnectionMetrics, PerformanceMonitor
 from vnc_lib.types import is_valid_pixel_format
 from vnc_lib.clipboard import sanitize_clipboard_text
@@ -78,15 +79,16 @@ class VNCServerV3:
         # Features
         self.enable_region_detection = self.config.get('enable_region_detection', True)
         requested_cursor_encoding = bool(self.config.get('enable_cursor_encoding', False))
-        self.enable_cursor_encoding = False
+        cursor_probe = SystemCursorCapture(scale_factor=self.scale_factor)
+        self.enable_cursor_encoding = requested_cursor_encoding and cursor_probe.enabled
         self.enable_metrics = self.config.get('enable_metrics', True)
         self.enable_websocket = self.config.get('enable_websocket', False)
         self.enable_tight_security = self.config.get('enable_tight_security', True)
         self.enable_lan_adaptive_encoding = self.config.get('enable_lan_adaptive_encoding', True)
         self.enable_request_coalescing = self.config.get('enable_request_coalescing', True)
-        if requested_cursor_encoding:
+        if requested_cursor_encoding and not self.enable_cursor_encoding:
             self.logger.warning(
-                "Cursor pseudo-encoding is not fully implemented; disabling enable_cursor_encoding"
+                "Cursor pseudo-encoding is unavailable on this platform; disabling enable_cursor_encoding"
             )
 
         # LAN adaptive encoding tuning
@@ -501,6 +503,16 @@ class VNCServerV3:
             if security.tight_enabled:
                 protocol.send_tight_interaction_caps(client_socket)
 
+            cursor_capture = None
+            cursor_encoder = None
+            if self.enable_cursor_encoding:
+                cursor_capture = SystemCursorCapture(
+                    scale_factor=self.scale_factor,
+                    monitor=getattr(screen_capture, "monitor", 0),
+                )
+                if cursor_capture.enabled:
+                    cursor_encoder = CursorEncoder()
+
             # Initialize encoders and change detection
             # Enable advanced encodings from config
             enable_tight = self.config.get('enable_tight_encoding', True)
@@ -547,7 +559,8 @@ class VNCServerV3:
                 client_socket, protocol, screen_capture, input_handler,
                 current_pixel_format, client_encodings, width, height,
                 encoder_manager, change_detector, conn_metrics,
-                client_id, is_localhost, parallel_encoder, network_profile
+                client_id, cursor_capture, cursor_encoder,
+                is_localhost, parallel_encoder, network_profile
             )
 
         except Exception as e:
@@ -582,6 +595,8 @@ class VNCServerV3:
                               change_detector: AdaptiveChangeDetector | None,
                               conn_metrics: ConnectionMetrics | None,
                               client_id: str,
+                              cursor_capture: SystemCursorCapture | None,
+                              cursor_encoder: CursorEncoder | None,
                               is_localhost: bool = False,
                               parallel_encoder = None,
                              network_profile: NetworkProfile = NetworkProfile.WAN):
@@ -630,6 +645,7 @@ class VNCServerV3:
         ultravnc_like_client = False
         ultravnc_tight_delay_active = False
         parallel_enabled_for_client = parallel_encoder is not None
+        last_pointer_pos: tuple[int, int] | None = None
 
         while not self.shutdown_handler.is_shutting_down():
             try:
@@ -773,9 +789,18 @@ class VNCServerV3:
                                 ])
                                 continue
 
+                        cursor_rectangles, last_pointer_pos = self._build_cursor_pseudo_rectangles(
+                            protocol,
+                            client_encodings,
+                            current_pixel_format,
+                            cursor_capture,
+                            cursor_encoder,
+                            last_pointer_pos,
+                        )
+
                         request_region = self._normalize_request_region(request, fb_width, fb_height)
                         if request_region is None:
-                            protocol.send_framebuffer_update(client_socket, [])
+                            protocol.send_framebuffer_update(client_socket, cursor_rectangles)
                             continue
                         req_x, req_y, req_w, req_h = request_region
 
@@ -799,7 +824,7 @@ class VNCServerV3:
 
                             if changed_regions is not None and len(changed_regions) == 0:
                                 # No changes
-                                protocol.send_framebuffer_update(client_socket, [])
+                                protocol.send_framebuffer_update(client_socket, cursor_rectangles)
                                 continue
 
                             # Send region updates if available using parallel encoding
@@ -849,7 +874,7 @@ class VNCServerV3:
                                     encoded_results = parallel_encoder.encode_regions(regions_to_encode, bytes_per_pixel)
 
                                     # Build rectangles from results
-                                    rectangles = [
+                                    rectangles = cursor_rectangles + [
                                         (r.x, r.y, r.width, r.height, r.encoding_type, r.encoded_data)
                                         for r in encoded_results
                                     ]
@@ -892,7 +917,7 @@ class VNCServerV3:
                                 bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
                                 content_type = network_profile.value if network_profile != NetworkProfile.WAN else "dynamic"
 
-                                rectangles = []
+                                rectangles = list(cursor_rectangles)
                                 original_total_bytes = 0
                                 compressed_total_bytes = 0
                                 jpeg_original_bytes = 0
@@ -1003,7 +1028,7 @@ class VNCServerV3:
                         self.logger.debug(f"Encoded data size: {len(encoded_data)} bytes")
 
                         # Send framebuffer update
-                        rectangles = [
+                        rectangles = list(cursor_rectangles) + [
                             (req_x, req_y, req_w, req_h, encoding_type, encoded_data)
                         ]
                         self.logger.debug(f"Sending framebuffer update with {len(rectangles)} rectangle(s)")
@@ -1409,6 +1434,61 @@ class VNCServerV3:
             encoding_type,
             content_type,
         )
+
+    def _build_cursor_pseudo_rectangles(
+        self,
+        protocol: RFBProtocol,
+        client_encodings: list[int],
+        current_pixel_format: dict,
+        cursor_capture: SystemCursorCapture | None,
+        cursor_encoder: CursorEncoder | None,
+        last_pointer_pos: tuple[int, int] | None,
+    ) -> tuple[list[tuple[int, int, int, int, int, bytes]], tuple[int, int] | None]:
+        """Build RichCursor/PointerPos pseudo-rectangles for the current frame."""
+        if (
+            not self.enable_cursor_encoding
+            or cursor_capture is None
+            or cursor_encoder is None
+        ):
+            return [], last_pointer_pos
+
+        rectangles: list[tuple[int, int, int, int, int, bytes]] = []
+        bytes_per_pixel = max(1, current_pixel_format.get("bits_per_pixel", 32) // 8)
+
+        if protocol.ENCODING_CURSOR in client_encodings:
+            cursor_data = cursor_capture.capture_cursor()
+            if cursor_data is not None and cursor_encoder.has_cursor_changed(cursor_data):
+                hotspot_x, hotspot_y, encoded_data = cursor_encoder.encode_cursor(
+                    cursor_data,
+                    bytes_per_pixel=bytes_per_pixel,
+                )
+                rectangles.append(
+                    (
+                        hotspot_x,
+                        hotspot_y,
+                        cursor_data.width,
+                        cursor_data.height,
+                        protocol.ENCODING_CURSOR,
+                        encoded_data,
+                    )
+                )
+
+        if protocol.ENCODING_POINTER_POS in client_encodings:
+            pointer_pos = cursor_capture.get_pointer_position()
+            if pointer_pos is not None and pointer_pos != last_pointer_pos:
+                rectangles.append(
+                    (
+                        pointer_pos[0],
+                        pointer_pos[1],
+                        0,
+                        0,
+                        protocol.ENCODING_POINTER_POS,
+                        b"",
+                    )
+                )
+                last_pointer_pos = pointer_pos
+
+        return rectangles, last_pointer_pos
 
     def _configure_tight_compatibility(self, encoder_manager: EncoderManager,
                                        client_encodings: list[int]) -> None:

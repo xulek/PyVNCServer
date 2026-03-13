@@ -13,8 +13,8 @@ PyVNCServer is an RFB (VNC) server implementation in Python. The repository comb
 
 The supported entrypoint is the packaged CLI in `pyvncserver`.
 
-The `src/pyvncserver/` package is the new source of truth for runtime structure.
-The packaged `src/vnc_lib/` modules still back parts of the runtime during the migration.
+The `src/pyvncserver/` package is the runtime source of truth.
+The bundled `src/vnc_lib/` package remains as an internal support library inside the packaged layout.
 
 ## Implemented Capabilities
 
@@ -217,7 +217,7 @@ config/              Runtime configuration files
 docs/                Project and architecture documentation
 examples/            Runnable demo scripts
 src/pyvncserver/     Packaged application and library code
-src/vnc_lib/         Supporting modules still used internally
+src/vnc_lib/         Internal support modules shipped with the package
 tests/               Unit tests
 web/                 Browser client assets and noVNC integration
 ```

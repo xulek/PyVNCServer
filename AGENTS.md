@@ -5,7 +5,7 @@
 - `src/pyvncserver/`: primary packaged application and library code.
 - `src/pyvncserver/app/`: server bootstrap and runtime entrypoints.
 - `src/pyvncserver/rfb/`, `platform/`, `runtime/`, `features/`, `observability/`: domain layers.
-- `src/vnc_lib/`: legacy modules still used during the migration; prefer `pyvncserver.*` for new code.
+- `src/vnc_lib/`: internal support modules still packaged with the project; prefer `pyvncserver.*` for new code.
 - `tests/`: regression and unit tests. Add new tests here, not under `examples/`.
 - `config/`: preferred runtime config, e.g. `config/pyvncserver.toml`.
 - `web/`: browser assets and noVNC integration.
@@ -43,7 +43,7 @@
 - PRs should include:
   - a short summary of behavior changes,
   - testing performed (`pytest` commands),
-  - config or migration notes if entrypoints/imports changed,
+  - config or import-path notes if entrypoints/imports changed,
   - screenshots only for web/client UI changes.
 
 ## Security & Configuration Tips

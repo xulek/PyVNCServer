@@ -75,6 +75,10 @@ class BaseCaptureBackend:
     def is_available(self) -> bool:
         return False
 
+    def healthcheck(self) -> bool:
+        """Return whether the backend is usable right now."""
+        return self.is_available()
+
     def grab_bgra(self) -> tuple[bytes | None, int, int]:
         return None, 0, 0
 
@@ -106,13 +110,20 @@ class MSSCaptureBackend(BaseCaptureBackend):
     def is_available(self) -> bool:
         return bool(getattr(self.owner, "_mss_available", False))
 
+    def healthcheck(self) -> bool:
+        try:
+            return self.is_available() and self.owner._get_mss_session() is not None
+        except Exception:
+            return False
+
     def grab_bgra(self) -> tuple[bytes | None, int, int]:
         sct = self.owner._get_mss_session()
         if sct is None:
             return None, 0, 0
         monitor = sct.monitors[self.owner.monitor] if self.owner.monitor < len(sct.monitors) else sct.monitors[0]
         sct_img = sct.grab(monitor)
-        return bytes(sct_img.raw), int(sct_img.width), int(sct_img.height)
+        raw = sct_img.raw
+        return (raw if isinstance(raw, bytes) else bytes(raw)), int(sct_img.width), int(sct_img.height)
 
     def grab_rgb(self) -> tuple[bytes | None, int, int]:
         bgra_bytes, width, height = self.grab_bgra()
@@ -144,6 +155,9 @@ class PILCaptureBackend(BaseCaptureBackend):
     def is_available(self) -> bool:
         return bool(getattr(self.owner, "_pil_available", False))
 
+    def healthcheck(self) -> bool:
+        return self.is_available() and getattr(self.owner, "_ImageGrab", None) is not None
+
     def grab_rgb(self) -> tuple[bytes | None, int, int]:
         screenshot = self.grab_image()
         if screenshot is None:
@@ -173,6 +187,12 @@ class DXCamCaptureBackend(BaseCaptureBackend):
 
     def is_available(self) -> bool:
         return bool(getattr(self.owner, "_dxcam_available", False))
+
+    def healthcheck(self) -> bool:
+        try:
+            return self.is_available() and self.owner._get_dxcam_session() is not None
+        except Exception:
+            return False
 
     def grab_bgra(self) -> tuple[bytes | None, int, int]:
         frame_bytes, width, height, channels, color_hint = self.owner._grab_dxcam_frame()

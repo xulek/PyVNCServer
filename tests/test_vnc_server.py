@@ -12,6 +12,7 @@ from vnc_lib.cursor import CursorData
 from vnc_lib.encodings import CopyRectEncoder, ZRLEEncoder
 from vnc_lib.protocol import RFBProtocol
 from vnc_lib.server_utils import NetworkProfile
+from vnc_lib.screen_capture import CaptureResult
 from pyvncserver import VNCServerV3
 
 
@@ -217,6 +218,26 @@ def test_split_rectangles_for_tight_matches_reference_style_limits():
     assert split[1] == (256, 0, 256, 64)
     assert split[-1][2] <= 256
     assert split[-1][3] <= 64
+
+
+def test_capture_frame_uses_captureframe_api_when_available():
+    server = _server_without_init()
+
+    class _FrameCapture:
+        def capture_frame(self, _pixel_format):
+            from vnc_lib.capture_backends import CaptureFrame
+
+            return CaptureFrame(
+                result=CaptureResult(b"abc", None, 2, 3, 0.001),
+                metadata=CaptureMetadata(backend_name="dxcam"),
+            )
+
+    frame = server._capture_frame(_FrameCapture(), _native_bgr0_pixel_format())
+
+    assert frame.result.pixel_data == b"abc"
+    assert frame.result.width == 2
+    assert frame.result.height == 3
+    assert frame.metadata.backend_name == "dxcam"
 
 
 def test_split_rectangles_for_non_tight_keeps_original_rectangle():

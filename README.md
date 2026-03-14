@@ -153,7 +153,7 @@ The repository ships with a ready-to-edit `config/pyvncserver.toml`. Runtime key
 | `lan_zrle_compression_level` | `int` | ZRLE compression level used when clients prefer ZRLE |
 | `network_profile_override` | `null \| "localhost" \| "lan" \| "wan"` | Forces profile, bypasses auto-detection |
 | `scale_factor` | `float` | Capture scaling factor |
-| `capture_backend` | `"auto" \| "dxcam" \| "mss" \| "pil"` | Screen capture backend. `dxcam` is an opt-in Windows DXGI/Desktop Duplication path |
+| `capture_backend` | `"auto" \| "dxcam" \| "mss" \| "pil"` | Screen capture backend. On Windows, `auto` prefers `dxcam` when available and healthy, then falls back to `mss`, then `pil` |
 | `capture_probe_frames` | `int` | Startup benchmark sample count for real capture latency logging |
 | `capture_probe_warn_ms` | `float` | Warn threshold for startup capture probe; above this, a DXGI-style backend is likely worth evaluating |
 | `max_connections` | `int` | Max simultaneous clients |

@@ -554,7 +554,8 @@ class VNCServerV3:
             }
 
             # Get initial screen dimensions
-            initial_result = self._capture_frame(screen_capture, current_pixel_format)
+            initial_frame = self._capture_frame(screen_capture, current_pixel_format)
+            initial_result = initial_frame.result
             if (
                 initial_result.pixel_data is None
                 or initial_result.width <= 0
@@ -630,7 +631,7 @@ class VNCServerV3:
                 current_pixel_format, client_encodings, width, height,
                 encoder_manager, change_detector, conn_metrics,
                 client_id, cursor_capture, cursor_encoder,
-                is_localhost, parallel_encoder, network_profile
+                view_only_session, is_localhost, parallel_encoder, network_profile
             )
 
         except Exception as e:
@@ -667,9 +668,10 @@ class VNCServerV3:
                               client_id: str,
                               cursor_capture: SystemCursorCapture | None,
                               cursor_encoder: CursorEncoder | None,
+                              view_only_session: bool = False,
                               is_localhost: bool = False,
                               parallel_encoder = None,
-                             network_profile: NetworkProfile = NetworkProfile.WAN):
+                              network_profile: NetworkProfile = NetworkProfile.WAN):
         """
         Enhanced client message handling loop with network-aware optimization
 

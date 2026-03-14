@@ -61,6 +61,7 @@ class ScreenCapture:
         self._active_backend = "none"
         self._backend: BaseCaptureBackend | None = None
         self._backend_registry: dict[str, BaseCaptureBackend] = {}
+        self._backend_failures: dict[str, int] = {}
 
         # Try to load dxcam (DXGI Desktop Duplication backend)
         self._dxcam_available = False
@@ -221,6 +222,7 @@ class ScreenCapture:
             "mss": MSSCaptureBackend(self),
             "pil": PILCaptureBackend(self),
         }
+        self._backend_failures = {name: 0 for name in self._backend_registry}
 
     def _apply_backend_preference(self):
         """Honor explicit backend preference without hiding fallback behavior."""
@@ -232,25 +234,25 @@ class ScreenCapture:
             self.backend_preference = "auto"
 
         if self.backend_preference == "dxcam":
-            if self._backend_registry["dxcam"].is_available():
+            if self._backend_registry["dxcam"].healthcheck():
                 self._set_active_backend("dxcam")
             else:
-                self.logger.warning("capture_backend='dxcam' requested, but dxcam is unavailable")
+                self.logger.warning("capture_backend='dxcam' requested, but dxcam is unavailable or unhealthy")
 
         if self.backend_preference == "mss":
-            if self._backend_registry["mss"].is_available():
+            if self._backend_registry["mss"].healthcheck():
                 self._set_active_backend("mss")
             else:
-                self.logger.warning("capture_backend='mss' requested, but mss is unavailable")
+                self.logger.warning("capture_backend='mss' requested, but mss is unavailable or unhealthy")
             return
 
         if self.backend_preference == "pil":
             if not self._pil_available:
                 self._lazy_load_pil()
-            if self._backend_registry["pil"].is_available():
+            if self._backend_registry["pil"].healthcheck():
                 self._set_active_backend("pil")
             else:
-                self.logger.warning("capture_backend='pil' requested, but Pillow is unavailable")
+                self.logger.warning("capture_backend='pil' requested, but Pillow is unavailable or unhealthy")
             return
 
         if self._active_backend == "dxcam":
@@ -262,9 +264,11 @@ class ScreenCapture:
         if self.backend_preference == "pil":
             return
 
-        if self._backend_registry["mss"].is_available():
+        if self._backend_registry["dxcam"].healthcheck():
+            self._set_active_backend("dxcam")
+        elif self._backend_registry["mss"].healthcheck():
             self._set_active_backend("mss")
-        elif self._backend_registry["pil"].is_available():
+        elif self._backend_registry["pil"].healthcheck():
             self._set_active_backend("pil")
         else:
             self._active_backend = "none"
@@ -274,10 +278,46 @@ class ScreenCapture:
         """Assign the active backend adapter."""
         self._active_backend = backend_name
         self._backend = self._backend_registry.get(backend_name)
+        self._backend_failures.setdefault(backend_name, 0)
 
     def get_backend_name(self) -> str:
         """Return the currently active capture backend name."""
         return self._active_backend
+
+    def _get_backend_fallback_order(self, failed_backend: str) -> list[str]:
+        """Return backend fallbacks in preference order."""
+        order_map = {
+            "dxcam": ["mss", "pil"],
+            "mss": ["pil"],
+            "pil": [],
+        }
+        return order_map.get(failed_backend, [])
+
+    def _switch_to_fallback_backend(self, failed_backend: str, reason: str) -> bool:
+        """Switch to the next healthy backend after a runtime failure."""
+        for candidate in self._get_backend_fallback_order(failed_backend):
+            backend = self._backend_registry.get(candidate)
+            if backend is None:
+                continue
+            if backend.healthcheck():
+                self._set_active_backend(candidate)
+                self.logger.warning(
+                    "Capture backend '%s' failed (%s); falling back to '%s'",
+                    failed_backend,
+                    reason,
+                    candidate,
+                )
+                self._cached_screenshot = None
+                self._cached_rgb_bytes = None
+                self._cached_bgra_bytes = None
+                self._cache_time = 0.0
+                return True
+        return False
+
+    def _record_backend_failure(self, backend_name: str, reason: str) -> bool:
+        """Track a backend failure and switch away if possible."""
+        self._backend_failures[backend_name] = self._backend_failures.get(backend_name, 0) + 1
+        return self._switch_to_fallback_backend(backend_name, reason)
 
     def get_backend_capabilities(self) -> CaptureMetadata:
         """Expose backend metadata capabilities in a stable shape."""
@@ -428,6 +468,13 @@ class ScreenCapture:
                 return None, 0, 0
             bgra_bytes, width, height = self._backend.grab_bgra()
             if bgra_bytes is None:
+                self._record_backend_failure(
+                    self._active_backend,
+                    "backend returned no BGRA frame",
+                )
+                if self._backend is not None and self._backend.capabilities.supports_bgra:
+                    bgra_bytes, width, height = self._backend.grab_bgra()
+            if bgra_bytes is None:
                 return None, 0, 0
 
             self._cached_bgra_bytes = bgra_bytes
@@ -438,6 +485,13 @@ class ScreenCapture:
 
             return bgra_bytes, width, height
         except Exception as e:
+            failed_backend = self._active_backend
+            recovered = self._record_backend_failure(failed_backend, str(e))
+            if recovered and self._backend is not None and self._backend.capabilities.supports_bgra:
+                try:
+                    return self._grab_screen_bgra()
+                except Exception:
+                    pass
             self.logger.error(f"Failed to grab screen (BGRA): {e}")
             return None, 0, 0
 
@@ -489,7 +543,7 @@ class ScreenCapture:
                         return CaptureResult(None, None, 0, 0, 0.0)
 
                 # For scaling, we need PIL
-                    if self._mss_available and not self._pil_available:
+                    if self._active_backend in {"dxcam", "mss"} and not self._pil_available:
                         self._lazy_load_pil()
 
                     if self._pil_available:
@@ -541,6 +595,15 @@ class ScreenCapture:
                 return None, 0, 0
             rgb_bytes, width, height = self._backend.grab_rgb()
             if rgb_bytes is None:
+                self._record_backend_failure(
+                    self._active_backend,
+                    "backend returned no RGB frame",
+                )
+                if self._backend is not None:
+                    rgb_bytes, width, height = self._backend.grab_rgb()
+                else:
+                    return None, 0, 0
+            if rgb_bytes is None:
                 return None, 0, 0
 
             # Cache the result
@@ -553,6 +616,13 @@ class ScreenCapture:
             return rgb_bytes, width, height
 
         except Exception as e:
+            failed_backend = self._active_backend
+            recovered = self._record_backend_failure(failed_backend, str(e))
+            if recovered and self._backend is not None:
+                try:
+                    return self._grab_screen_rgb()
+                except Exception:
+                    pass
             self.logger.error(f"Failed to grab screen: {e}")
             return None, 0, 0
 
@@ -618,7 +688,9 @@ class ScreenCapture:
             return None, 0, 0, 0, "unknown"
 
         try:
-            frame = camera.grab()
+            # dxcam one-shot grab returns None when no *new* frame is ready.
+            # Reuse the last captured frame instead of treating that as a backend failure.
+            frame = camera.grab(copy=False, new_frame_only=False)
             if frame is None or not hasattr(frame, "shape"):
                 return None, 0, 0, 0, "unknown"
 

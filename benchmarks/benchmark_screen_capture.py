@@ -18,17 +18,12 @@ logging.basicConfig(level=logging.WARNING)
 
 def benchmark_capture(
     backend_name: str,
-    backend_preference: str,
+    capture,
     pixel_format_name: str,
     pixel_format: dict,
     iterations: int = 10,
 ):
     """Benchmark screen capture with specified backend"""
-    from vnc_lib.screen_capture import ScreenCapture
-
-    # Create capture instance
-    capture = ScreenCapture(backend_preference=backend_preference)
-
     # Warm-up
     capture.capture_fast(pixel_format)
 
@@ -123,16 +118,22 @@ def main():
         return
 
     if dxcam_available:
-        benchmark_capture("dxcam backend", "dxcam", "BGR0/native", bgr0_format, iterations=20)
-        benchmark_capture("dxcam backend", "dxcam", "RGB0", rgb0_format, iterations=20)
+        from vnc_lib.screen_capture import ScreenCapture
+        capture = ScreenCapture(backend_preference="dxcam")
+        benchmark_capture("dxcam backend", capture, "BGR0/native", bgr0_format, iterations=20)
+        benchmark_capture("dxcam backend", capture, "RGB0", rgb0_format, iterations=20)
 
     # Run benchmark with mss (if available)
     if mss_available:
-        benchmark_capture("mss backend", "mss", "BGR0/native", bgr0_format, iterations=20)
-        benchmark_capture("mss backend", "mss", "RGB0", rgb0_format, iterations=20)
+        from vnc_lib.screen_capture import ScreenCapture
+        capture = ScreenCapture(backend_preference="mss")
+        benchmark_capture("mss backend", capture, "BGR0/native", bgr0_format, iterations=20)
+        benchmark_capture("mss backend", capture, "RGB0", rgb0_format, iterations=20)
 
     if pil_available:
-        benchmark_capture("PIL backend", "pil", "RGB0", rgb0_format, iterations=20)
+        from vnc_lib.screen_capture import ScreenCapture
+        capture = ScreenCapture(backend_preference="pil")
+        benchmark_capture("PIL backend", capture, "RGB0", rgb0_format, iterations=20)
 
     print("\n" + "=" * 60)
     print("Recommendation:")

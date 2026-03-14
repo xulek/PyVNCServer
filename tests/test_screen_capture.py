@@ -12,6 +12,8 @@ from vnc_lib.screen_capture import ScreenCapture, CaptureResult
 def _capture_without_init() -> ScreenCapture:
     cap = ScreenCapture.__new__(ScreenCapture)
     cap.logger = logging.getLogger("test.screen_capture")
+    cap.monitor = 0
+    cap.scale_factor = 1.0
     cap._pixel_buffer = None
     cap._palette_lut_cache = {}
     cap._numpy_lut_cache = {}
@@ -27,10 +29,17 @@ def _capture_without_init() -> ScreenCapture:
     cap._pil_available = False
     cap._ImageGrab = None
     cap._Image = None
+    cap._cached_screenshot = None
+    cap._cached_rgb_bytes = None
+    cap._cached_bgra_bytes = None
+    cap._cached_width = 0
+    cap._cached_height = 0
+    cap._cache_time = 0.0
     cap._cache_ttl = 0.016
     cap.backend_preference = "auto"
     cap._backend = None
     cap._backend_registry = {}
+    cap._backend_failures = {}
     cap._build_backend_registry()
     return cap
 
@@ -192,10 +201,45 @@ def test_apply_backend_preference_selects_dxcam_when_requested():
     cap = _capture_without_init()
     cap.backend_preference = "dxcam"
     cap._dxcam_available = True
+    cap._dxcam = type("_FakeDXCamModule", (), {"create": staticmethod(lambda **_: object())})()
 
     cap._apply_backend_preference()
 
     assert cap._active_backend == "dxcam"
+
+
+def test_apply_backend_preference_auto_prefers_dxcam_when_healthy():
+    cap = _capture_without_init()
+    cap.backend_preference = "auto"
+    cap._dxcam_available = True
+    cap._dxcam = type("_FakeDXCamModule", (), {"create": staticmethod(lambda **_: object())})()
+
+    class _FakeMSSModule:
+        def mss(self):
+            return object()
+
+    cap._mss_available = True
+    cap._mss = _FakeMSSModule()
+
+    cap._apply_backend_preference()
+
+    assert cap._active_backend == "dxcam"
+
+
+def test_apply_backend_preference_auto_falls_back_to_mss_when_dxcam_unavailable():
+    cap = _capture_without_init()
+    cap.backend_preference = "auto"
+
+    class _FakeMSSModule:
+        def mss(self):
+            return object()
+
+    cap._mss_available = True
+    cap._mss = _FakeMSSModule()
+
+    cap._apply_backend_preference()
+
+    assert cap._active_backend == "mss"
 
 
 def test_dxcam_frame_to_bgra_supports_rgb_frames():
@@ -226,3 +270,60 @@ def test_capture_frame_includes_backend_metadata():
     assert isinstance(frame, CaptureFrame)
     assert frame.result.width == 1
     assert frame.metadata.backend_name == "none"
+
+
+def test_record_backend_failure_falls_back_from_dxcam_to_mss():
+    cap = _capture_without_init()
+
+    class _FakeMSSModule:
+        def mss(self):
+            return object()
+
+    cap._mss_available = True
+    cap._mss = _FakeMSSModule()
+    cap._dxcam_available = True
+    cap._build_backend_registry()
+    cap._set_active_backend("dxcam")
+
+    switched = cap._record_backend_failure("dxcam", "grab failed")
+
+    assert switched is True
+    assert cap.get_backend_name() == "mss"
+
+
+def test_grab_screen_bgra_retries_after_backend_failover():
+    cap = _capture_without_init()
+
+    class _FakeMSSModule:
+        def mss(self):
+            return object()
+
+    cap._mss_available = True
+    cap._mss = _FakeMSSModule()
+    cap._dxcam_available = True
+    cap._build_backend_registry()
+
+    class _FailingDXBackend:
+        capabilities = type("Caps", (), {"supports_bgra": True})()
+
+        def grab_bgra(self):
+            return None, 0, 0
+
+    class _WorkingMSSBackend:
+        capabilities = type("Caps", (), {"supports_bgra": True})()
+
+        def healthcheck(self):
+            return True
+
+        def grab_bgra(self):
+            return b"abcd", 1, 1
+
+    cap._backend_registry["mss"] = _WorkingMSSBackend()
+    cap._backend = _FailingDXBackend()
+    cap._active_backend = "dxcam"
+
+    data, width, height = cap._grab_screen_bgra()
+
+    assert data == b"abcd"
+    assert (width, height) == (1, 1)
+    assert cap.get_backend_name() == "mss"

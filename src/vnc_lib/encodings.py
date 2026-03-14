@@ -4,6 +4,7 @@ Supports various RFB encodings for efficient data transmission
 """
 
 import struct
+import sys
 import zlib
 import logging
 from typing import Protocol, TypeAlias
@@ -753,6 +754,16 @@ class ZRLEEncoder:
         self._compressor = zlib.compressobj(level=self.compression_level)
         self.logger = logging.getLogger(__name__)
         self.tile_size = 64
+        self.fast_raw_unique_threshold = 24
+        self.fast_raw_run_ratio_threshold = 0.12
+        self.fast_palette_max_colors = 8
+
+    def set_compression_level(self, level: int) -> None:
+        """Update compression level and reset stream state only when it actually changes."""
+        new_level = max(1, min(9, int(level)))
+        if new_level != self.compression_level:
+            self.compression_level = new_level
+            self._compressor = zlib.compressobj(level=self.compression_level)
 
     def encode(self, pixel_data: PixelData, width: int, height: int,
                bytes_per_pixel: int, pixel_format: dict | None = None) -> EncodedData:
@@ -781,6 +792,13 @@ class ZRLEEncoder:
         if width <= 0 or height <= 0 or bytes_per_pixel <= 0 or not pixel_data:
             return b""
 
+        if bytes_per_pixel == 4:
+            cpixel_byte_offset = self._cpixel_byte_offset(pixel_format)
+            if cpixel_byte_offset is not None:
+                if cpixel_byte_offset == 0 and sys.byteorder == "little":
+                    return self._encode_tiles_32bpp_native(pixel_data, width, height)
+                return self._encode_tiles_32bpp(pixel_data, width, height, cpixel_byte_offset)
+
         result = bytearray()
         for tile_y in range(0, height, self.tile_size):
             tile_height = min(self.tile_size, height - tile_y)
@@ -802,6 +820,47 @@ class ZRLEEncoder:
                 )
                 result.extend(
                     self._encode_tile(cpixel_data, tile_width, tile_height, cpixel_bpp)
+                )
+        return bytes(result)
+
+    def _encode_tiles_32bpp(self, pixel_data: PixelData, width: int, height: int,
+                            byte_offset: int) -> bytes:
+        result = bytearray()
+        view = memoryview(pixel_data)
+        for tile_y in range(0, height, self.tile_size):
+            tile_height = min(self.tile_size, height - tile_y)
+            for tile_x in range(0, width, self.tile_size):
+                tile_width = min(self.tile_size, width - tile_x)
+                result.extend(
+                    self._encode_tile_32bpp(
+                        view,
+                        width,
+                        tile_x,
+                        tile_y,
+                        tile_width,
+                        tile_height,
+                        byte_offset,
+                    )
+                )
+        return bytes(result)
+
+    def _encode_tiles_32bpp_native(self, pixel_data: PixelData, width: int, height: int) -> bytes:
+        result = bytearray()
+        pixel_words = memoryview(pixel_data).cast("I")
+        for tile_y in range(0, height, self.tile_size):
+            tile_height = min(self.tile_size, height - tile_y)
+            for tile_x in range(0, width, self.tile_size):
+                tile_width = min(self.tile_size, width - tile_x)
+                result.extend(
+                    self._encode_tile_32bpp_native(
+                        pixel_data,
+                        pixel_words,
+                        width,
+                        tile_x,
+                        tile_y,
+                        tile_width,
+                        tile_height,
+                    )
                 )
         return bytes(result)
 
@@ -870,48 +929,620 @@ class ZRLEEncoder:
         if not pixel_data:
             return b"\x00"
 
+        pixel_count = width * height
+        if pixel_count <= 0:
+            return b"\x00"
+
+        if self._is_solid_tile(pixel_data, pixel_size):
+            return bytes([1]) + pixel_data[:pixel_size]
+
+        analysis = self._analyze_tile_fast(pixel_data, pixel_size, pixel_count)
+        if analysis["prefer_raw"]:
+            return bytes([0]) + pixel_data
+
         pixels = self._split_pixels(pixel_data, pixel_size)
         if not pixels:
             return b"\x00"
 
-        palette = self._palette_in_order(pixels, limit=127)
+        palette_limit = 16 if analysis["palette_candidate"] else 127
+        palette = self._palette_in_order(pixels, limit=palette_limit)
         if len(palette) == 1:
-            return bytes([1]) + palette[0]
-
-        raw_candidate = bytes([0]) + pixel_data
-        best = raw_candidate
-
-        plain_rle_payload = self._encode_plain_rle(pixels)
-        plain_rle_candidate = bytes([128]) + plain_rle_payload
-        if len(plain_rle_candidate) < len(best):
-            best = plain_rle_candidate
+            return bytes([1]) + self._pixel_to_bytes(palette[0], pixel_size)
 
         if 2 <= len(palette) <= 16:
             packed_payload = self._encode_packed_palette(pixels, palette, width, height)
-            packed_candidate = bytes([len(palette)]) + b"".join(palette) + packed_payload
-            if len(packed_candidate) < len(best):
-                best = packed_candidate
-
-        if 2 <= len(palette) <= 127:
-            palette_rle_payload = self._encode_palette_rle(pixels, palette)
-            palette_rle_candidate = (
-                bytes([128 + len(palette)]) + b"".join(palette) + palette_rle_payload
+            return (
+                bytes([len(palette)])
+                + b"".join(self._pixel_to_bytes(pixel, pixel_size) for pixel in palette)
+                + packed_payload
             )
-            if len(palette_rle_candidate) < len(best):
-                best = palette_rle_candidate
 
-        return best
+        if analysis["run_friendly"]:
+            plain_rle_payload = self._encode_plain_rle(pixels, pixel_size)
+            plain_rle_candidate = bytes([128]) + plain_rle_payload
+            if len(palette) < 2:
+                return plain_rle_candidate
 
-    def _split_pixels(self, pixel_data: PixelData, pixel_size: int) -> list[bytes]:
+        if 2 <= len(palette) <= 127 and analysis["run_friendly"]:
+            palette_rle_payload = self._encode_palette_rle(pixels, palette)
+            return (
+                bytes([128 + len(palette)])
+                + b"".join(self._pixel_to_bytes(pixel, pixel_size) for pixel in palette)
+                + palette_rle_payload
+            )
+
+        if analysis["run_friendly"]:
+            return bytes([128]) + self._encode_plain_rle(pixels, pixel_size)
+
+        return bytes([0]) + pixel_data
+
+    def _encode_tile_32bpp(self, frame_view: memoryview, fb_width: int,
+                           tile_x: int, tile_y: int, width: int, height: int,
+                           byte_offset: int) -> bytes:
+        pixel_count = width * height
+        if pixel_count <= 0:
+            return b"\x00"
+
+        solid_pixel = self._solid_pixel_32bpp(
+            frame_view,
+            fb_width,
+            tile_x,
+            tile_y,
+            width,
+            height,
+            byte_offset,
+        )
+        if solid_pixel is not None:
+            return bytes([1]) + self._pixel_to_bytes(solid_pixel, 3)
+
+        analysis = self._analyze_tile_fast_32bpp(
+            frame_view,
+            fb_width,
+            tile_x,
+            tile_y,
+            width,
+            height,
+            byte_offset,
+            pixel_count,
+        )
+        if analysis["prefer_raw"]:
+            return bytes([0]) + self._build_raw_tile_32bpp(
+                frame_view,
+                fb_width,
+                tile_x,
+                tile_y,
+                width,
+                height,
+                byte_offset,
+            )
+
+        pixels = self._extract_tile_pixels_32bpp(
+            frame_view,
+            fb_width,
+            tile_x,
+            tile_y,
+            width,
+            height,
+            byte_offset,
+        )
+        if not pixels:
+            return b"\x00"
+
+        palette_limit = 16 if analysis["palette_candidate"] else 127
+        palette = self._palette_in_order(pixels, limit=palette_limit)
+        if len(palette) == 1:
+            return bytes([1]) + self._pixel_to_bytes(palette[0], 3)
+
+        if 2 <= len(palette) <= 16:
+            packed_payload = self._encode_packed_palette(pixels, palette, width, height)
+            return (
+                bytes([len(palette)])
+                + b"".join(self._pixel_to_bytes(pixel, 3) for pixel in palette)
+                + packed_payload
+            )
+
+        if analysis["run_friendly"]:
+            plain_rle_payload = self._encode_plain_rle(pixels, 3)
+            plain_rle_candidate = bytes([128]) + plain_rle_payload
+            if len(palette) < 2:
+                return plain_rle_candidate
+
+        if 2 <= len(palette) <= 127 and analysis["run_friendly"]:
+            palette_rle_payload = self._encode_palette_rle(pixels, palette)
+            return (
+                bytes([128 + len(palette)])
+                + b"".join(self._pixel_to_bytes(pixel, 3) for pixel in palette)
+                + palette_rle_payload
+            )
+
+        if analysis["run_friendly"]:
+            return bytes([128]) + self._encode_plain_rle(pixels, 3)
+
+        return bytes([0]) + self._build_raw_tile_32bpp(
+            frame_view,
+            fb_width,
+            tile_x,
+            tile_y,
+            width,
+            height,
+            byte_offset,
+        )
+
+    def _encode_tile_32bpp_native(self, frame_bytes: bytes, pixel_words: memoryview,
+                                  fb_width: int, tile_x: int, tile_y: int,
+                                  width: int, height: int) -> bytes:
+        pixel_count = width * height
+        if pixel_count <= 0:
+            return b"\x00"
+
+        solid_pixel = self._solid_pixel_32bpp_native(
+            pixel_words,
+            fb_width,
+            tile_x,
+            tile_y,
+            width,
+            height,
+        )
+        if solid_pixel is not None:
+            return bytes([1]) + self._pixel32_native_to_cpixel_bytes(solid_pixel)
+
+        analysis = self._analyze_tile_fast_32bpp_native(
+            pixel_words,
+            fb_width,
+            tile_x,
+            tile_y,
+            width,
+            height,
+            pixel_count,
+        )
+        if analysis["palette_candidate"]:
+            packed_palette = self._try_encode_packed_palette_tile_32bpp_native(
+                pixel_words,
+                fb_width,
+                tile_x,
+                tile_y,
+                width,
+                height,
+            )
+            if packed_palette is not None:
+                return packed_palette
+
+        if analysis["prefer_raw"]:
+            return bytes([0]) + self._build_raw_tile_32bpp_native(
+                frame_bytes,
+                fb_width,
+                tile_x,
+                tile_y,
+                width,
+                height,
+            )
+
+        pixels = self._extract_tile_pixels_32bpp_native(
+            pixel_words,
+            fb_width,
+            tile_x,
+            tile_y,
+            width,
+            height,
+        )
+        if not pixels:
+            return b"\x00"
+
+        palette_limit = 16 if analysis["palette_candidate"] else 127
+        palette = self._palette_in_order(pixels, limit=palette_limit)
+        if len(palette) == 1:
+            return bytes([1]) + self._pixel32_native_to_cpixel_bytes(palette[0])
+
+        if 2 <= len(palette) <= 16:
+            packed_payload = self._encode_packed_palette(pixels, palette, width, height)
+            return (
+                bytes([len(palette)])
+                + b"".join(self._pixel32_native_to_cpixel_bytes(pixel) for pixel in palette)
+                + packed_payload
+            )
+
+        if analysis["run_friendly"]:
+            plain_rle_payload = self._encode_plain_rle_32bpp_native(pixels)
+            plain_rle_candidate = bytes([128]) + plain_rle_payload
+            if len(palette) < 2:
+                return plain_rle_candidate
+
+        if 2 <= len(palette) <= 127 and analysis["run_friendly"]:
+            palette_rle_payload = self._encode_palette_rle(pixels, palette)
+            return (
+                bytes([128 + len(palette)])
+                + b"".join(self._pixel32_native_to_cpixel_bytes(pixel) for pixel in palette)
+                + palette_rle_payload
+            )
+
+        if analysis["run_friendly"]:
+            return bytes([128]) + self._encode_plain_rle_32bpp_native(pixels)
+
+        return bytes([0]) + self._build_raw_tile_32bpp_native(
+            frame_bytes,
+            fb_width,
+            tile_x,
+            tile_y,
+            width,
+            height,
+        )
+
+    def _solid_pixel_32bpp_native(self, pixel_words: memoryview, fb_width: int,
+                                  tile_x: int, tile_y: int, width: int,
+                                  height: int) -> int | None:
+        first_index = tile_y * fb_width + tile_x
+        first_pixel = int(pixel_words[first_index]) & 0x00FFFFFF
+        row_start = first_index
+        for _ in range(height):
+            row_end = row_start + width
+            for pixel in pixel_words[row_start:row_end]:
+                if (int(pixel) & 0x00FFFFFF) != first_pixel:
+                    return None
+            row_start += fb_width
+        return first_pixel
+
+    def _analyze_tile_fast_32bpp_native(self, pixel_words: memoryview, fb_width: int,
+                                        tile_x: int, tile_y: int, width: int,
+                                        height: int, pixel_count: int) -> dict[str, bool]:
+        if pixel_count <= 64:
+            return {
+                "prefer_raw": False,
+                "run_friendly": True,
+                "palette_candidate": True,
+            }
+
+        sample_pixels = min(pixel_count, 128)
+        step = max(1, pixel_count // sample_pixels)
+        row = 0
+        col = 0
+        first_index = tile_y * fb_width + tile_x
+        first_pixel = int(pixel_words[first_index]) & 0x00FFFFFF
+        previous = first_pixel
+        unique = {first_pixel}
+        repeat_pairs = 0
+        samples_seen = 1
+
+        for _ in range(1, sample_pixels):
+            col += step
+            while col >= width:
+                col -= width
+                row += 1
+                if row >= height:
+                    row = height - 1
+                    col = width - 1
+                    break
+            pixel = int(pixel_words[(tile_y + row) * fb_width + tile_x + col]) & 0x00FFFFFF
+            if pixel == previous:
+                repeat_pairs += 1
+            previous = pixel
+            unique.add(pixel)
+            samples_seen += 1
+            if len(unique) > self.fast_raw_unique_threshold:
+                return {
+                    "prefer_raw": True,
+                    "run_friendly": False,
+                    "palette_candidate": False,
+                }
+
+        run_ratio = repeat_pairs / max(1, samples_seen - 1)
+        palette_candidate = len(unique) <= self.fast_palette_max_colors
+        prefer_raw = (not palette_candidate) and run_ratio < self.fast_raw_run_ratio_threshold
+        return {
+            "prefer_raw": prefer_raw,
+            "run_friendly": run_ratio >= self.fast_raw_run_ratio_threshold,
+            "palette_candidate": palette_candidate,
+        }
+
+    def _extract_tile_pixels_32bpp_native(self, pixel_words: memoryview, fb_width: int,
+                                          tile_x: int, tile_y: int, width: int,
+                                          height: int) -> list[int]:
+        pixels: list[int] = []
+        pixels_extend = pixels.extend
+        row_start = tile_y * fb_width + tile_x
+        for _ in range(height):
+            row_end = row_start + width
+            pixels_extend((int(pixel) & 0x00FFFFFF) for pixel in pixel_words[row_start:row_end])
+            row_start += fb_width
+        return pixels
+
+    def _try_encode_packed_palette_tile_32bpp_native(
+        self,
+        pixel_words: memoryview,
+        fb_width: int,
+        tile_x: int,
+        tile_y: int,
+        width: int,
+        height: int,
+    ) -> bytes | None:
+        palette: list[int] = []
+        palette_index: dict[int, int] = {}
+        row_indices: list[list[int]] = []
+        row_start = tile_y * fb_width + tile_x
+
+        for _ in range(height):
+            row_end = row_start + width
+            indices_row: list[int] = []
+            for pixel in pixel_words[row_start:row_end]:
+                pixel_value = int(pixel) & 0x00FFFFFF
+                idx = palette_index.get(pixel_value)
+                if idx is None:
+                    idx = len(palette)
+                    if idx >= 16:
+                        return None
+                    palette_index[pixel_value] = idx
+                    palette.append(pixel_value)
+                indices_row.append(idx)
+            row_indices.append(indices_row)
+            row_start += fb_width
+
+        palette_size = len(palette)
+        if palette_size == 0:
+            return b"\x00"
+        if palette_size == 1:
+            return bytes([1]) + self._pixel32_native_to_cpixel_bytes(palette[0])
+
+        if palette_size == 2:
+            bits_per_index = 1
+        elif palette_size <= 4:
+            bits_per_index = 2
+        else:
+            bits_per_index = 4
+
+        packed_payload = bytearray()
+        for indices_row in row_indices:
+            current_byte = 0
+            used_bits = 0
+            for idx in indices_row:
+                current_byte = (current_byte << bits_per_index) | idx
+                used_bits += bits_per_index
+                if used_bits == 8:
+                    packed_payload.append(current_byte)
+                    current_byte = 0
+                    used_bits = 0
+            if used_bits:
+                current_byte <<= (8 - used_bits)
+                packed_payload.append(current_byte)
+
+        return (
+            bytes([palette_size])
+            + b"".join(self._pixel32_native_to_cpixel_bytes(pixel) for pixel in palette)
+            + bytes(packed_payload)
+        )
+
+    def _build_raw_tile_32bpp_native(self, frame_bytes: bytes, fb_width: int,
+                                     tile_x: int, tile_y: int, width: int,
+                                     height: int) -> bytes:
+        frame_view = memoryview(frame_bytes)
+        result = bytearray(width * height * 3)
+        dst_view = memoryview(result)
+        row_stride = fb_width * 4
+        src_row_start = ((tile_y * fb_width) + tile_x) * 4
+        dst_row_start = 0
+        for _ in range(height):
+            row_slice = frame_view[src_row_start:src_row_start + (width * 4)]
+            row_dst = dst_view[dst_row_start:dst_row_start + (width * 3)]
+            row_dst[0::3] = row_slice[0::4]
+            row_dst[1::3] = row_slice[1::4]
+            row_dst[2::3] = row_slice[2::4]
+            src_row_start += row_stride
+            dst_row_start += width * 3
+        return bytes(result)
+
+    def _encode_plain_rle_32bpp_native(self, pixels: list[int]) -> bytes:
+        result = bytearray()
+        index = 0
+        while index < len(pixels):
+            pixel = pixels[index]
+            run_length = 1
+            while index + run_length < len(pixels) and pixels[index + run_length] == pixel:
+                run_length += 1
+            result.extend(self._pixel32_native_to_cpixel_bytes(pixel))
+            self._encode_run_length_into(result, run_length)
+            index += run_length
+        return bytes(result)
+
+    def _pixel32_native_to_cpixel_bytes(self, pixel: int) -> bytes:
+        return pixel.to_bytes(4, "little")[:3]
+
+    def _solid_pixel_32bpp(self, frame_view: memoryview, fb_width: int,
+                           tile_x: int, tile_y: int, width: int, height: int,
+                           byte_offset: int) -> int | None:
+        first_offset = ((tile_y * fb_width) + tile_x) * 4 + byte_offset
+        first_pixel = (
+            (frame_view[first_offset] << 16)
+            | (frame_view[first_offset + 1] << 8)
+            | frame_view[first_offset + 2]
+        )
+
+        row_stride = fb_width * 4
+        row_start = ((tile_y * fb_width) + tile_x) * 4 + byte_offset
+        for _ in range(height):
+            offset = row_start
+            for _ in range(width):
+                pixel = (
+                    (frame_view[offset] << 16)
+                    | (frame_view[offset + 1] << 8)
+                    | frame_view[offset + 2]
+                )
+                if pixel != first_pixel:
+                    return None
+                offset += 4
+            row_start += row_stride
+        return first_pixel
+
+    def _analyze_tile_fast_32bpp(self, frame_view: memoryview, fb_width: int,
+                                 tile_x: int, tile_y: int, width: int, height: int,
+                                 byte_offset: int, pixel_count: int) -> dict[str, bool]:
+        if pixel_count <= 64:
+            return {
+                "prefer_raw": False,
+                "run_friendly": True,
+                "palette_candidate": True,
+            }
+
+        sample_pixels = min(pixel_count, 128)
+        step = max(1, pixel_count // sample_pixels)
+        row_stride = fb_width * 4
+        row = 0
+        col = 0
+        first_offset = ((tile_y * fb_width) + tile_x) * 4 + byte_offset
+        first_pixel = (
+            (frame_view[first_offset] << 16)
+            | (frame_view[first_offset + 1] << 8)
+            | frame_view[first_offset + 2]
+        )
+        previous = first_pixel
+        unique = {first_pixel}
+        repeat_pairs = 0
+        samples_seen = 1
+
+        for _ in range(1, sample_pixels):
+            col += step
+            while col >= width:
+                col -= width
+                row += 1
+                if row >= height:
+                    row = height - 1
+                    col = width - 1
+                    break
+            offset = (((tile_y + row) * fb_width) + tile_x + col) * 4 + byte_offset
+            pixel = (
+                (frame_view[offset] << 16)
+                | (frame_view[offset + 1] << 8)
+                | frame_view[offset + 2]
+            )
+            if pixel == previous:
+                repeat_pairs += 1
+            previous = pixel
+            unique.add(pixel)
+            samples_seen += 1
+            if len(unique) > self.fast_raw_unique_threshold:
+                return {
+                    "prefer_raw": True,
+                    "run_friendly": False,
+                    "palette_candidate": False,
+                }
+
+        run_ratio = repeat_pairs / max(1, samples_seen - 1)
+        palette_candidate = len(unique) <= self.fast_palette_max_colors
+        prefer_raw = (not palette_candidate) and run_ratio < self.fast_raw_run_ratio_threshold
+        return {
+            "prefer_raw": prefer_raw,
+            "run_friendly": run_ratio >= self.fast_raw_run_ratio_threshold,
+            "palette_candidate": palette_candidate,
+        }
+
+    def _extract_tile_pixels_32bpp(self, frame_view: memoryview, fb_width: int,
+                                   tile_x: int, tile_y: int, width: int, height: int,
+                                   byte_offset: int) -> list[int]:
+        pixels: list[int] = []
+        pixels_extend = pixels.extend
+        row_stride = fb_width * 4
+        row_start = ((tile_y * fb_width) + tile_x) * 4 + byte_offset
+        for _ in range(height):
+            row_pixels = [
+                (frame_view[offset] << 16)
+                | (frame_view[offset + 1] << 8)
+                | frame_view[offset + 2]
+                for offset in range(row_start, row_start + (width * 4), 4)
+            ]
+            pixels_extend(row_pixels)
+            row_start += row_stride
+        return pixels
+
+    def _build_raw_tile_32bpp(self, frame_view: memoryview, fb_width: int,
+                              tile_x: int, tile_y: int, width: int, height: int,
+                              byte_offset: int) -> bytes:
+        result = bytearray(width * height * 3)
+        dst_view = memoryview(result)
+        row_stride = fb_width * 4
+        src_row_start = ((tile_y * fb_width) + tile_x) * 4
+        dst_row_start = 0
+        for _ in range(height):
+            row_slice = frame_view[src_row_start:src_row_start + (width * 4)]
+            row_dst = dst_view[dst_row_start:dst_row_start + (width * 3)]
+            row_dst[0::3] = row_slice[byte_offset + 0::4]
+            row_dst[1::3] = row_slice[byte_offset + 1::4]
+            row_dst[2::3] = row_slice[byte_offset + 2::4]
+            src_row_start += row_stride
+            dst_row_start += width * 3
+        return bytes(result)
+
+    def _is_solid_tile(self, pixel_data: PixelData, pixel_size: int) -> bool:
+        if len(pixel_data) <= pixel_size:
+            return True
+        first = pixel_data[:pixel_size]
+        for offset in range(pixel_size, len(pixel_data), pixel_size):
+            if pixel_data[offset:offset + pixel_size] != first:
+                return False
+        return True
+
+    def _analyze_tile_fast(self, pixel_data: PixelData, pixel_size: int,
+                           pixel_count: int) -> dict[str, bool]:
+        """Cheap tile heuristics to avoid expensive TRLE analysis on obviously high-entropy tiles."""
+        if pixel_count <= 64:
+            return {
+                "prefer_raw": False,
+                "run_friendly": True,
+                "palette_candidate": True,
+            }
+
+        view = memoryview(pixel_data)
+        sample_pixels = min(pixel_count, 128)
+        step = max(1, pixel_count // sample_pixels)
+        sample_step = step * pixel_size
+        first = bytes(view[:pixel_size])
+        previous = first
+        unique: set[bytes] = {first}
+        repeat_pairs = 0
+        samples_seen = 1
+
+        for offset in range(sample_step, len(pixel_data), sample_step):
+            pixel = bytes(view[offset:offset + pixel_size])
+            if pixel == previous:
+                repeat_pairs += 1
+            previous = pixel
+            unique.add(pixel)
+            samples_seen += 1
+            if len(unique) > self.fast_raw_unique_threshold:
+                return {
+                    "prefer_raw": True,
+                    "run_friendly": False,
+                    "palette_candidate": False,
+                }
+
+        run_ratio = repeat_pairs / max(1, samples_seen - 1)
+        palette_candidate = len(unique) <= self.fast_palette_max_colors
+        prefer_raw = (not palette_candidate) and run_ratio < self.fast_raw_run_ratio_threshold
+        return {
+            "prefer_raw": prefer_raw,
+            "run_friendly": run_ratio >= self.fast_raw_run_ratio_threshold,
+            "palette_candidate": palette_candidate,
+        }
+
+    def _split_pixels(self, pixel_data: PixelData, pixel_size: int) -> list[int]:
         usable = len(pixel_data) - (len(pixel_data) % pixel_size)
+        if usable <= 0:
+            return []
+
+        view = memoryview(pixel_data)
+        if pixel_size == 1:
+            return list(view[:usable])
+        if pixel_size == 2:
+            return [(view[offset] << 8) | view[offset + 1] for offset in range(0, usable, 2)]
+        if pixel_size == 3:
+            return [
+                (view[offset] << 16) | (view[offset + 1] << 8) | view[offset + 2]
+                for offset in range(0, usable, 3)
+            ]
         return [
-            bytes(pixel_data[offset:offset + pixel_size])
+            int.from_bytes(view[offset:offset + pixel_size], "big")
             for offset in range(0, usable, pixel_size)
         ]
 
-    def _palette_in_order(self, pixels: list[bytes], limit: int) -> list[bytes]:
-        palette: list[bytes] = []
-        seen: dict[bytes, int] = {}
+    def _palette_in_order(self, pixels: list[int], limit: int) -> list[int]:
+        palette: list[int] = []
+        seen: dict[int, int] = {}
         for pixel in pixels:
             if pixel in seen:
                 continue
@@ -921,7 +1552,7 @@ class ZRLEEncoder:
                 return []
         return palette
 
-    def _encode_plain_rle(self, pixels: list[bytes]) -> bytes:
+    def _encode_plain_rle(self, pixels: list[int], pixel_size: int) -> bytes:
         result = bytearray()
         index = 0
         while index < len(pixels):
@@ -929,12 +1560,12 @@ class ZRLEEncoder:
             run_length = 1
             while index + run_length < len(pixels) and pixels[index + run_length] == pixel:
                 run_length += 1
-            result.extend(pixel)
-            result.extend(self._encode_run_length(run_length))
+            result.extend(self._pixel_to_bytes(pixel, pixel_size))
+            self._encode_run_length_into(result, run_length)
             index += run_length
         return bytes(result)
 
-    def _encode_palette_rle(self, pixels: list[bytes], palette: list[bytes]) -> bytes:
+    def _encode_palette_rle(self, pixels: list[int], palette: list[int]) -> bytes:
         palette_index = {pixel: idx for idx, pixel in enumerate(palette)}
         result = bytearray()
         index = 0
@@ -948,7 +1579,7 @@ class ZRLEEncoder:
                 result.append(idx)
             else:
                 result.append(idx + 128)
-                result.extend(self._encode_run_length(run_length))
+                self._encode_run_length_into(result, run_length)
             index += run_length
         return bytes(result)
 
@@ -961,7 +1592,14 @@ class ZRLEEncoder:
         encoded.append(remaining)
         return bytes(encoded)
 
-    def _encode_packed_palette(self, pixels: list[bytes], palette: list[bytes],
+    def _encode_run_length_into(self, result: bytearray, run_length: int) -> None:
+        remaining = max(0, run_length - 1)
+        while remaining >= 255:
+            result.append(255)
+            remaining -= 255
+        result.append(remaining)
+
+    def _encode_packed_palette(self, pixels: list[int], palette: list[int],
                                width: int, height: int) -> bytes:
         palette_index = {pixel: idx for idx, pixel in enumerate(palette)}
         palette_size = len(palette)
@@ -989,6 +1627,11 @@ class ZRLEEncoder:
                 current_byte <<= (8 - used_bits)
                 result.append(current_byte)
         return bytes(result)
+
+    def _pixel_to_bytes(self, pixel: int, pixel_size: int) -> bytes:
+        if pixel_size == 1:
+            return bytes((pixel & 0xFF,))
+        return pixel.to_bytes(pixel_size, "big")
 
 
 class EncoderManager:

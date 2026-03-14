@@ -21,6 +21,10 @@ def _server_without_init() -> VNCServerV3:
     server = VNCServerV3.__new__(VNCServerV3)
     server.input_control_policy = 'single-controller'
     server.tight_stream_reset_for_ultravnc = False
+    server.lan_prefer_zlib = False
+    server.lan_zlib_area_threshold = 0.20
+    server.lan_zlib_min_pixels = 131072
+    server.lan_tight_compression_level = 2
     server._input_control_lock = threading.Lock()
     server._input_controller_client_id = None
     server._input_control_rejections_logged = set()
@@ -214,10 +218,10 @@ def test_split_rectangles_for_tight_matches_reference_style_limits():
     split = server._split_rectangles_for_encoding(7, 0, 0, 1920, 1080)
 
     assert len(split) > 1
-    assert split[0] == (0, 0, 256, 64)
-    assert split[1] == (256, 0, 256, 64)
-    assert split[-1][2] <= 256
-    assert split[-1][3] <= 64
+    assert split[0] == (0, 0, 1920, 273)
+    assert split[1] == (0, 273, 1920, 273)
+    assert split[-1][2] <= 2048
+    assert split[-1][3] <= 273
 
 
 def test_capture_frame_uses_captureframe_api_when_available():

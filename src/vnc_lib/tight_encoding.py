@@ -57,6 +57,7 @@ class TightEncoder:
     COMPRESSION_MAX = 9
     COMPRESSION_DEFAULT = 6
     MIN_TO_COMPRESS = 12
+    PALETTE_MAX_PIXELS = 16384
 
     def __init__(self, compression_level: int = COMPRESSION_DEFAULT):
         """
@@ -77,6 +78,7 @@ class TightEncoder:
         }
         self._compressor_lock = threading.Lock()
         self._reset_stream_each_rect = False
+        self._rgb_conversion_buffer = bytearray()
 
     def encode(self, pixel_data: PixelData, width: int, height: int,
                bytes_per_pixel: int) -> EncodedData:
@@ -93,24 +95,39 @@ class TightEncoder:
             self.logger.warning(f"Tight: unsupported bpp {bytes_per_pixel}, using raw")
             return self._encode_raw(pixel_data, width, height, bytes_per_pixel)
 
-        # Tight true-color payload is RGB TPIXEL (3 bytes). The server's native
-        # framebuffer is BGRX for 32bpp, so normalize upfront to avoid malformed
-        # palette/fill payloads and channel swaps in clients.
         if bytes_per_pixel == 4:
+            # Avoid full-frame BGRX->RGB conversion for fill/palette paths.
+            if self._is_solid_fill(pixel_data, bytes_per_pixel):
+                return self._encode_fill_bgrx(pixel_data)
+
+            palette_bgrx = self._extract_palette(
+                pixel_data,
+                bytes_per_pixel,
+                max_colors=256,
+                max_pixels=self.PALETTE_MAX_PIXELS,
+            )
+            if palette_bgrx and len(palette_bgrx) <= 256:
+                return self._encode_palette_bgrx(pixel_data, width, height, palette_bgrx)
+
             tight_pixels = self._convert_bgrx_to_rgb(pixel_data)
             tight_bpp = 3
         else:
             tight_pixels = pixel_data
             tight_bpp = bytes_per_pixel
 
-        # Solid color fill — 4 bytes for entire rectangle
-        if self._is_solid_fill(tight_pixels, tight_bpp):
-            return self._encode_fill(tight_pixels, tight_bpp)
+            # Solid color fill — 4 bytes for entire rectangle
+            if self._is_solid_fill(tight_pixels, tight_bpp):
+                return self._encode_fill(tight_pixels, tight_bpp)
 
-        # Palette encoding — very efficient for text, buttons, window chrome
-        palette = self._extract_palette(tight_pixels, tight_bpp, max_colors=256)
-        if palette and len(palette) <= 256:
-            return self._encode_palette(tight_pixels, width, height, tight_bpp, palette)
+            # Palette encoding — very efficient for text, buttons, window chrome
+            palette = self._extract_palette(
+                tight_pixels,
+                tight_bpp,
+                max_colors=256,
+                max_pixels=self.PALETTE_MAX_PIXELS,
+            )
+            if palette and len(palette) <= 256:
+                return self._encode_palette(tight_pixels, width, height, tight_bpp, palette)
 
         # Gradient filter disabled — pure-Python nested loop is too CPU-expensive
         # for LAN targets. _apply_gradient_filter is O(width*height*bpp) per-pixel.
@@ -120,19 +137,21 @@ class TightEncoder:
         # Default: basic zlib compression (with TPIXEL 3-byte format for 32bpp)
         return self._encode_basic(tight_pixels, width, height, tight_bpp)
 
-    def _convert_bgrx_to_rgb(self, pixel_data: PixelData) -> PixelData:
-        """Convert BGRX pixels to Tight RGB TPIXEL bytes."""
+    def _convert_bgrx_to_rgb(self, pixel_data: PixelData) -> memoryview:
+        """Convert BGRX pixels to Tight RGB TPIXEL bytes using a reusable buffer."""
         if not pixel_data:
-            return b""
+            return memoryview(bytearray())
 
         num_pixels = len(pixel_data) // 4
         src = memoryview(pixel_data)
-        rgb_buf = bytearray(num_pixels * 3)
-        dst = memoryview(rgb_buf)
+        required_size = num_pixels * 3
+        if len(self._rgb_conversion_buffer) != required_size:
+            self._rgb_conversion_buffer = bytearray(required_size)
+        dst = memoryview(self._rgb_conversion_buffer)
         dst[0::3] = src[2::4]  # R
         dst[1::3] = src[1::4]  # G
         dst[2::3] = src[0::4]  # B
-        return bytes(rgb_buf)
+        return dst
 
     def _is_solid_fill(self, pixel_data: PixelData, bpp: int,
                        num_samples: int = 256) -> bool:
@@ -176,6 +195,21 @@ class TightEncoder:
 
         return result
 
+    def _encode_fill_bgrx(self, pixel_data: PixelData) -> EncodedData:
+        """Encode solid-color BGRX input directly as Tight RGB TPIXEL."""
+        if len(pixel_data) < 4:
+            return bytes([TightCompressionControl.FILL])
+        b = pixel_data[0]
+        g = pixel_data[1]
+        r = pixel_data[2]
+        result = struct.pack("B", TightCompressionControl.FILL) + bytes((r, g, b))
+        self.logger.debug(
+            "Tight FILL (BGRX): %d -> %d bytes",
+            len(pixel_data),
+            len(result),
+        )
+        return result
+
     def _extract_palette(self, pixel_data: PixelData, bpp: int,
                         max_colors: int = 256,
                         max_pixels: int = 65536) -> list[bytes] | None:
@@ -200,6 +234,37 @@ class TightEncoder:
                 return None
 
         return list(unique_colors)
+
+    def _encode_palette_bgrx(self, pixel_data: PixelData, width: int, height: int,
+                             palette_bgrx: list[bytes]) -> EncodedData:
+        """Encode a BGRX framebuffer region using Tight palette mode without pre-converting the full buffer."""
+        num_colors = len(palette_bgrx)
+        if num_colors > 256:
+            return self._encode_basic(self._convert_bgrx_to_rgb(pixel_data), width, height, 3)
+
+        stream_id = self.STREAM_MONO if num_colors == 2 else self.STREAM_PALETTE
+        reset_mask = (1 << stream_id) if self._reset_stream_each_rect else 0
+        control_nibble = stream_id | 0x04
+        control = (control_nibble << 4) | reset_mask
+
+        result = bytearray([control, TightCompressionControl.FILTER_PALETTE, num_colors - 1])
+        palette_map = {color: idx for idx, color in enumerate(palette_bgrx)}
+        for color in palette_bgrx:
+            result.extend((color[2], color[1], color[0]))
+
+        if num_colors == 2:
+            indices = self._pack_indices_1bit(pixel_data, 4, palette_map, width, height)
+        else:
+            indices = self._pack_indices_8bit(pixel_data, 4, palette_map)
+
+        if len(indices) < self.MIN_TO_COMPRESS:
+            result.extend(indices)
+        else:
+            compressed = self._compress_with_stream(indices, stream_id)
+            result.extend(self._encode_compact_length(len(compressed)))
+            result.extend(compressed)
+
+        return bytes(result)
 
     def _encode_palette(self, pixel_data: PixelData, width: int, height: int,
                        bpp: int, palette: list[bytes]) -> EncodedData:
@@ -473,10 +538,10 @@ class TightEncoder:
         result.extend(compressed)
 
         compression_ratio = len(tight_bytes) / len(result) if len(result) > 0 else 0
-        self.logger.info(f"Tight BASIC: {len(pixel_data)} -> {len(result)} bytes "
-                        f"({compression_ratio:.1f}x), "
-                        f"control=0x{control:02x}, stream={stream_id}, "
-                        f"compressed_len={len(compressed)}")
+        self.logger.debug(f"Tight BASIC: {len(pixel_data)} -> {len(result)} bytes "
+                         f"({compression_ratio:.1f}x), "
+                         f"control=0x{control:02x}, stream={stream_id}, "
+                         f"compressed_len={len(compressed)}")
         self.logger.debug(f"First 32 bytes: {result[:32].hex()}")
 
         return bytes(result)
@@ -542,6 +607,13 @@ class TightEncoder:
             for i in range(4)
         }
         self.logger.debug("Tight encoder compressors reset")
+
+    def set_compression_level(self, level: int) -> None:
+        """Update compression level and reset stream state only when the level changes."""
+        new_level = max(self.COMPRESSION_MIN, min(self.COMPRESSION_MAX, int(level)))
+        if new_level != self.compression_level:
+            self.compression_level = new_level
+            self.reset_compressors()
 
     def set_stream_reset_mode(self, enabled: bool):
         """

@@ -144,6 +144,9 @@ class VNCServerV3:
         self.lan_zrle_compression_level = max(
             1, min(9, int(self.config.get('lan_zrle_compression_level', 2)))
         )
+        self.lan_tight_compression_level = max(
+            1, min(9, int(self.config.get('lan_tight_compression_level', 2)))
+        )
         # Protocol and WebSocket safety limits
         self.max_set_encodings = max(
             1, int(self.config.get('max_set_encodings', RFBProtocol.DEFAULT_MAX_SET_ENCODINGS))
@@ -702,11 +705,6 @@ class VNCServerV3:
         )
         target_frame_time = 1.0 / max_frame_rate if max_frame_rate > 0 else 0.0
         lan_jpeg_quality = self.lan_jpeg_quality_initial
-        lan_zlib_enabled_runtime = self.lan_prefer_zlib
-        lan_zlib_disable_gap_s = (
-            max(100, int(getattr(self, 'lan_zlib_disable_if_request_gap_ms', 1500))) / 1000.0
-        )
-        last_fburq_time: float | None = None
         if lan_adaptive:
             self._configure_lan_encoders(encoder_manager, lan_jpeg_quality)
         parallel_enabled_for_client = parallel_encoder is not None
@@ -769,19 +767,6 @@ class VNCServerV3:
                             )
 
                     case protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
-                        now = time.perf_counter()
-                        if (
-                            lan_zlib_enabled_runtime
-                            and last_fburq_time is not None
-                            and (now - last_fburq_time) >= lan_zlib_disable_gap_s
-                        ):
-                            lan_zlib_enabled_runtime = False
-                            self.logger.info(
-                                "Disabling LAN zlib for this client due to slow request cadence "
-                                f"({now - last_fburq_time:.2f}s gap)"
-                            )
-                        last_fburq_time = now
-
                         request = protocol.parse_framebuffer_update_request(client_socket)
                         if self.enable_request_coalescing:
                             request = self._coalesce_framebuffer_update_requests(
@@ -1543,9 +1528,9 @@ class VNCServerV3:
         if encoding_type != 7:
             return [(x, y, width, height)]
 
-        max_rect_size = 16384
-        max_rect_width = 256
-        if width <= 2048 and width * height <= (max_rect_size // 4):
+        max_rect_size = 524288
+        max_rect_width = 2048
+        if width <= 2048 and width * height <= max_rect_size:
             return [(x, y, width, height)]
 
         split_rects: list[tuple[int, int, int, int]] = []
@@ -1633,9 +1618,19 @@ class VNCServerV3:
                                 jpeg_quality: int) -> None:
         """Apply LAN-specific encoder settings."""
         zrle_encoder = encoder_manager.encoders.get(16)
-        if zrle_encoder is not None and hasattr(zrle_encoder, 'compression_level'):
+        if zrle_encoder is not None:
             try:
-                zrle_encoder.compression_level = self.lan_zrle_compression_level
+                if hasattr(zrle_encoder, 'set_compression_level'):
+                    zrle_encoder.set_compression_level(self.lan_zrle_compression_level)
+                elif hasattr(zrle_encoder, 'compression_level'):
+                    zrle_encoder.compression_level = self.lan_zrle_compression_level
+            except Exception:
+                pass
+
+        tight_encoder = encoder_manager.encoders.get(7)
+        if tight_encoder is not None and hasattr(tight_encoder, 'set_compression_level'):
+            try:
+                tight_encoder.set_compression_level(self.lan_tight_compression_level)
             except Exception:
                 pass
 
@@ -1842,14 +1837,23 @@ class VNCServerV3:
         )
         encoders = encoder_manager.encoders
 
-        for enc_type in ordered_client_encodings:
+        def available(enc_type: int) -> bool:
             if enc_type not in encoders:
-                continue
+                return False
             if not self._encoding_supported_for_pixel_format(enc_type, pixel_format):
+                return False
+            if enc_type == 1 and not allow_copyrect:
+                return False
+            if enc_type == 21 and (not allow_jpeg or bytes_per_pixel not in (3, 4)):
+                return False
+            if enc_type == 6 and not allow_zlib:
+                return False
+            return True
+
+        for enc_type in ordered_client_encodings:
+            if not available(enc_type):
                 continue
             if enc_type == 1:
-                if not allow_copyrect:
-                    continue
                 encoder = encoders[enc_type]
                 payload = encoder.encode_copyrect(
                     full_frame,
@@ -1864,11 +1868,6 @@ class VNCServerV3:
                 )
                 if payload is not None:
                     return enc_type, encoder, payload
-                continue
-            if enc_type == 21:
-                if not allow_jpeg or bytes_per_pixel not in (3, 4):
-                    continue
-            if enc_type == 6 and not allow_zlib:
                 continue
 
             encoder = encoders[enc_type]

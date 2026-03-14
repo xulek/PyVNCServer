@@ -213,6 +213,7 @@ python examples/python313_features_demo.py
 python benchmarks/benchmark_lan_latency.py 127.0.0.1 5900 20
 python benchmarks/benchmark_screen_capture.py
 python benchmarks/benchmark_screen_capture_methods.py 20
+python benchmarks/benchmark_encoders.py
 ```
 
 For real runtime capture cost on the active backend, set for example:

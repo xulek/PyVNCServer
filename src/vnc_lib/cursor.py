@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Cursor handling and encoding for VNC
 Implements cursor pseudo-encoding (RFC 6143 Section 7.8.1)

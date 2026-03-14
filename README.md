@@ -209,7 +209,7 @@ python benchmarks/benchmark_screen_capture_methods.py 20
 
 ```bash
 python -m pytest tests/ -v --tb=short
-python -m pytest tests/ -v --cov=vnc_lib --cov-report=term-missing
+python -m pytest tests/ -v --cov=pyvncserver --cov=vnc_lib --cov-report=term-missing
 ```
 
 ## Project Layout

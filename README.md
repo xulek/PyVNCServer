@@ -1,197 +1,258 @@
-# PyVNCServer
+<p align="center">
+  <h1 align="center">PyVNCServer</h1>
+  <p align="center">
+    <strong>A feature-rich RFB/VNC server written in pure Python</strong>
+  </p>
+  <p align="center">
+    <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.13+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.13+"></a>&nbsp;
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License"></a>&nbsp;
+    <a href="https://github.com/xulek/PyVNCServer/actions"><img src="https://img.shields.io/badge/CI-passing-brightgreen?style=for-the-badge&logo=github-actions&logoColor=white" alt="CI"></a>&nbsp;
+    <a href="#"><img src="https://img.shields.io/badge/version-3.2.0-blue?style=for-the-badge" alt="Version 3.2.0"></a>
+  </p>
+</p>
 
-[![Python Version](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+---
 
-PyVNCServer is an RFB (VNC) server implementation in Python. The repository combines:
-- a packaged runtime in `src/pyvncserver/`
-- reusable protocol/encoding modules
-- browser client assets (`web/`)
-- demos, tests, and benchmarks
+PyVNCServer is an [RFC 6143](https://datatracker.ietf.org/doc/html/rfc6143)-compliant VNC server that captures your desktop and streams it to any VNC viewer. It supports multiple encodings, adaptive compression, WebSocket transport for browser access via [noVNC](https://novnc.com/), and network-aware performance tuning -- all from a single Python package.
 
-## Scope
+## Highlights
 
-The supported entrypoint is the packaged CLI in `pyvncserver`.
+<table>
+<tr>
+<td width="50%">
 
-The `src/pyvncserver/` package is the runtime source of truth.
-The bundled `src/vnc_lib/` package remains as an internal support library inside the packaged layout.
+**Protocol & Security**
+- RFB 3.3 / 3.7 / 3.8 negotiation
+- No-auth, VNC Authentication, TightVNC Security (type 16)
+- Read-only password support
+- Multi-client with configurable input arbitration
 
-## Implemented Capabilities
+</td>
+<td width="50%">
 
-### Server Runtime (`pyvncserver`)
-- RFB protocol negotiation for versions 3.3, 3.7, and 3.8
-- Security: `None` and `VNC Authentication`
-- Encodings: Raw, RRE, Hextile, Zlib
-- Optional encoders: Tight, JPEG, H.264 (H.264 requires extra dependencies)
-- Incremental updates with adaptive change detection
-- Desktop size update support via pseudo-encoding
-- Network profile tuning (`localhost`, `lan`, `wan`) for frame rate and socket behavior
-- Optional WebSocket transport support for browser clients
-- Connection pool, health checks, and per-connection metrics
-- Optional parallel region encoding
+**Encodings**
+- **Core:** Raw, RRE, Hextile, Zlib, CopyRect
+- **Advanced:** ZRLE, Tight, JPEG
+- **Experimental:** H.264 (requires PyAV)
+- Adaptive per-rectangle encoder selection
 
-### Library Modules (`vnc_lib/`)
-- Session recording and playback (`session_recorder.py`)
-- Clipboard message parsing and synchronization helpers (`clipboard.py`)
-- Prometheus metrics exporter (`prometheus_exporter.py`)
-- Structured logging helpers (`structured_logging.py`)
-- Performance monitoring utilities (`metrics.py`, `performance_monitor.py`)
+</td>
+</tr>
+<tr>
+<td>
 
-## Requirements
+**Performance**
+- LAN-tuned adaptive encoding with auto thresholds
+- Parallel region encoding with thread pool
+- Tile-grid incremental change detection
+- Request coalescing to reduce lag
+- Runtime capture backend failover
 
-- Python 3.13+ (CI is configured for Python 3.13)
-- GUI-capable environment for screen capture and input simulation
-- Dependencies from `requirements.txt`:
-  - `dxcam` (optional Windows DXGI/Desktop Duplication backend)
-  - `mss` (preferred capture backend)
-  - `Pillow`
-  - `pyautogui`
-  - `pycryptodome`
-  - `numpy`
-- Optional for H.264:
-  - `av` (PyAV) and FFmpeg libraries
+</td>
+<td>
 
-## Installation
+**Platform & Transport**
+- Screen capture: DXGI (dxcam), MSS, PIL fallback
+- Native cursor capture & RichCursor pseudo-encoding
+- Desktop resize (ExtendedDesktopSize)
+- WebSocket on the same port -- no websockify needed
+- Bundled noVNC web client
+
+</td>
+</tr>
+</table>
+
+## Quick Start
+
+### 1. Install
 
 ```bash
 git clone https://github.com/xulek/PyVNCServer.git
 cd PyVNCServer
-python -m pip install --upgrade pip
-python -m pip install -e .[dev]
+pip install -e .[dev]
 ```
 
-For a checkout-only workflow without installation, point Python at `src/` first:
+<details>
+<summary><b>Alternative: run without installing</b></summary>
 
 ```powershell
+# PowerShell
 $env:PYTHONPATH = "src"
 python -m pyvncserver --help
 ```
 
-For the optional Windows DXGI capture backend:
-
-```powershell
-python -m pip install -e .[windows-capture]
+```bash
+# Bash
+PYTHONPATH=src python -m pyvncserver --help
 ```
 
-## Quick Start
+</details>
 
-1. Review `config/pyvncserver.toml` and set at least `host`, `port`, and `password`.
-   Optionally set `read_only_password` for a TightVNC-style view-only login.
-   The shipped default is currently tuned for LAN quality/performance
-   (`network_profile_override` is set to `"lan"`).
-2. Start the server:
+<details>
+<summary><b>Optional: Windows DXGI capture backend</b></summary>
+
+```bash
+pip install -e .[windows-capture]
+```
+
+Provides hardware-accelerated screen capture via Desktop Duplication API. Falls back to MSS automatically if unavailable.
+
+</details>
+
+### 2. Configure
+
+Edit `config/pyvncserver.toml` -- set at least `password` for authentication:
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 5900
+password = "secret"
+```
+
+### 3. Run
 
 ```bash
 pyvncserver serve --config config/pyvncserver.toml
 ```
 
-Without `pip install -e .`, use:
-
-```powershell
-$env:PYTHONPATH = "src"
-python -m pyvncserver serve --config config/pyvncserver.toml
-```
-
-3. Connect with a VNC client (example):
+### 4. Connect
 
 ```bash
 vncviewer localhost:5900
 ```
 
-If you want automatic profile detection (`localhost`/`lan`/`wan`) instead of
-forced LAN mode, set `network_profile_override = ""` or remove that key in `config/pyvncserver.toml`.
-
 ## Browser Access (WebSocket + noVNC)
 
-1. Set `enable_websocket = true` in `[features]`.
-2. Set `allowed_origins = ["http://localhost:8000"]` in `[websocket]`.
-3. Start the VNC server:
+PyVNCServer serves WebSocket and standard VNC on the **same port** -- no external proxy required.
+
+**1.** Enable WebSocket in `config/pyvncserver.toml`:
+
+```toml
+[features]
+enable_websocket = true
+
+[websocket]
+allowed_origins = ["http://localhost:8000"]
+```
+
+**2.** Start the VNC server, then serve the web client:
 
 ```bash
 pyvncserver serve --config config/pyvncserver.toml
+python -m http.server 8000                              # separate terminal
 ```
 
-4. Serve web assets from project root:
+**3.** Open [`http://localhost:8000/web/vnc_client.html`](http://localhost:8000/web/vnc_client.html) in your browser.
 
-```bash
-python -m http.server 8000
-```
+> For production `wss://` transport, terminate TLS at a reverse proxy (e.g. Nginx). See [`WEBSOCKET.md`](WEBSOCKET.md) for details and an Nginx config example.
 
-5. Open:
+## Configuration Reference
 
-`http://localhost:8000/web/vnc_client.html`
+All settings live in [`config/pyvncserver.toml`](config/pyvncserver.toml), organized into sections:
 
-Additional details are documented in `WEBSOCKET.md` and `web/README_NOVNC.md`.
+<details>
+<summary><b><code>[server]</code> -- Core server settings</b></summary>
 
-## Configuration
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `host` | `str` | `"0.0.0.0"` | Bind address |
+| `port` | `int` | `5900` | VNC port |
+| `password` | `str` | `""` | VNC password (empty = no auth) |
+| `read_only_password` | `str` | `""` | Optional view-only password |
+| `frame_rate` | `int` | `30` | Target FPS (WAN profile) |
+| `lan_frame_rate` | `int` | `90` | Target FPS (LAN profile) |
+| `network_profile_override` | `str\|null` | `"lan"` | Force `localhost`, `lan`, `wan`, or auto-detect (`""`) |
+| `scale_factor` | `float` | `1.0` | Capture scaling factor |
+| `capture_backend` | `str` | `"auto"` | `auto`, `dxcam`, `mss`, or `pil` |
+| `capture_probe_frames` | `int` | `0` | Startup capture latency probe samples |
+| `capture_probe_warn_ms` | `float` | `40.0` | Probe warning threshold (ms) |
+| `max_connections` | `int` | `10` | Maximum simultaneous clients |
+| `client_socket_timeout` | `float` | `60.0` | Per-client read timeout (seconds) |
+| `input_control_policy` | `str` | `"single-controller"` | `single-controller` or `shared` |
 
-The repository ships with a ready-to-edit `config/pyvncserver.toml`. Runtime keys map to the following values:
+</details>
 
-| Key | Type | Description |
+<details>
+<summary><b><code>[features]</code> -- Feature toggles</b></summary>
+
+| Key | Default | Description |
 |---|---|---|
-| `host` | `str` | Bind address |
-| `port` | `int` | VNC port |
-| `password` | `str` | Empty string disables auth |
-| `read_only_password` | `str` | Optional secondary password that authenticates the client as view-only |
-| `frame_rate` | `int` | Target FPS for WAN profile |
-| `lan_frame_rate` | `int` | Target FPS for LAN profile |
-| `enable_tight_security` | `bool` | Advertise Tight security type 16 and perform TightVNC-style auth negotiation |
-| `enable_lan_adaptive_encoding` | `bool` | LAN tuning for encoder parameters and transport behavior; encoding order still follows client preference |
-| `enable_request_coalescing` | `bool` | Drops stale framebuffer requests to reduce lag |
-| `lan_raw_area_threshold` | `float` | Area ratio below which Raw is preferred on LAN |
-| `lan_raw_max_pixels` | `int` | Maximum rectangle size (pixels) eligible for Raw on LAN |
-| `lan_prefer_zlib` | `bool` | Legacy tuning flag; no longer overrides client encoding order |
-| `lan_zlib_area_threshold` | `float` | Area ratio above which Zlib is preferred on LAN |
-| `lan_zlib_min_pixels` | `int` | Minimum rectangle size for Zlib consideration on LAN |
-| `lan_zlib_compression_level` | `int` | Zlib compression level used in LAN mode |
-| `lan_zlib_disable_if_request_gap_ms` | `int` | Auto-disable Zlib for client if request gaps are too large |
-| `lan_jpeg_area_threshold` | `float` | Area ratio above which JPEG is preferred on LAN |
-| `lan_jpeg_min_pixels` | `int` | Minimum rectangle size for JPEG consideration |
-| `lan_jpeg_quality_initial` | `int` | Initial JPEG quality in adaptive LAN mode |
-| `lan_jpeg_quality_min` | `int` | Lower bound for adaptive JPEG quality |
-| `lan_jpeg_quality_max` | `int` | Upper bound for adaptive JPEG quality |
-| `lan_zrle_compression_level` | `int` | ZRLE compression level used when clients prefer ZRLE |
-| `network_profile_override` | `null \| "localhost" \| "lan" \| "wan"` | Forces profile, bypasses auto-detection |
-| `scale_factor` | `float` | Capture scaling factor |
-| `capture_backend` | `"auto" \| "dxcam" \| "mss" \| "pil"` | Screen capture backend. On Windows, `auto` prefers `dxcam` when available and healthy, then falls back to `mss`, then `pil` |
-| `capture_probe_frames` | `int` | Startup benchmark sample count for real capture latency logging |
-| `capture_probe_warn_ms` | `float` | Warn threshold for startup capture probe; above this, a DXGI-style backend is likely worth evaluating |
-| `max_connections` | `int` | Max simultaneous clients |
-| `client_socket_timeout` | `float` | Per-client read timeout in seconds |
-| `enable_region_detection` | `bool` | Incremental update optimization |
-| `enable_cursor_encoding` | `bool` | Enables Windows RichCursor and PointerPos pseudo-encodings when the client advertises them |
-| `enable_copyrect_encoding` | `bool` | Enables CopyRect negotiation and conservative server-side copy detection |
-| `enable_zrle_encoding` | `bool` | Enables RFC 6143 ZRLE negotiation with 64x64 tiled zlib encoding |
-| `enable_metrics` | `bool` | Internal metrics collection |
-| `enable_tight_encoding` | `bool` | Tight encoder availability |
-| `tight_disable_for_ultravnc` | `bool` | Legacy hard-disable for Tight on UltraVNC-like clients; default `false` |
-| `tight_stream_reset_for_ultravnc` | `bool` | Explicit opt-in Tight stream-reset mode; leave `false` unless a specific decoder requires it |
-| `enable_jpeg_encoding` | `bool` | JPEG encoder availability |
-| `enable_h264_encoding` | `bool` | H.264 encoder availability (requires optional deps) |
-| `enable_parallel_encoding` | `bool` | Parallel region encoding |
-| `encoding_threads` | `int \| null` | Worker count for parallel encoding |
-| `enable_websocket` | `bool` | WebSocket transport support |
-| `websocket_allowed_origins` | `list[str]` | Allowed browser `Origin` values for WebSocket upgrade |
-| `websocket_detect_timeout` | `float` | Timeout for WebSocket request detection |
-| `websocket_max_handshake_bytes` | `int` | Max HTTP upgrade header size |
-| `websocket_max_payload_bytes` | `int` | Max inbound WebSocket frame payload size |
-| `websocket_max_buffer_bytes` | `int` | Max adapter receive buffer size |
-| `input_control_policy` | `"single-controller" \| "shared"` | Multi-client input arbitration policy |
-| `max_set_encodings` | `int` | Max SetEncodings items accepted from client |
-| `max_client_cut_text` | `int` | Max ClientCutText payload accepted from client |
-| `log_level` | `str` | Python logging level |
-| `log_file` | `str \| null` | Optional file logging target |
+| `enable_region_detection` | `true` | Incremental update optimization |
+| `enable_metrics` | `true` | Internal metrics collection |
+| `enable_request_coalescing` | `true` | Drop stale framebuffer requests |
+| `enable_lan_adaptive_encoding` | `true` | LAN-tuned encoder parameter adaptation |
+| `enable_websocket` | `false` | WebSocket transport support |
+| `enable_tight_security` | `true` | TightVNC security type 16 |
+| `enable_cursor_encoding` | `false` | RichCursor & PointerPos pseudo-encodings |
+| `enable_copyrect_encoding` | `true` | CopyRect encoding |
+| `enable_zrle_encoding` | `true` | ZRLE encoding |
+| `enable_tight_encoding` | `true` | Tight encoding |
+| `enable_jpeg_encoding` | `true` | JPEG encoding |
+| `enable_h264_encoding` | `false` | H.264 encoding (requires PyAV) |
+| `enable_parallel_encoding` | `true` | Multi-threaded region encoding |
 
-## CLI And Programmatic Startup
+</details>
 
-CLI supports config and log level overrides:
+<details>
+<summary><b><code>[lan]</code> -- LAN adaptive encoding thresholds</b></summary>
+
+| Key | Default | Description |
+|---|---|---|
+| `raw_area_threshold` | `0.10` | Area ratio below which Raw is preferred |
+| `raw_max_pixels` | `65536` | Max rectangle size eligible for Raw |
+| `zlib_area_threshold` | `0.08` | Area ratio above which Zlib is preferred |
+| `zlib_min_pixels` | `8192` | Min rectangle size for Zlib |
+| `zlib_compression_level` | `2` | Zlib compression level |
+| `zlib_disable_if_request_gap_ms` | `1500` | Disable Zlib if client request gap exceeds this |
+| `jpeg_area_threshold` | `0.20` | Area ratio above which JPEG is preferred |
+| `jpeg_min_pixels` | `16384` | Min rectangle size for JPEG |
+| `jpeg_quality_initial` | `84` | Starting JPEG quality |
+| `jpeg_quality_min` / `max` | `70` / `95` | Adaptive JPEG quality bounds |
+| `zrle_compression_level` | `3` | ZRLE compression level |
+
+</details>
+
+<details>
+<summary><b><code>[websocket]</code> -- WebSocket transport settings</b></summary>
+
+| Key | Default | Description |
+|---|---|---|
+| `allowed_origins` | `[]` | Allowed browser `Origin` values |
+| `detect_timeout` | `0.5` | WebSocket handshake detection timeout |
+| `max_handshake_bytes` | `65536` | Max HTTP upgrade header size |
+| `max_payload_bytes` | `8388608` | Max inbound frame payload (8 MB) |
+| `max_buffer_bytes` | `16777216` | Max receive buffer (16 MB) |
+
+</details>
+
+<details>
+<summary><b><code>[limits]</code> and <code>[logging]</code></b></summary>
+
+| Key | Default | Description |
+|---|---|---|
+| `max_set_encodings` | `1024` | Max SetEncodings items from client |
+| `max_client_cut_text` | `16777216` | Max ClientCutText payload (16 MB) |
+| `encoding_threads` | `0` | Worker threads for parallel encoding (0 = auto) |
+| `log_level` | `"INFO"` | Python logging level |
+| `log_file` | `""` | Optional log file path |
+
+</details>
+
+## CLI Usage
 
 ```bash
+# Start with default config
+pyvncserver serve
+
+# Start with custom config and debug logging
 pyvncserver serve --config config/pyvncserver.toml --log-level DEBUG
-python -m pyvncserver serve --config config/pyvncserver.toml --log-level DEBUG
+
+# Run as Python module (no install required, set PYTHONPATH=src)
+python -m pyvncserver serve --config config/pyvncserver.toml
 ```
 
-Programmatic startup is also available:
+**Programmatic startup:**
 
 ```python
 from pyvncserver import VNCServer
@@ -200,23 +261,60 @@ server = VNCServer(config_file="config/pyvncserver.toml")
 server.start()
 ```
 
-## Examples
+## Project Structure
+
+```
+PyVNCServer/
+├── src/
+│   ├── pyvncserver/            # Packaged application (new code goes here)
+│   │   ├── cli.py              # CLI entrypoint
+│   │   ├── config.py           # TOML config loader
+│   │   ├── app/server.py       # Main VNCServerV3 class
+│   │   ├── rfb/                # Protocol layer (auth, encodings, messages)
+│   │   ├── platform/           # OS integration (capture, cursor, input)
+│   │   ├── runtime/            # Connection pool, network profiles, threading
+│   │   ├── features/           # Clipboard, session recording, WebSocket
+│   │   └── observability/      # Logging, metrics, Prometheus, profiling
+│   └── vnc_lib/                # Internal implementation library
+│       ├── protocol.py         # RFB protocol negotiation
+│       ├── encodings.py        # Encoder implementations + EncoderManager
+│       ├── screen_capture.py   # Screen capture with backend selection
+│       ├── auth.py             # VNC/Tight authentication
+│       └── ...                 # 20+ modules
+├── config/pyvncserver.toml     # Default server configuration
+├── tests/                      # 320+ pytest tests
+├── benchmarks/                 # Performance measurement scripts
+├── examples/                   # Demo scripts
+├── web/                        # noVNC browser client
+└── docs/                       # Architecture & protocol docs
+```
+
+## Testing
 
 ```bash
-python examples/advanced_features_demo.py
-python examples/python313_features_demo.py
+# Full test suite
+python -m pytest tests/ -v --tb=short
+
+# Single test file
+python -m pytest tests/test_encodings.py -v
+
+# Single test
+python -m pytest tests/test_vnc_server.py::TestClassName::test_method -v
+
+# With coverage report
+python -m pytest tests/ --cov=pyvncserver --cov=vnc_lib --cov-report=term-missing
 ```
 
 ## Benchmarks
 
 ```bash
-python benchmarks/benchmark_lan_latency.py 127.0.0.1 5900 20
-python benchmarks/benchmark_screen_capture.py
-python benchmarks/benchmark_screen_capture_methods.py 20
-python benchmarks/benchmark_encoders.py
+python benchmarks/benchmark_encoders.py              # Encoder throughput (Raw/Zlib/Tight/ZRLE)
+python benchmarks/benchmark_screen_capture.py         # Capture backend performance
+python benchmarks/benchmark_screen_capture_methods.py 20  # Comparative backend benchmark
+python benchmarks/benchmark_lan_latency.py 127.0.0.1 5900 20  # Network latency
 ```
 
-For real runtime capture cost on the active backend, set for example:
+To measure real capture latency at startup, set in config:
 
 ```toml
 [server]
@@ -224,36 +322,21 @@ capture_probe_frames = 12
 capture_probe_warn_ms = 40.0
 ```
 
-## Testing
+## Security
 
-```bash
-python -m pytest tests/ -v --tb=short
-python -m pytest tests/ -v --cov=pyvncserver --cov=vnc_lib --cov-report=term-missing
-```
+> **Important:** VNC authentication uses DES-based challenge-response and provides only basic protection. Traffic is **not encrypted** by default.
 
-## Project Layout
-
-```text
-benchmarks/          Performance and latency scripts
-config/              Runtime configuration files
-docs/                Project and architecture documentation
-examples/            Runnable demo scripts
-src/pyvncserver/     Packaged application and library code
-src/vnc_lib/         Internal support modules shipped with the package
-tests/               Unit tests
-web/                 Browser client assets and noVNC integration
-```
-
-## Security Notes
-
-- VNC authentication is DES-based challenge/response and should be treated as legacy protection.
-- Traffic is not encrypted by default.
-- For production, run behind SSH tunneling or TLS-terminating reverse proxy/VPN.
-- Expose the server only on trusted networks.
+For production deployments:
+- Set a strong password in `config/pyvncserver.toml`
+- Run behind SSH tunneling, a VPN, or a TLS-terminating reverse proxy
+- Restrict `allowed_origins` for WebSocket access
+- Bind to `127.0.0.1` if only local access is needed
+- Do not expose directly to untrusted networks
 
 ## Troubleshooting
 
-### No screen capture/input in Linux headless environments
+<details>
+<summary><b>No screen capture or input in Linux headless environments</b></summary>
 
 `pyautogui` and capture backends require a graphical session. For X11:
 
@@ -261,16 +344,49 @@ web/                 Browser client assets and noVNC integration
 export DISPLAY=:0
 ```
 
-For headless servers, run an X server/Xvfb and ensure the process has display access.
+For headless servers, run Xvfb and ensure the process has display access.
 
-### `mss` or `Pillow` import/runtime issues
+</details>
+
+<details>
+<summary><b>Import or runtime issues with <code>mss</code> / <code>Pillow</code></b></summary>
 
 Reinstall dependencies:
 
 ```bash
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
+
+</details>
+
+<details>
+<summary><b>Browser connects but shows nothing</b></summary>
+
+- Verify `enable_websocket = true` in `[features]`
+- Verify `allowed_origins` contains the origin serving the page (e.g., `http://localhost:8000`)
+- Serve the web client over HTTP, not `file://` (ES modules require it)
+- Check that the VNC port is not blocked by a firewall
+
+</details>
+
+## Dependencies
+
+| Package | Purpose |
+|---|---|
+| [mss](https://github.com/BoboTiG/python-mss) | Fast cross-platform screen capture |
+| [Pillow](https://python-pillow.org/) | Image processing and PIL capture fallback |
+| [pyautogui](https://github.com/asweigart/pyautogui) | Keyboard and mouse input simulation |
+| [pycryptodome](https://www.pycryptodome.org/) | DES encryption for VNC authentication |
+| [numpy](https://numpy.org/) | Fast pixel data operations |
+| [dxcam](https://github.com/ra1nty/DXcam) | *(optional)* Windows DXGI Desktop Duplication capture |
+| [PyAV](https://github.com/PyAV-Org/PyAV) | *(optional)* H.264 encoding via FFmpeg |
 
 ## License
 
-MIT. See `LICENSE`.
+This project is licensed under the [MIT License](LICENSE).
+
+---
+
+<p align="center">
+  <sub>Built with Python 3.13+ &bull; RFC 6143 compliant &bull; <a href="https://github.com/xulek/PyVNCServer">github.com/xulek/PyVNCServer</a></sub>
+</p>

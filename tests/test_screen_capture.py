@@ -5,7 +5,8 @@ Tests for screen capture pixel conversion helpers.
 import logging
 import threading
 
-from vnc_lib.screen_capture import ScreenCapture
+from vnc_lib.capture_backends import CaptureFrame
+from vnc_lib.screen_capture import ScreenCapture, CaptureResult
 
 
 def _capture_without_init() -> ScreenCapture:
@@ -18,8 +19,19 @@ def _capture_without_init() -> ScreenCapture:
     cap._np = None
     cap._capture_lock = threading.RLock()
     cap._thread_local = threading.local()
+    cap._active_backend = "none"
+    cap._dxcam_available = False
+    cap._dxcam = None
     cap._mss_available = False
     cap._mss = None
+    cap._pil_available = False
+    cap._ImageGrab = None
+    cap._Image = None
+    cap._cache_ttl = 0.016
+    cap.backend_preference = "auto"
+    cap._backend = None
+    cap._backend_registry = {}
+    cap._build_backend_registry()
     return cap
 
 
@@ -140,3 +152,77 @@ def test_get_mss_session_is_thread_local():
 
     assert thread_result['session'] is not main_session_a
     assert fake_mss.created == 2
+
+
+def test_get_backend_name_reports_active_backend():
+    cap = _capture_without_init()
+    cap._active_backend = "dxcam"
+    assert cap.get_backend_name() == "dxcam"
+
+    cap._active_backend = "mss"
+    assert cap.get_backend_name() == "mss"
+
+    cap._active_backend = "pil"
+    assert cap.get_backend_name() == "pil"
+
+    cap._active_backend = "none"
+    assert cap.get_backend_name() == "none"
+
+
+def test_benchmark_capture_temporarily_disables_cache_and_restores_it():
+    cap = _capture_without_init()
+    calls = []
+
+    def _fake_capture_fast(_pixel_format):
+        calls.append(cap._cache_ttl)
+        return CaptureResult(b"x" * 16, None, 2, 2, 0.010)
+
+    cap.capture_fast = _fake_capture_fast
+
+    stats = cap.benchmark_capture({'bits_per_pixel': 32}, iterations=3, warmup=1)
+
+    assert stats["backend"] == "none"
+    assert stats["iterations"] == 3
+    assert stats["avg_ms"] == 10.0
+    assert calls == [0.0, 0.0, 0.0, 0.0]
+    assert cap._cache_ttl == 0.016
+
+
+def test_apply_backend_preference_selects_dxcam_when_requested():
+    cap = _capture_without_init()
+    cap.backend_preference = "dxcam"
+    cap._dxcam_available = True
+
+    cap._apply_backend_preference()
+
+    assert cap._active_backend == "dxcam"
+
+
+def test_dxcam_frame_to_bgra_supports_rgb_frames():
+    cap = _capture_without_init()
+
+    # RGB pixels: red, green
+    frame = bytes([
+        255, 0, 0,
+        0, 255, 0,
+    ])
+
+    bgra = cap._dxcam_frame_to_bgra(frame, 2, 1, 3, "RGB")
+
+    assert bgra == bytes([
+        0, 0, 255, 0,
+        0, 255, 0, 0,
+    ])
+
+
+def test_capture_frame_includes_backend_metadata():
+    cap = _capture_without_init()
+    cap._backend_registry = {}
+    cap._backend = None
+    cap.capture_fast = lambda _pixel_format: CaptureResult(b"x", None, 1, 1, 0.001)
+
+    frame = cap.capture_frame({'bits_per_pixel': 32})
+
+    assert isinstance(frame, CaptureFrame)
+    assert frame.result.width == 1
+    assert frame.metadata.backend_name == "none"

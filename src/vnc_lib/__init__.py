@@ -28,6 +28,7 @@ from .protocol import RFBProtocol
 from .auth import VNCAuth, NoAuth
 from .input_handler import InputHandler
 from .screen_capture import ScreenCapture, CaptureResult
+from .capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
 
 # Enhanced v3.0 modules
 from .encodings import (
@@ -99,6 +100,9 @@ __all__ = [
     'InputHandler',
     'ScreenCapture',
     'CaptureResult',
+    'CaptureFrame',
+    'CaptureMetadata',
+    'CaptureMoveRect',
 
     # Encodings
     'RawEncoder',

@@ -42,6 +42,7 @@ The bundled `src/vnc_lib/` package remains as an internal support library inside
 - Python 3.13+ (CI is configured for Python 3.13)
 - GUI-capable environment for screen capture and input simulation
 - Dependencies from `requirements.txt`:
+  - `dxcam` (optional Windows DXGI/Desktop Duplication backend)
   - `mss` (preferred capture backend)
   - `Pillow`
   - `pyautogui`
@@ -64,6 +65,12 @@ For a checkout-only workflow without installation, point Python at `src/` first:
 ```powershell
 $env:PYTHONPATH = "src"
 python -m pyvncserver --help
+```
+
+For the optional Windows DXGI capture backend:
+
+```powershell
+python -m pip install -e .[windows-capture]
 ```
 
 ## Quick Start
@@ -146,6 +153,9 @@ The repository ships with a ready-to-edit `config/pyvncserver.toml`. Runtime key
 | `lan_zrle_compression_level` | `int` | ZRLE compression level used when clients prefer ZRLE |
 | `network_profile_override` | `null \| "localhost" \| "lan" \| "wan"` | Forces profile, bypasses auto-detection |
 | `scale_factor` | `float` | Capture scaling factor |
+| `capture_backend` | `"auto" \| "dxcam" \| "mss" \| "pil"` | Screen capture backend. `dxcam` is an opt-in Windows DXGI/Desktop Duplication path |
+| `capture_probe_frames` | `int` | Startup benchmark sample count for real capture latency logging |
+| `capture_probe_warn_ms` | `float` | Warn threshold for startup capture probe; above this, a DXGI-style backend is likely worth evaluating |
 | `max_connections` | `int` | Max simultaneous clients |
 | `client_socket_timeout` | `float` | Per-client read timeout in seconds |
 | `enable_region_detection` | `bool` | Incremental update optimization |
@@ -203,6 +213,14 @@ python examples/python313_features_demo.py
 python benchmarks/benchmark_lan_latency.py 127.0.0.1 5900 20
 python benchmarks/benchmark_screen_capture.py
 python benchmarks/benchmark_screen_capture_methods.py 20
+```
+
+For real runtime capture cost on the active backend, set for example:
+
+```toml
+[server]
+capture_probe_frames = 12
+capture_probe_warn_ms = 40.0
 ```
 
 ## Testing

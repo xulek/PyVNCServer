@@ -5,13 +5,25 @@ Enhanced with Python 3.13 features and high-performance mss backend
 """
 
 import logging
+import os
 import struct
 import time
 import threading
 from typing import NamedTuple, TYPE_CHECKING, Any
+import statistics
+
+from .capture_backends import (
+    BaseCaptureBackend,
+    CaptureFrame,
+    CaptureMetadata,
+    DXCamCaptureBackend,
+    MSSCaptureBackend,
+    PILCaptureBackend,
+)
 
 if TYPE_CHECKING:
     from PIL import ImageGrab, Image
+    import dxcam
     import mss
 
 
@@ -30,7 +42,8 @@ class ScreenCapture:
     Enhanced with better performance and caching
     """
 
-    def __init__(self, scale_factor: float = 1.0, monitor: int = 0):
+    def __init__(self, scale_factor: float = 1.0, monitor: int = 0,
+                 backend_preference: str = "auto"):
         """
         Initialize screen capture
 
@@ -40,10 +53,19 @@ class ScreenCapture:
         """
         self.scale_factor = scale_factor
         self.monitor = monitor
+        self.backend_preference = str(backend_preference).strip().lower() or "auto"
         self.logger = logging.getLogger(__name__)
         self.last_checksum: bytes | None = None
         self._capture_lock = threading.RLock()
         self._thread_local = threading.local()
+        self._active_backend = "none"
+        self._backend: BaseCaptureBackend | None = None
+        self._backend_registry: dict[str, BaseCaptureBackend] = {}
+
+        # Try to load dxcam (DXGI Desktop Duplication backend)
+        self._dxcam_available = False
+        self._dxcam = None
+        self._lazy_load_dxcam()
 
         # Try to load mss (high performance backend)
         self._mss_available = False
@@ -57,10 +79,15 @@ class ScreenCapture:
         if not self._mss_available:
             self._lazy_load_pil()
 
+        self._build_backend_registry()
+        self._apply_backend_preference()
+
         # Log which backend is being used
-        if self._mss_available:
+        if self._active_backend == "dxcam":
+            self.logger.info("Using dxcam backend for DXGI desktop duplication capture")
+        elif self._active_backend == "mss":
             self.logger.info("Using mss backend for high-performance screen capture")
-        elif self._pil_available:
+        elif self._active_backend == "pil":
             self.logger.info("Using PIL backend for screen capture (fallback)")
         else:
             self.logger.warning("No screen capture backend available")
@@ -97,6 +124,18 @@ class ScreenCapture:
                 self.logger.debug(f"numpy not available, 8bpp conversion will use pure Python: {e}")
                 self._numpy_available = False
 
+    def _lazy_load_dxcam(self):
+        """Lazy load dxcam module (Windows DXGI Desktop Duplication backend)."""
+        if self._dxcam_available or os.name != "nt":
+            return
+        try:
+            import dxcam
+            self._dxcam = dxcam
+            self._dxcam_available = True
+        except ImportError as e:
+            self.logger.debug(f"dxcam not available: {e}")
+            self._dxcam_available = False
+
     def _lazy_load_mss(self):
         """Lazy load mss module (high-performance backend)"""
         if not self._mss_available:
@@ -124,6 +163,45 @@ class ScreenCapture:
             self._thread_local.sct = session
         return session
 
+    def _get_dxcam_session(self):
+        """Get a dxcam camera bound to the current thread."""
+        if not self._dxcam_available or self._dxcam is None:
+            return None
+
+        camera = getattr(self._thread_local, "dxcam_camera", None)
+        if camera is not None:
+            return camera
+
+        create = getattr(self._dxcam, "create", None)
+        if create is None:
+            return None
+
+        output_idx = self.monitor if self.monitor > 0 else 0
+        attempts = (
+            ("BGRA", {"output_color": "BGRA"}),
+            ("BGR", {"output_color": "BGR"}),
+            ("RGB", {"output_color": "RGB"}),
+        )
+        for color_hint, kwargs in attempts:
+            try:
+                camera = create(output_idx=output_idx, **kwargs)
+                self._thread_local.dxcam_camera = camera
+                self._thread_local.dxcam_color_hint = color_hint
+                return camera
+            except TypeError:
+                continue
+            except Exception as e:
+                self.logger.debug("dxcam create(%s) failed: %s", color_hint, e)
+
+        try:
+            camera = create(output_idx=output_idx)
+            self._thread_local.dxcam_camera = camera
+            self._thread_local.dxcam_color_hint = "unknown"
+            return camera
+        except Exception as e:
+            self.logger.warning("Failed to initialize dxcam backend: %s", e)
+            return None
+
     def _lazy_load_pil(self):
         """Lazy load PIL modules (fallback backend)"""
         if not self._pil_available:
@@ -136,11 +214,150 @@ class ScreenCapture:
                 self.logger.warning(f"PIL not available: {e}")
                 self._pil_available = False
 
+    def _build_backend_registry(self):
+        """Build backend adapters once imports/availability probes are ready."""
+        self._backend_registry = {
+            "dxcam": DXCamCaptureBackend(self),
+            "mss": MSSCaptureBackend(self),
+            "pil": PILCaptureBackend(self),
+        }
+
+    def _apply_backend_preference(self):
+        """Honor explicit backend preference without hiding fallback behavior."""
+        if self.backend_preference not in {"auto", "dxcam", "mss", "pil"}:
+            self.logger.warning(
+                "Unknown capture backend preference '%s'; using auto",
+                self.backend_preference,
+            )
+            self.backend_preference = "auto"
+
+        if self.backend_preference == "dxcam":
+            if self._backend_registry["dxcam"].is_available():
+                self._set_active_backend("dxcam")
+            else:
+                self.logger.warning("capture_backend='dxcam' requested, but dxcam is unavailable")
+
+        if self.backend_preference == "mss":
+            if self._backend_registry["mss"].is_available():
+                self._set_active_backend("mss")
+            else:
+                self.logger.warning("capture_backend='mss' requested, but mss is unavailable")
+            return
+
+        if self.backend_preference == "pil":
+            if not self._pil_available:
+                self._lazy_load_pil()
+            if self._backend_registry["pil"].is_available():
+                self._set_active_backend("pil")
+            else:
+                self.logger.warning("capture_backend='pil' requested, but Pillow is unavailable")
+            return
+
+        if self._active_backend == "dxcam":
+            return
+
+        if self.backend_preference == "mss":
+            return
+
+        if self.backend_preference == "pil":
+            return
+
+        if self._backend_registry["mss"].is_available():
+            self._set_active_backend("mss")
+        elif self._backend_registry["pil"].is_available():
+            self._set_active_backend("pil")
+        else:
+            self._active_backend = "none"
+            self._backend = None
+
+    def _set_active_backend(self, backend_name: str):
+        """Assign the active backend adapter."""
+        self._active_backend = backend_name
+        self._backend = self._backend_registry.get(backend_name)
+
+    def get_backend_name(self) -> str:
+        """Return the currently active capture backend name."""
+        return self._active_backend
+
+    def get_backend_capabilities(self) -> CaptureMetadata:
+        """Expose backend metadata capabilities in a stable shape."""
+        if self._backend is None:
+            return CaptureMetadata(backend_name="none")
+        return self._backend.build_metadata(0, 0)
+
+    def capture_frame(self, pixel_format: dict) -> CaptureFrame:
+        """Capture a frame together with backend metadata hints."""
+        result = self.capture_fast(pixel_format)
+        metadata = (
+            self._backend.build_metadata(result.width, result.height)
+            if self._backend is not None
+            else CaptureMetadata(backend_name="none")
+        )
+        return CaptureFrame(result=result, metadata=metadata)
+
+    def benchmark_capture(self, pixel_format: dict, iterations: int = 10,
+                          warmup: int = 2) -> dict[str, float | int | str]:
+        """
+        Measure actual capture_fast latency for the active backend.
+
+        The benchmark temporarily disables cache reuse so it reflects real capture cost.
+        """
+        iterations = max(1, int(iterations))
+        warmup = max(0, int(warmup))
+
+        previous_ttl = self._cache_ttl
+        self._cache_ttl = 0.0
+        try:
+            for _ in range(warmup):
+                self.capture_fast(pixel_format)
+
+            samples_ms: list[float] = []
+            width = 0
+            height = 0
+            bytes_out = 0
+            for _ in range(iterations):
+                result = self.capture_fast(pixel_format)
+                if result.pixel_data is None:
+                    continue
+                samples_ms.append(result.capture_time * 1000.0)
+                width = result.width
+                height = result.height
+                bytes_out = len(result.pixel_data)
+
+            if not samples_ms:
+                return {
+                    "backend": self.get_backend_name(),
+                    "iterations": 0,
+                    "avg_ms": 0.0,
+                    "min_ms": 0.0,
+                    "max_ms": 0.0,
+                    "fps": 0.0,
+                    "width": width,
+                    "height": height,
+                    "bytes": bytes_out,
+                }
+
+            avg_ms = statistics.mean(samples_ms)
+            return {
+                "backend": self.get_backend_name(),
+                "iterations": len(samples_ms),
+                "avg_ms": avg_ms,
+                "min_ms": min(samples_ms),
+                "max_ms": max(samples_ms),
+                "fps": 1000.0 / avg_ms if avg_ms > 0 else 0.0,
+                "width": width,
+                "height": height,
+                "bytes": bytes_out,
+            }
+        finally:
+            self._cache_ttl = previous_ttl
+
     def _ensure_capture_backend(self):
         """Ensure at least one capture backend is available"""
-        if not self._mss_available and not self._pil_available:
+        if self._active_backend == "none":
             raise RuntimeError(
                 "No screen capture backend available. Please install mss or Pillow:\n"
+                "pip install dxcam  # Optional Windows DXGI backend\n"
                 "pip install mss  # Recommended: high-performance\n"
                 "pip install Pillow  # Alternative: fallback backend\n"
             )
@@ -195,7 +412,7 @@ class ScreenCapture:
     def _grab_screen_bgra(self) -> tuple[bytes | None, int, int]:
         """
         Grab screenshot as raw BGRA bytes (no color conversion).
-        Only available with mss backend.
+        Available with dxcam and mss backends.
 
         Returns:
             (bgra_bytes, width, height) or (None, 0, 0) on error
@@ -206,18 +423,12 @@ class ScreenCapture:
             current_time - self._cache_time < self._cache_ttl):
             return self._cached_bgra_bytes, self._cached_width, self._cached_height
 
-        if not self._mss_available:
-            return None, 0, 0
-
         try:
-            sct = self._get_mss_session()
-            if sct is None:
+            if self._backend is None or not self._backend.capabilities.supports_bgra:
                 return None, 0, 0
-            monitor = sct.monitors[self.monitor] if self.monitor < len(sct.monitors) else sct.monitors[0]
-            sct_img = sct.grab(monitor)
-            width = sct_img.width
-            height = sct_img.height
-            bgra_bytes = bytes(sct_img.raw)
+            bgra_bytes, width, height = self._backend.grab_bgra()
+            if bgra_bytes is None:
+                return None, 0, 0
 
             self._cached_bgra_bytes = bgra_bytes
             self._cached_rgb_bytes = None  # Invalidate RGB cache
@@ -248,7 +459,7 @@ class ScreenCapture:
 
             # Fast path: for 32-bit formats with mss, work directly with BGRA
             # to avoid the expensive intermediate RGB conversion
-                if self._mss_available and self.scale_factor == 1.0:
+                if self._active_backend in {"dxcam", "mss"} and self.scale_factor == 1.0:
                     bgra_bytes, width, height = self._grab_screen_bgra()
                     if bgra_bytes is not None:
                         num_pixels = width * height
@@ -326,44 +537,10 @@ class ScreenCapture:
 
         # Capture new screenshot using mss (preferred) or PIL (fallback)
         try:
-            if self._mss_available:
-                sct = self._get_mss_session()
-                if sct is None:
-                    return None, 0, 0
-                # High-performance mss backend
-                monitor = sct.monitors[self.monitor] if self.monitor < len(sct.monitors) else sct.monitors[0]
-                sct_img = sct.grab(monitor)
-
-                # mss returns BGRA, convert to RGB
-                width = sct_img.width
-                height = sct_img.height
-                bgra_bytes = sct_img.raw
-
-                # ULTRA-OPTIMIZED: Convert BGRA to RGB using memoryview (4-5x faster)
-                num_pixels = width * height
-                rgb_size = num_pixels * 3
-
-                # Use pre-allocated buffer to avoid repeated allocations
-                if self._rgb_buffer is None or len(self._rgb_buffer) != rgb_size:
-                    self._rgb_buffer = bytearray(rgb_size)
-
-                # Use memoryview for zero-copy slicing
-                bgra_view = memoryview(bgra_bytes)
-                rgb_view = memoryview(self._rgb_buffer)
-
-                # Fast bulk copy using memoryview slicing
-                rgb_view[0::3] = bgra_view[2::4]  # R from B
-                rgb_view[1::3] = bgra_view[1::4]  # G
-                rgb_view[2::3] = bgra_view[0::4]  # B from R
-
-                rgb_bytes = bytes(self._rgb_buffer)
-
-            elif self._pil_available:
-                # PIL fallback
-                screenshot = self._ImageGrab.grab(all_screens=(self.monitor == 0))
-                width, height = screenshot.size
-                rgb_bytes = screenshot.convert("RGB").tobytes()
-            else:
+            if self._backend is None:
+                return None, 0, 0
+            rgb_bytes, width, height = self._backend.grab_rgb()
+            if rgb_bytes is None:
                 return None, 0, 0
 
             # Cache the result
@@ -396,12 +573,13 @@ class ScreenCapture:
 
         # Capture new screenshot
         try:
-            if self._pil_available:
-                screenshot = self._ImageGrab.grab(all_screens=(self.monitor == 0))
-                self._cached_screenshot = screenshot
-                self._cache_time = current_time
-                return screenshot
-            elif self._mss_available:
+            if self._backend is not None and self._backend.capabilities.supports_pil_image:
+                screenshot = self._backend.grab_image()
+                if screenshot is not None:
+                    self._cached_screenshot = screenshot
+                    self._cache_time = current_time
+                    return screenshot
+            elif self._active_backend in {"dxcam", "mss"}:
                 # Convert mss to PIL Image if needed
                 if not self._pil_available:
                     self._lazy_load_pil()
@@ -418,6 +596,111 @@ class ScreenCapture:
         except Exception as e:
             self.logger.error(f"Failed to grab screen: {e}")
             return None
+
+    def _grab_dxcam_frame(self) -> tuple[bytes | None, int, int, int, str]:
+        """Grab a raw frame from dxcam if available."""
+        current_time = time.time()
+        if (
+            self._cached_bgra_bytes is not None
+            and current_time - self._cache_time < self._cache_ttl
+            and self._active_backend == "dxcam"
+        ):
+            return (
+                self._cached_bgra_bytes,
+                self._cached_width,
+                self._cached_height,
+                4,
+                "BGRA",
+            )
+
+        camera = self._get_dxcam_session()
+        if camera is None:
+            return None, 0, 0, 0, "unknown"
+
+        try:
+            frame = camera.grab()
+            if frame is None or not hasattr(frame, "shape"):
+                return None, 0, 0, 0, "unknown"
+
+            shape = getattr(frame, "shape", ())
+            if len(shape) < 2:
+                return None, 0, 0, 0, "unknown"
+
+            height = int(shape[0])
+            width = int(shape[1])
+            channels = int(shape[2]) if len(shape) >= 3 else 1
+            color_hint = getattr(self._thread_local, "dxcam_color_hint", "unknown")
+            frame_bytes = frame.tobytes() if hasattr(frame, "tobytes") else bytes(frame)
+            return frame_bytes, width, height, channels, color_hint
+        except Exception as e:
+            self.logger.error("Failed to grab screen (dxcam): %s", e)
+            return None, 0, 0, 0, "unknown"
+
+    def _dxcam_frame_to_bgra(
+        self,
+        frame_bytes: bytes,
+        width: int,
+        height: int,
+        channels: int,
+        color_hint: str,
+    ) -> bytes | None:
+        """Convert a dxcam frame into BGRA bytes."""
+        num_pixels = width * height
+
+        if channels == 4 and color_hint == "BGRA":
+            return frame_bytes
+
+        out = bytearray(num_pixels * 4)
+        if channels == 3 and color_hint == "BGR":
+            src = memoryview(frame_bytes)
+            dst = memoryview(out)
+            dst[0::4] = src[0::3]
+            dst[1::4] = src[1::3]
+            dst[2::4] = src[2::3]
+            dst[3::4] = b"\x00" * num_pixels
+            return bytes(out)
+
+        if channels == 3 and color_hint == "RGB":
+            src = memoryview(frame_bytes)
+            dst = memoryview(out)
+            dst[0::4] = src[2::3]
+            dst[1::4] = src[1::3]
+            dst[2::4] = src[0::3]
+            dst[3::4] = b"\x00" * num_pixels
+            return bytes(out)
+
+        return None
+
+    def _dxcam_frame_to_rgb(
+        self,
+        frame_bytes: bytes,
+        width: int,
+        height: int,
+        channels: int,
+        color_hint: str,
+    ) -> bytes | None:
+        """Convert a dxcam frame into RGB bytes."""
+        num_pixels = width * height
+        out = bytearray(num_pixels * 3)
+        src = memoryview(frame_bytes)
+        dst = memoryview(out)
+
+        if channels == 4 and color_hint == "BGRA":
+            dst[0::3] = src[2::4]
+            dst[1::3] = src[1::4]
+            dst[2::3] = src[0::4]
+            return bytes(out)
+
+        if channels == 3 and color_hint == "BGR":
+            dst[0::3] = src[2::3]
+            dst[1::3] = src[1::3]
+            dst[2::3] = src[0::3]
+            return bytes(out)
+
+        if channels == 3 and color_hint == "RGB":
+            return frame_bytes
+
+        return None
 
     def capture_region(self, x: int, y: int, width: int, height: int,
                       pixel_format: dict) -> bytes | None:

@@ -9,12 +9,14 @@ import threading
 import time
 import logging
 import argparse
+import struct
 from pathlib import Path
 
 from vnc_lib.protocol import RFBProtocol
 from vnc_lib.auth import VNCAuth
 from vnc_lib.input_handler import InputHandler
 from vnc_lib.screen_capture import ScreenCapture
+from vnc_lib.capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
 from vnc_lib.encodings import EncoderManager, encoding_name, format_encoding_list
 from vnc_lib.change_detector import AdaptiveChangeDetector
 from vnc_lib.cursor import CursorEncoder, SystemCursorCapture
@@ -71,6 +73,11 @@ class VNCServerV3:
         self.lan_frame_rate = max(1, min(120, self.config.get('lan_frame_rate', 30)))
         self.network_profile_override = self.config.get('network_profile_override', None)
         self.scale_factor = self.config.get('scale_factor', self.DEFAULT_SCALE_FACTOR)
+        self.capture_backend = str(self.config.get('capture_backend', 'auto')).strip().lower() or 'auto'
+        self.capture_probe_frames = max(0, int(self.config.get('capture_probe_frames', 0)))
+        self.capture_probe_warn_ms = max(
+            1.0, float(self.config.get('capture_probe_warn_ms', 40.0))
+        )
         self.max_connections = self.config.get('max_connections', self.MAX_CONNECTIONS)
         self.client_socket_timeout = max(
             1.0, float(self.config.get('client_socket_timeout', 60.0))
@@ -195,7 +202,10 @@ class VNCServerV3:
 
         # Shared OS-facing services. Capture is internally locked to avoid
         # racing its backend state across client threads.
-        self.screen_capture = ScreenCapture(scale_factor=self.scale_factor)
+        self.screen_capture = ScreenCapture(
+            scale_factor=self.scale_factor,
+            backend_preference=self.capture_backend,
+        )
         self.input_handler = InputHandler(scale_factor=self.scale_factor)
 
         # Server components
@@ -224,6 +234,18 @@ class VNCServerV3:
 
         self.logger.info(f"VNC Server v3.0 listening on {self.host}:{self.port}")
         self.logger.info(f"Frame rate: {self.frame_rate} FPS, Scale: {self.scale_factor}")
+        self.logger.info(
+            "Capture backend: %s (requested=%s)",
+            getattr(self.screen_capture, 'get_backend_name', lambda: 'unknown')(),
+            self.capture_backend,
+        )
+        if hasattr(self.screen_capture, 'get_backend_capabilities'):
+            caps = self.screen_capture.get_backend_capabilities()
+            self.logger.info(
+                "Capture metadata: dirty_regions=%s, move_rects=%s",
+                caps.supports_dirty_regions,
+                caps.supports_move_rects,
+            )
         self.logger.info(f"Max connections: {self.max_connections}")
         self.logger.info(f"Features: region_detection={self.enable_region_detection}, "
                         f"cursor={self.enable_cursor_encoding}, metrics={self.enable_metrics}, "
@@ -233,6 +255,7 @@ class VNCServerV3:
                 "Server is running without authentication (SecurityType None). "
                 "Use a password or network-level protections for untrusted environments."
             )
+        self._log_capture_probe()
 
     def _load_config(self, config_file: str | Path) -> dict:
         """Load configuration from a supported file format."""
@@ -243,6 +266,56 @@ class VNCServerV3:
         except Exception as e:
             logging.error("Error loading configuration from %s: %s, using defaults", config_file, e)
             return {}
+
+    def _log_capture_probe(self) -> None:
+        """Optionally benchmark startup capture cost for the active backend."""
+        if self.capture_probe_frames <= 0:
+            return
+        if not hasattr(self.screen_capture, 'benchmark_capture'):
+            return
+
+        native_bgr0 = {
+            'bits_per_pixel': 32,
+            'depth': 24,
+            'big_endian_flag': 0,
+            'true_colour_flag': 1,
+            'red_max': 255,
+            'green_max': 255,
+            'blue_max': 255,
+            'red_shift': 16,
+            'green_shift': 8,
+            'blue_shift': 0,
+        }
+        try:
+            stats = self.screen_capture.benchmark_capture(
+                native_bgr0,
+                iterations=self.capture_probe_frames,
+            )
+        except Exception as exc:
+            self.logger.warning("Capture probe failed: %s", exc)
+            return
+
+        if int(stats.get('iterations', 0)) <= 0:
+            self.logger.warning("Capture probe did not produce any frames")
+            return
+
+        avg_ms = float(stats.get('avg_ms', 0.0))
+        self.logger.info(
+            "Capture probe: backend=%s, %sx%s, avg=%.2fms, min=%.2fms, max=%.2fms, fps=%.1f",
+            stats.get('backend', 'unknown'),
+            stats.get('width', 0),
+            stats.get('height', 0),
+            avg_ms,
+            float(stats.get('min_ms', 0.0)),
+            float(stats.get('max_ms', 0.0)),
+            float(stats.get('fps', 0.0)),
+        )
+        if avg_ms >= self.capture_probe_warn_ms:
+            self.logger.warning(
+                "Capture backend is averaging %.2fms per frame; an advanced Windows pipeline "
+                "(DXGI Desktop Duplication / mirror-driver style) is likely worth evaluating.",
+                avg_ms,
+            )
 
     def _setup_logging(self):
         """Setup enhanced logging"""
@@ -719,7 +792,9 @@ class VNCServerV3:
                         # Throttle before expensive capture/encoding work.
                         throttler.throttle()
                         start_time = time.perf_counter()
-                        result = self._capture_frame(screen_capture, current_pixel_format)
+                        frame = self._capture_frame(screen_capture, current_pixel_format)
+                        result = frame.result
+                        capture_metadata = frame.metadata
 
                         if result.pixel_data is None:
                             continue
@@ -755,19 +830,31 @@ class VNCServerV3:
                             continue
                         req_x, req_y, req_w, req_h = request_region
 
-                        # Check for changes (incremental update)
-                        if request['incremental'] and change_detector:
-                            changed_regions = change_detector.detect_changes(
-                                result.pixel_data,
-                                current_pixel_format['bits_per_pixel'] // 8
-                            )
+                        backend_copyrect_rectangles: list[tuple[int, int, int, int, int, bytes]] = []
 
-                            if changed_regions is not None:
-                                changed_regions = self._intersect_regions(changed_regions, request_region)
+                        # Check for changes (incremental update)
+                        if request['incremental']:
+                            changed_regions, backend_copyrect_rectangles = (
+                                self._resolve_incremental_update_hints(
+                                    protocol,
+                                    client_encodings,
+                                    capture_metadata,
+                                    request_region,
+                                )
+                            )
+                            if changed_regions is None and change_detector:
+                                changed_regions = change_detector.detect_changes(
+                                    result.pixel_data,
+                                    current_pixel_format['bits_per_pixel'] // 8
+                                )
+                                if changed_regions is not None:
+                                    changed_regions = self._intersect_regions(changed_regions, request_region)
 
                             if changed_regions is not None and len(changed_regions) == 0:
-                                # No changes
-                                protocol.send_framebuffer_update(client_socket, cursor_rectangles)
+                                protocol.send_framebuffer_update(
+                                    client_socket,
+                                    cursor_rectangles + backend_copyrect_rectangles,
+                                )
                                 continue
 
                             # Send region updates if available using parallel encoding
@@ -817,7 +904,7 @@ class VNCServerV3:
                                     encoded_results = parallel_encoder.encode_regions(regions_to_encode, bytes_per_pixel)
 
                                     # Build rectangles from results
-                                    rectangles = cursor_rectangles + [
+                                    rectangles = cursor_rectangles + backend_copyrect_rectangles + [
                                         (r.x, r.y, r.width, r.height, r.encoding_type, r.encoded_data)
                                         for r in encoded_results
                                     ]
@@ -867,7 +954,7 @@ class VNCServerV3:
                                 bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
                                 content_type = network_profile.value if network_profile != NetworkProfile.WAN else "dynamic"
 
-                                rectangles = list(cursor_rectangles)
+                                rectangles = list(cursor_rectangles) + list(backend_copyrect_rectangles)
                                 original_total_bytes = 0
                                 compressed_total_bytes = 0
                                 jpeg_original_bytes = 0
@@ -1472,7 +1559,73 @@ class VNCServerV3:
 
     def _capture_frame(self, screen_capture: ScreenCapture, pixel_format: dict):
         """Capture a frame for a single client connection."""
-        return screen_capture.capture_fast(pixel_format)
+        if hasattr(screen_capture, 'capture_frame'):
+            return screen_capture.capture_frame(pixel_format)
+        result = screen_capture.capture_fast(pixel_format)
+        return CaptureFrame(result=result, metadata=CaptureMetadata(backend_name="legacy"))
+
+    def _resolve_incremental_update_hints(
+        self,
+        protocol: RFBProtocol,
+        client_encodings: list[int],
+        capture_metadata: CaptureMetadata,
+        request_region: tuple[int, int, int, int],
+    ) -> tuple[list[tuple[int, int, int, int]] | None, list[tuple[int, int, int, int, int, bytes]]]:
+        """Use backend-supplied dirty/move hints when available."""
+        changed_regions = capture_metadata.dirty_regions
+        if changed_regions is not None:
+            changed_regions = self._intersect_regions(changed_regions, request_region)
+
+        copyrect_rectangles: list[tuple[int, int, int, int, int, bytes]] = []
+        if (
+            self.enable_copyrect_encoding
+            and protocol.ENCODING_COPYRECT in client_encodings
+            and capture_metadata.move_rects
+        ):
+            copyrect_rectangles = self._build_copyrect_rectangles_from_moves(
+                capture_metadata.move_rects,
+                request_region,
+            )
+
+        return changed_regions, copyrect_rectangles
+
+    def _build_copyrect_rectangles_from_moves(
+        self,
+        move_rects: list[CaptureMoveRect],
+        request_region: tuple[int, int, int, int],
+    ) -> list[tuple[int, int, int, int, int, bytes]]:
+        """Translate backend move hints into RFB CopyRect rectangles."""
+        req_x, req_y, req_w, req_h = request_region
+        req_x2 = req_x + req_w
+        req_y2 = req_y + req_h
+        rectangles: list[tuple[int, int, int, int, int, bytes]] = []
+
+        for move in move_rects:
+            dst_x1 = max(move.dst_x, req_x)
+            dst_y1 = max(move.dst_y, req_y)
+            dst_x2 = min(move.dst_x + move.width, req_x2)
+            dst_y2 = min(move.dst_y + move.height, req_y2)
+            if dst_x1 >= dst_x2 or dst_y1 >= dst_y2:
+                continue
+
+            offset_x = dst_x1 - move.dst_x
+            offset_y = dst_y1 - move.dst_y
+            src_x = move.src_x + offset_x
+            src_y = move.src_y + offset_y
+            width = dst_x2 - dst_x1
+            height = dst_y2 - dst_y1
+            rectangles.append(
+                (
+                    dst_x1,
+                    dst_y1,
+                    width,
+                    height,
+                    1,
+                    struct.pack(">HH", src_x, src_y),
+                )
+            )
+
+        return rectangles
 
     def _configure_lan_encoders(self, encoder_manager: EncoderManager,
                                 jpeg_quality: int) -> None:

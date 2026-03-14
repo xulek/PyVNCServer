@@ -23,6 +23,9 @@ dev = [
   "pytest>=9.0.2",
   "pytest-cov>=7.0.0",
 ]
+windows-capture = [
+  "dxcam>=0.0.5; platform_system == 'Windows'",
+]
 
 [project.scripts]
 pyvncserver = "pyvncserver.cli:main"

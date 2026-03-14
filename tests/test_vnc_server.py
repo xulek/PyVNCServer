@@ -7,6 +7,7 @@ import socket
 import threading
 import logging
 
+from vnc_lib.capture_backends import CaptureMetadata, CaptureMoveRect
 from vnc_lib.cursor import CursorData
 from vnc_lib.encodings import CopyRectEncoder, ZRLEEncoder
 from vnc_lib.protocol import RFBProtocol
@@ -224,6 +225,45 @@ def test_split_rectangles_for_non_tight_keeps_original_rectangle():
     split = server._split_rectangles_for_encoding(16, 10, 20, 300, 200)
 
     assert split == [(10, 20, 300, 200)]
+
+
+def test_build_copyrect_rectangles_from_moves_clamps_to_request_region():
+    server = _server_without_init()
+
+    rects = server._build_copyrect_rectangles_from_moves(
+        [
+            CaptureMoveRect(src_x=10, src_y=20, dst_x=50, dst_y=60, width=40, height=30),
+        ],
+        (60, 70, 20, 10),
+    )
+
+    assert rects == [
+        (60, 70, 20, 10, 1, struct.pack(">HH", 20, 30)),
+    ]
+
+
+def test_resolve_incremental_update_hints_prefers_backend_dirty_regions_and_copyrect():
+    server = _server_without_init()
+    server.enable_copyrect_encoding = True
+    protocol = RFBProtocol()
+
+    changed_regions, copyrect_rectangles = server._resolve_incremental_update_hints(
+        protocol,
+        [protocol.ENCODING_COPYRECT],
+        CaptureMetadata(
+            backend_name="dxgi",
+            dirty_regions=[(0, 0, 100, 100)],
+            move_rects=[CaptureMoveRect(0, 0, 10, 10, 20, 20)],
+            supports_dirty_regions=True,
+            supports_move_rects=True,
+        ),
+        (5, 5, 20, 20),
+    )
+
+    assert changed_regions == [(5, 5, 20, 20)]
+    assert copyrect_rectangles == [
+        (10, 10, 15, 15, 1, struct.pack(">HH", 0, 0)),
+    ]
 
 
 def test_coalesce_pointer_events_keeps_latest():

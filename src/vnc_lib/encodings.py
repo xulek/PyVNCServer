@@ -757,13 +757,17 @@ class ZRLEEncoder:
         self.fast_raw_unique_threshold = 24
         self.fast_raw_run_ratio_threshold = 0.12
         self.fast_palette_max_colors = 8
+        self._compression_strategy = zlib.Z_DEFAULT_STRATEGY
 
     def set_compression_level(self, level: int) -> None:
         """Update compression level and reset stream state only when it actually changes."""
         new_level = max(1, min(9, int(level)))
         if new_level != self.compression_level:
             self.compression_level = new_level
-            self._compressor = zlib.compressobj(level=self.compression_level)
+            self._compressor = zlib.compressobj(
+                level=self.compression_level,
+                strategy=self._compression_strategy,
+            )
 
     def encode(self, pixel_data: PixelData, width: int, height: int,
                bytes_per_pixel: int, pixel_format: dict | None = None) -> EncodedData:
@@ -774,7 +778,14 @@ class ZRLEEncoder:
         3. Compress with a persistent zlib stream
         4. Prepend a 4-byte length header
         """
-        encoded_tiles = self._encode_tiles(pixel_data, width, height, bytes_per_pixel, pixel_format)
+        encoded_tiles, tile_stats = self._encode_tiles(pixel_data, width, height, bytes_per_pixel, pixel_format)
+        strategy = self._choose_compression_strategy(tile_stats)
+        if strategy != self._compression_strategy:
+            self._compression_strategy = strategy
+            self._compressor = zlib.compressobj(
+                level=self.compression_level,
+                strategy=self._compression_strategy,
+            )
         compressed = (
             self._compressor.compress(encoded_tiles)
             + self._compressor.flush(zlib.Z_SYNC_FLUSH)
@@ -788,9 +799,9 @@ class ZRLEEncoder:
         return struct.pack(">I", len(compressed)) + compressed
 
     def _encode_tiles(self, pixel_data: PixelData, width: int, height: int,
-                      bytes_per_pixel: int, pixel_format: dict | None) -> bytes:
+                      bytes_per_pixel: int, pixel_format: dict | None) -> tuple[bytes, dict[str, int]]:
         if width <= 0 or height <= 0 or bytes_per_pixel <= 0 or not pixel_data:
-            return b""
+            return b"", {"raw": 0, "solid": 0, "palette": 0, "rle": 0, "total": 0}
 
         if bytes_per_pixel == 4:
             cpixel_byte_offset = self._cpixel_byte_offset(pixel_format)
@@ -800,6 +811,7 @@ class ZRLEEncoder:
                 return self._encode_tiles_32bpp(pixel_data, width, height, cpixel_byte_offset)
 
         result = bytearray()
+        stats = {"raw": 0, "solid": 0, "palette": 0, "rle": 0, "total": 0}
         for tile_y in range(0, height, self.tile_size):
             tile_height = min(self.tile_size, height - tile_y)
             for tile_x in range(0, width, self.tile_size):
@@ -818,51 +830,76 @@ class ZRLEEncoder:
                     bytes_per_pixel,
                     pixel_format=pixel_format,
                 )
-                result.extend(
-                    self._encode_tile(cpixel_data, tile_width, tile_height, cpixel_bpp)
-                )
-        return bytes(result)
+                tile_payload = self._encode_tile(cpixel_data, tile_width, tile_height, cpixel_bpp)
+                self._update_tile_stats(stats, tile_payload)
+                result.extend(tile_payload)
+        return bytes(result), stats
 
     def _encode_tiles_32bpp(self, pixel_data: PixelData, width: int, height: int,
-                            byte_offset: int) -> bytes:
+                            byte_offset: int) -> tuple[bytes, dict[str, int]]:
         result = bytearray()
         view = memoryview(pixel_data)
+        stats = {"raw": 0, "solid": 0, "palette": 0, "rle": 0, "total": 0}
         for tile_y in range(0, height, self.tile_size):
             tile_height = min(self.tile_size, height - tile_y)
             for tile_x in range(0, width, self.tile_size):
                 tile_width = min(self.tile_size, width - tile_x)
-                result.extend(
-                    self._encode_tile_32bpp(
-                        view,
-                        width,
-                        tile_x,
-                        tile_y,
-                        tile_width,
-                        tile_height,
-                        byte_offset,
-                    )
+                tile_payload = self._encode_tile_32bpp(
+                    view,
+                    width,
+                    tile_x,
+                    tile_y,
+                    tile_width,
+                    tile_height,
+                    byte_offset,
                 )
-        return bytes(result)
+                self._update_tile_stats(stats, tile_payload)
+                result.extend(tile_payload)
+        return bytes(result), stats
 
-    def _encode_tiles_32bpp_native(self, pixel_data: PixelData, width: int, height: int) -> bytes:
+    def _encode_tiles_32bpp_native(self, pixel_data: PixelData, width: int, height: int) -> tuple[bytes, dict[str, int]]:
         result = bytearray()
         pixel_words = memoryview(pixel_data).cast("I")
+        stats = {"raw": 0, "solid": 0, "palette": 0, "rle": 0, "total": 0}
         for tile_y in range(0, height, self.tile_size):
             tile_height = min(self.tile_size, height - tile_y)
             for tile_x in range(0, width, self.tile_size):
                 tile_width = min(self.tile_size, width - tile_x)
-                result.extend(
-                    self._encode_tile_32bpp_native(
-                        pixel_data,
-                        pixel_words,
-                        width,
-                        tile_x,
-                        tile_y,
-                        tile_width,
-                        tile_height,
-                    )
+                tile_payload = self._encode_tile_32bpp_native(
+                    pixel_data,
+                    pixel_words,
+                    width,
+                    tile_x,
+                    tile_y,
+                    tile_width,
+                    tile_height,
                 )
-        return bytes(result)
+                self._update_tile_stats(stats, tile_payload)
+                result.extend(tile_payload)
+        return bytes(result), stats
+
+    def _update_tile_stats(self, stats: dict[str, int], tile_payload: bytes) -> None:
+        if not tile_payload:
+            return
+        stats["total"] += 1
+        subencoding = tile_payload[0]
+        if subencoding == 0:
+            stats["raw"] += 1
+        elif subencoding == 1:
+            stats["solid"] += 1
+        elif 2 <= subencoding <= 16:
+            stats["palette"] += 1
+        else:
+            stats["rle"] += 1
+
+    def _choose_compression_strategy(self, tile_stats: dict[str, int]) -> int:
+        total = tile_stats.get("total", 0)
+        if total <= 0:
+            return zlib.Z_DEFAULT_STRATEGY
+        raw_ratio = tile_stats.get("raw", 0) / total
+        if raw_ratio >= 0.7:
+            return zlib.Z_HUFFMAN_ONLY
+        return zlib.Z_DEFAULT_STRATEGY
 
     def _extract_tile(self, pixel_data: PixelData, fb_width: int,
                       tile_x: int, tile_y: int, tile_width: int,

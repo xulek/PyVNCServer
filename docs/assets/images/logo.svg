@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="PyVNCServer logo">
+  <defs>
+    <linearGradient id="g" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#06b6d4"/>
+    </linearGradient>
+  </defs>
+  <rect x="5" y="8" width="54" height="40" rx="9" fill="url(#g)"/>
+  <rect x="10" y="13" width="44" height="30" rx="5" fill="#0b1020" opacity=".92"/>
+  <path d="M18 22h11l-6 7 6 7H18l6-7-6-7Z" fill="#fff"/>
+  <path d="M35 23h10v4H35zm0 8h12v4H35z" fill="#67e8f9"/>
+  <path d="M24 52h16" stroke="#0b1020" stroke-width="4" stroke-linecap="round"/>
+</svg>

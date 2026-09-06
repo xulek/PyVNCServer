@@ -13,9 +13,12 @@ RFB 3.8 · UltraVNC interoperability · Tight / ZRLE / Hextile / Zlib · WebSock
   <img alt="UltraVNC" src="https://img.shields.io/badge/UltraVNC-tested-2ea44f">
   <img alt="WebSocket" src="https://img.shields.io/badge/WebSocket-noVNC-ff9800">
   <img alt="Tests" src="https://img.shields.io/badge/tests-326%20passed-2ea44f">
+  <a href="https://xulek.github.io/PyVNCServer/"><img alt="Documentation" src="https://img.shields.io/badge/docs-GitHub%20Pages-0ea5e9?logo=materialformkdocs&logoColor=white"></a>
 </p>
 
 **PyVNCServer** is a Python implementation of a VNC/RFB server focused on protocol correctness, practical client interoperability, low-latency desktop streaming and a security-conscious default configuration.
+
+[**Documentation**](https://xulek.github.io/PyVNCServer/) · [**GitHub**](https://github.com/xulek/PyVNCServer)
 
 </div>
 
@@ -43,6 +46,8 @@ Highlights:
 - Metrics, health checks and session instrumentation.
 - Test suite covering protocol, encoders, WebSocket handling, security, capture and end-to-end RFB communication.
 
+For the complete guides, configuration reference, architecture and troubleshooting documentation, see **https://xulek.github.io/PyVNCServer/**.
+
 ---
 
 ## Client compatibility
@@ -51,7 +56,7 @@ Highlights:
 | --- | --- | --- |
 | **UltraVNC Viewer** | ✅ Tested | Tight, RRE, Hextile, Zlib, ZRLE and Raw negotiation paths tested during 3.2.1 work |
 | **Standard RFB 3.8 clients** | ✅ Supported | Client must advertise at least one encoding implemented by the server |
-| **noVNC / browser clients** | ✅ Supported transport | Enable WebSocket and configure an origin allowlist; serve the noVNC frontend separately |
+| **noVNC / browser clients** | ✅ Supported transport | noVNC is tracked as `web/noVNC`; enable WebSocket and configure an Origin allowlist |
 | **Raw TCP VNC** | ✅ Supported | Default transport |
 | **TLS-wrapped VNC** | ✅ Optional | Requires certificate and private key configuration |
 
@@ -70,11 +75,19 @@ Highlights:
 
 ### Install from source
 
+Clone recursively to initialize the bundled noVNC submodule:
+
 ```bash
-git clone <your-repository-url>
+git clone --recurse-submodules https://github.com/xulek/PyVNCServer.git
 cd PyVNCServer
 python -m pip install -U pip
 python -m pip install -e .
+```
+
+If you already cloned the repository without submodules:
+
+```bash
+git submodule update --init --recursive
 ```
 
 For the faster optional capture stack:
@@ -156,6 +169,8 @@ tight_disable_for_ultravnc = false
 
 Use these as troubleshooting switches rather than enabling them automatically for every client.
 
+More details: [UltraVNC documentation](https://xulek.github.io/PyVNCServer/ultravnc/).
+
 ---
 
 ## noVNC / WebSocket mode
@@ -182,7 +197,9 @@ The WebSocket implementation accepts the binary transport used by noVNC and enfo
 - bounded handshake size,
 - preservation of bytes pipelined after the HTTP upgrade request.
 
-The repository contains noVNC assets under `web/noVNC/`. PyVNCServer provides the VNC WebSocket transport; the static noVNC frontend should be served with your preferred HTTP server or reverse proxy.
+noVNC is tracked as the `web/noVNC` Git submodule. PyVNCServer provides the VNC WebSocket transport; serve the noVNC frontend with your preferred HTTP server or reverse proxy.
+
+More details: [noVNC & WebSocket documentation](https://xulek.github.io/PyVNCServer/novnc/).
 
 ---
 
@@ -201,6 +218,8 @@ The repository contains noVNC assets under `web/noVNC/`. PyVNCServer provides th
 | H.264 path | extension | ⚙️ Optional | Requires `av`; extension/client support is required |
 
 The server negotiates only encodings advertised by the client and can select different encodings for different update regions.
+
+See the [encoding reference](https://xulek.github.io/PyVNCServer/encodings/) for protocol and fallback details.
 
 ---
 
@@ -280,6 +299,8 @@ auth_backoff_max_seconds = 2.0
 
 Additional protections include connection admission limits, handshake timeouts and WebSocket payload limits.
 
+See the full [security guide](https://xulek.github.io/PyVNCServer/security/).
+
 ---
 
 ## Configuration
@@ -331,6 +352,8 @@ max_client_cut_text = 16777216
 ```
 
 `network_profile_override = "auto"` allows the server to classify the connection instead of forcing LAN tuning for every client.
+
+The complete option reference is available in the [configuration documentation](https://xulek.github.io/PyVNCServer/configuration/).
 
 ---
 
@@ -384,6 +407,8 @@ src/vnc_lib/                    compatibility implementation layer
 ```
 
 `vnc_lib` is retained for compatibility with existing imports while the public package surface is exposed under `pyvncserver`.
+
+More detail: [architecture documentation](https://xulek.github.io/PyVNCServer/architecture/).
 
 ---
 
@@ -469,14 +494,12 @@ Capture benchmarks depend on the host desktop environment and should be interpre
 
 ## GitHub Actions
 
-The repository ships with a complete CI/release setup:
+The repository currently contains these workflow definitions:
 
 | Workflow | Purpose |
 | --- | --- |
-| `CI` | Tests Python 3.11–3.13, includes a Windows test job, checks bytecode compilation and validates package builds |
-| `CodeQL` | Python static security analysis on pushes, pull requests and a weekly schedule |
-| `Release` | Validates the tag/version, builds wheel + sdist, creates a GitHub Release and optionally publishes to PyPI |
-| `Benchmarks` | Manual encoder benchmark run with downloadable results |
+| `CI` | Tests Python 3.11–3.13, includes a Windows test job, checks bytecode compilation, coverage and package builds |
+| `Documentation` | Strictly builds MkDocs documentation on PRs and deploys GitHub Pages from `main` |
 
 ---
 
@@ -524,7 +547,6 @@ python -m twine check dist/*
 
 ---
 
-
 ## Known limitations / roadmap
 
 - Native DXGI dirty/move rectangle harvesting is not implemented yet.
@@ -533,11 +555,10 @@ python -m twine check dist/*
 - Browser use requires a separately served noVNC frontend/static HTTP endpoint.
 - `vnc_lib` remains as a compatibility layer and can be progressively folded into the `pyvncserver` package structure.
 
-
 ---
 
 <div align="center">
 
-**PyVNCServer 3.2.1** · Python 3.11+ · RFB 3.8
+**PyVNCServer 3.2.1** · Python 3.11+ · RFB 3.8 · [Documentation](https://xulek.github.io/PyVNCServer/)
 
 </div>

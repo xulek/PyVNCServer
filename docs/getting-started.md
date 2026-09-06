@@ -12,10 +12,12 @@ Windows is the primary platform for the optional DXCam/DXGI fast capture path. M
 
 ## Install from source
 
+PyVNCServer tracks noVNC as a Git submodule, so clone recursively if you want the bundled browser client assets too.
+
 === "Windows PowerShell"
 
     ```powershell
-    git clone https://github.com/xulek/PyVNCServer.git
+    git clone --recurse-submodules https://github.com/xulek/PyVNCServer.git
     cd PyVNCServer
     py -m venv .venv
     .\.venv\Scripts\Activate.ps1
@@ -26,13 +28,19 @@ Windows is the primary platform for the optional DXCam/DXGI fast capture path. M
 === "Linux / macOS"
 
     ```bash
-    git clone https://github.com/xulek/PyVNCServer.git
+    git clone --recurse-submodules https://github.com/xulek/PyVNCServer.git
     cd PyVNCServer
     python3 -m venv .venv
     source .venv/bin/activate
     python -m pip install -U pip
     python -m pip install -e .
     ```
+
+If you already cloned the repository without submodules:
+
+```bash
+git submodule update --init --recursive
+```
 
 ### Optional extras
 

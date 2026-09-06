@@ -15,7 +15,12 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Protocol, Self
+from typing import Protocol
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 from collections.abc import Callable
 from enum import IntEnum, auto
 from queue import Queue, Empty, Full
@@ -126,7 +131,7 @@ class PooledConnection:
         return self.state == ConnectionState.IDLE
 
 
-class ConnectionPool:
+class ReusableConnectionPool:
     """
     Thread-safe connection pool with health monitoring and resource limits.
 
@@ -391,6 +396,11 @@ class ConnectionPool:
         return False
 
 
+# Backward compatibility for the legacy vnc_lib API. New code should use
+# ReusableConnectionPool; server admission control is ConnectionLimiter.
+ConnectionPool = ReusableConnectionPool
+
+
 class ConnectionPoolManager:
     """
     Manages multiple connection pools with automatic cleanup and monitoring.
@@ -402,7 +412,7 @@ class ConnectionPoolManager:
                  '_running', '_stats')
 
     def __init__(self, cleanup_interval: float = 60.0):
-        self._pools: dict[str, ConnectionPool] = {}
+        self._pools: dict[str, ReusableConnectionPool] = {}
         self._lock = threading.RLock()
         self._cleanup_thread: threading.Thread | None = None
         self._cleanup_interval = cleanup_interval
@@ -418,17 +428,17 @@ class ConnectionPoolManager:
         max_size: int = 100,
         min_size: int = 0,
         **kwargs
-    ) -> ConnectionPool:
+    ) -> ReusableConnectionPool:
         """Create a new connection pool."""
         with self._lock:
             if name in self._pools:
                 raise ValueError(f"Pool '{name}' already exists")
 
-            pool = ConnectionPool(max_size=max_size, min_size=min_size, **kwargs)
+            pool = ReusableConnectionPool(max_size=max_size, min_size=min_size, **kwargs)
             self._pools[name] = pool
             return pool
 
-    def get_pool(self, name: str) -> ConnectionPool | None:
+    def get_pool(self, name: str) -> ReusableConnectionPool | None:
         """Get a pool by name."""
         with self._lock:
             return self._pools.get(name)

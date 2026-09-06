@@ -5,7 +5,7 @@ import struct
 
 from vnc_lib.clipboard import (
     ClipboardManager, ClipboardData, ClipboardHistory,
-    ClipboardFormat, sanitize_clipboard_text, estimate_clipboard_encoding
+    ClipboardFormat, sanitize_clipboard_text
 )
 
 
@@ -340,21 +340,3 @@ class TestClipboardUtilities:
         assert '\r' not in sanitized
         assert sanitized.count('\n') == 3
 
-    def test_estimate_encoding_utf8(self):
-        """Test encoding estimation for UTF-8."""
-        utf8_data = 'Hello 世界'.encode('utf-8')
-        encoding = estimate_clipboard_encoding(utf8_data)
-        assert encoding == 'utf-8'
-
-    def test_estimate_encoding_latin1(self):
-        """Test encoding estimation for Latin-1."""
-        # Latin-1 with special chars
-        latin1_data = bytes([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0xe9])  # "Helloé"
-        encoding = estimate_clipboard_encoding(latin1_data)
-        assert encoding in ('utf-8', 'latin-1')  # Could be either
-
-    def test_estimate_encoding_ascii(self):
-        """Test encoding estimation for ASCII."""
-        ascii_data = b'Hello World'
-        encoding = estimate_clipboard_encoding(ascii_data)
-        assert encoding == 'utf-8'  # UTF-8 is superset of ASCII

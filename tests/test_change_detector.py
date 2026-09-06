@@ -159,6 +159,23 @@ class TestAdaptiveChangeDetector(unittest.TestCase):
         # Large change should return None (full update)
         self.assertIsNone(changes)
 
+    def test_change_outside_old_sparse_sample_is_detected(self):
+        """A small change must not be skipped because it misses sparse sample offsets."""
+        width = 128
+        height = 128
+        bpp = 4
+        detector = AdaptiveChangeDetector(width, height)
+        frame = bytearray(width * height * bpp)
+
+        detector.detect_changes(bytes(frame), bpp)
+        changed_offset = 1234  # Deliberately not divisible by the former 4096-byte stride.
+        frame[changed_offset] ^= 0xFF
+
+        changes = detector.detect_changes(bytes(frame), bpp)
+
+        self.assertIsNotNone(changes)
+        self.assertGreater(len(changes), 0)
+
     def test_detector_resize(self):
         """Test detector resizing"""
         detector = AdaptiveChangeDetector(self.width, self.height)

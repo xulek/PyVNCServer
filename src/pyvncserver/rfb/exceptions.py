@@ -1,7 +1,7 @@
 from vnc_lib.exceptions import (
     AuthenticationError,
     ConfigurationError,
-    ConnectionError,
+    ConnectionError as VNCConnectionError,
     EncodingError,
     ProtocolError,
     ScreenCaptureError,
@@ -11,7 +11,7 @@ from vnc_lib.exceptions import (
 __all__ = [
     "AuthenticationError",
     "ConfigurationError",
-    "ConnectionError",
+    "VNCConnectionError",
     "EncodingError",
     "ProtocolError",
     "ScreenCaptureError",

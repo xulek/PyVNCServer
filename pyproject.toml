@@ -4,34 +4,42 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyvncserver"
-version = "3.2.0"
-description = "Python VNC/RFB server with packaged CLI and reusable library surface"
+dynamic = ["version"]
+description = "RFC 6143 VNC server with noVNC/WebSocket support and low-latency capture optimizations"
 readme = "README.md"
-requires-python = ">=3.13"
-license = { file = "LICENSE" }
-authors = [{ name = "PyVNCServer contributors" }]
+requires-python = ">=3.11"
 dependencies = [
-  "mss>=10.1.0",
-  "Pillow>=12.1.0",
-  "pyautogui>=0.9.54",
-  "pycryptodome>=3.23.0",
-  "numpy>=2.0,<2.3",
+    "pycryptodome>=3.20",
+    "mss>=9.0",
+    "Pillow>=10.0",
+    "pyautogui>=0.9.54",
 ]
 
 [project.optional-dependencies]
-dev = [
-  "pytest>=9.0.2",
-  "pytest-cov>=7.0.0",
+performance = [
+    "numpy>=1.26",
+    "dxcam>=0.0.5; platform_system == 'Windows'",
 ]
-windows-capture = [
-  "dxcam>=0.0.5; platform_system == 'Windows'",
-]
+h264 = ["av>=12.0"]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 pyvncserver = "pyvncserver.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+pyvncserver = ["default_config.toml"]
+
+[tool.setuptools.dynamic]
+version = {attr = "pyvncserver._version.__version__"}
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"

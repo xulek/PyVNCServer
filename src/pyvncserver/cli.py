@@ -8,17 +8,18 @@ import argparse
 
 from .app.server import run_server
 from .config import DEFAULT_CONFIG_PATH
+from ._version import SERVER_NAME
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pyvncserver", description="PyVNCServer CLI")
+    parser = argparse.ArgumentParser(prog="pyvncserver", description=f"{SERVER_NAME} CLI")
     subparsers = parser.add_subparsers(dest="command")
 
     serve_parser = subparsers.add_parser("serve", help="Start the VNC server")
     serve_parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
-        help=f"Path to TOML or legacy JSON configuration (default: {DEFAULT_CONFIG_PATH.as_posix()})",
+        help=f"Path to TOML configuration (default: {DEFAULT_CONFIG_PATH.as_posix()})",
     )
     serve_parser.add_argument(
         "--log-level",

@@ -13,10 +13,23 @@ Uses Python 3.13 features:
 import time
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Protocol, Self
+from typing import Protocol
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 from dataclasses import dataclass, field
 from collections.abc import Callable
-from enum import StrEnum
+import enum
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    class StrEnum(str, enum.Enum):
+        """StrEnum polyfill for Python < 3.11."""
+        def __new__(cls, value):
+            return str.__new__(cls, value)
 
 
 class MetricType(StrEnum):
@@ -415,7 +428,7 @@ class PrometheusExporter:
 
     def __init__(
         self,
-        host: str = '0.0.0.0',
+        host: str = '127.0.0.1',
         port: int = 9100,
         registry: MetricsRegistry | None = None
     ):

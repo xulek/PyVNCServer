@@ -9,7 +9,7 @@ import logging
 
 from vnc_lib.capture_backends import CaptureMetadata, CaptureMoveRect
 from vnc_lib.cursor import CursorData
-from vnc_lib.encodings import CopyRectEncoder, ZRLEEncoder
+from vnc_lib.encodings import CopyRectEncoder, EncoderManager, RREEncoder, RawEncoder, ZRLEEncoder
 from vnc_lib.protocol import RFBProtocol
 from vnc_lib.server_utils import NetworkProfile
 from vnc_lib.screen_capture import CaptureResult
@@ -250,6 +250,17 @@ def test_split_rectangles_for_non_tight_keeps_original_rectangle():
     split = server._split_rectangles_for_encoding(16, 10, 20, 300, 200)
 
     assert split == [(10, 20, 300, 200)]
+
+
+def test_split_rectangles_for_rre_stays_within_encoder_work_limit():
+    server = _server_without_init()
+
+    split = server._split_rectangles_for_encoding(2, 0, 0, 1920, 1080)
+
+    assert len(split) > 1
+    assert sum(w * h for _, _, w, h in split) == 1920 * 1080
+    assert all(w <= 256 and h <= 256 and w * h <= RREEncoder.DEFAULT_MAX_PIXELS
+               for _, _, w, h in split)
 
 
 def test_build_copyrect_rectangles_from_moves_clamps_to_request_region():
@@ -588,18 +599,32 @@ def test_adjust_lan_jpeg_quality_reacts_to_timing():
     assert raised >= lowered
 
 
-def test_configure_tight_compatibility_is_explicit():
+def test_configure_tight_compatibility_honors_explicit_switch():
     server = _server_without_init()
     tight = _TightModeRecorder()
     manager = _DummyEncoderManager({7: tight})
 
     server.tight_stream_reset_for_ultravnc = True
-    server._configure_tight_compatibility(manager)
+    server._configure_tight_compatibility(manager, [7, 0])
     assert tight.enabled_values[-1] is True
+    assert tight.reset_requests == 1
 
     server.tight_stream_reset_for_ultravnc = False
-    server._configure_tight_compatibility(manager)
+    server._configure_tight_compatibility(manager, [7, 0])
     assert tight.enabled_values[-1] is False
+    assert tight.reset_requests == 2
+
+
+def test_configure_tight_compatibility_auto_detects_ultravnc_marker():
+    server = _server_without_init()
+    tight = _TightModeRecorder()
+    manager = _DummyEncoderManager({7: tight})
+
+    server.tight_stream_reset_for_ultravnc = False
+    server._configure_tight_compatibility(manager, [7, 9, 6, 5, 2, 0])
+
+    assert tight.enabled_values[-1] is True
+    assert tight.reset_requests == 1
 
 
 def test_supported_pixel_format_accepts_common_32bit_true_color():
@@ -784,6 +809,41 @@ def test_encode_rectangle_for_update_falls_back_when_copyrect_has_no_safe_source
     assert encoded == current_frame
 
 
+def test_encode_rectangle_for_update_never_labels_raw_payload_as_rre():
+    server = _server_without_init()
+    manager = EncoderManager(
+        enable_tight=False,
+        enable_zrle=False,
+        enable_copyrect=False,
+    )
+    # Checkerboard expands badly in RRE, so the RRE encoder explicitly asks
+    # the selection layer to fall back. Raw is the next client preference.
+    width = height = 8
+    pixels = bytearray()
+    for y in range(height):
+        for x in range(width):
+            pixels.extend([255, 0, 0, 0] if (x + y) % 2 == 0 else [0, 0, 255, 0])
+    pixels = bytes(pixels)
+
+    enc_type, encoder, encoded = server._encode_rectangle_for_update(
+        manager,
+        [2, 0],
+        NetworkProfile.LOCALHOST,
+        0, 0, width, height, width, height,
+        content_type='localhost',
+        pixel_data=pixels,
+        full_frame=pixels,
+        request_region=(0, 0, width, height),
+        allow_copyrect=False,
+        bytes_per_pixel=4,
+        pixel_format=_native_bgr0_pixel_format(),
+    )
+
+    assert enc_type == 0
+    assert isinstance(encoder, RawEncoder)
+    assert encoded == pixels
+
+
 def test_encode_rectangle_for_update_uses_zrle_payload():
     server = _server_without_init()
     zrle = ZRLEEncoder()
@@ -859,9 +919,13 @@ class _RawRecorder:
 class _TightModeRecorder:
     def __init__(self):
         self.enabled_values = []
+        self.reset_requests = 0
 
     def set_stream_reset_mode(self, enabled):
         self.enabled_values.append(bool(enabled))
+
+    def request_stream_reset(self):
+        self.reset_requests += 1
 
 
 class _DisconnectRecorder:

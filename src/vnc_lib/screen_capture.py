@@ -55,7 +55,6 @@ class ScreenCapture:
         self.monitor = monitor
         self.backend_preference = str(backend_preference).strip().lower() or "auto"
         self.logger = logging.getLogger(__name__)
-        self.last_checksum: bytes | None = None
         self._capture_lock = threading.RLock()
         self._thread_local = threading.local()
         self._active_backend = "none"
@@ -335,6 +334,55 @@ class ScreenCapture:
         )
         return CaptureFrame(result=result, metadata=metadata)
 
+    def set_cache_frame_rate(self, fps: float) -> None:
+        """Tune cache lifetime to a target producer frame rate."""
+        fps = max(1.0, float(fps))
+        # Keep a small safety margin so a producer tick is not served the
+        # previous cached frame merely because scheduling jitter was tiny.
+        self._cache_ttl = max(0.0, (1.0 / fps) * 0.90)
+
+    def convert_native_bgr0(self, pixel_data: bytes, width: int, height: int,
+                            pixel_format: dict) -> bytes:
+        """Convert a native BGR0/BGRA-layout frame to a client pixel format.
+
+        This is used by the server-wide capture producer so the desktop is
+        captured once and converted independently for each client.
+        """
+        with self._capture_lock:
+            converted = self._convert_bgra_to_pixel_format(
+                pixel_data, width, height, width * height, pixel_format
+            )
+            if converted is not None:
+                return converted
+
+            src = memoryview(pixel_data)
+            rgb = bytearray(width * height * 3)
+            dst = memoryview(rgb)
+            dst[0::3] = src[2::4]
+            dst[1::3] = src[1::4]
+            dst[2::3] = src[0::4]
+            return self._convert_rgb_to_pixel_format(bytes(rgb), width, height, pixel_format)
+
+    def close_current_thread_sessions(self) -> None:
+        """Close capture backend objects owned by the current thread."""
+        sct = getattr(self._thread_local, "sct", None)
+        if sct is not None:
+            try:
+                sct.close()
+            except Exception:
+                pass
+            self._thread_local.sct = None
+
+        camera = getattr(self._thread_local, "dxcam_camera", None)
+        if camera is not None:
+            try:
+                stop = getattr(camera, "stop", None)
+                if callable(stop):
+                    stop()
+            except Exception:
+                pass
+            self._thread_local.dxcam_camera = None
+
     def benchmark_capture(self, pixel_format: dict, iterations: int = 10,
                           warmup: int = 2) -> dict[str, float | int | str]:
         """
@@ -401,29 +449,6 @@ class ScreenCapture:
                 "pip install mss  # Recommended: high-performance\n"
                 "pip install Pillow  # Alternative: fallback backend\n"
             )
-
-    def _ensure_pil(self):
-        """Ensure PIL backend is available for region capture/scaling helpers."""
-        if not self._pil_available:
-            self._lazy_load_pil()
-        if not self._pil_available or self._ImageGrab is None or self._Image is None:
-            raise RuntimeError(
-                "Pillow is required for this screen capture operation. "
-                "Install it with: pip install Pillow"
-            )
-
-    def capture(self, pixel_format: dict) -> tuple[bytes | None, bytes | None, int, int]:
-        """
-        Capture screen and convert to specified pixel format
-
-        Args:
-            pixel_format: Client's requested pixel format
-
-        Returns:
-            (pixel_data, checksum, width, height)
-        """
-        result = self.capture_fast(pixel_format)
-        return result.pixel_data, result.checksum, result.width, result.height
 
     def _is_bgr0_format(self, pixel_format: dict) -> bool:
         """Check if client wants BGR0 format (matches native BGRA capture output)"""
@@ -626,47 +651,6 @@ class ScreenCapture:
             self.logger.error(f"Failed to grab screen: {e}")
             return None, 0, 0
 
-    def _grab_screen(self) -> Any:
-        """
-        Legacy method: Grab screenshot as PIL Image
-        Used for backward compatibility with region capture
-
-        Returns:
-            PIL Image or None on error
-        """
-        current_time = time.time()
-
-        # Use cached screenshot if available and fresh
-        if (self._cached_screenshot is not None and
-            current_time - self._cache_time < self._cache_ttl):
-            return self._cached_screenshot
-
-        # Capture new screenshot
-        try:
-            if self._backend is not None and self._backend.capabilities.supports_pil_image:
-                screenshot = self._backend.grab_image()
-                if screenshot is not None:
-                    self._cached_screenshot = screenshot
-                    self._cache_time = current_time
-                    return screenshot
-            elif self._active_backend in {"dxcam", "mss"}:
-                # Convert mss to PIL Image if needed
-                if not self._pil_available:
-                    self._lazy_load_pil()
-
-                if self._pil_available:
-                    from PIL import Image
-                    rgb_bytes, width, height = self._grab_screen_rgb()
-                    if rgb_bytes:
-                        screenshot = Image.frombytes('RGB', (width, height), rgb_bytes)
-                        self._cached_screenshot = screenshot
-                        self._cache_time = current_time
-                        return screenshot
-            return None
-        except Exception as e:
-            self.logger.error(f"Failed to grab screen: {e}")
-            return None
-
     def _grab_dxcam_frame(self) -> tuple[bytes | None, int, int, int, str]:
         """Grab a raw frame from dxcam if available."""
         current_time = time.time()
@@ -774,42 +758,6 @@ class ScreenCapture:
 
         return None
 
-    def capture_region(self, x: int, y: int, width: int, height: int,
-                      pixel_format: dict) -> bytes | None:
-        """
-        Capture specific screen region (for region-based updates)
-
-        Args:
-            x, y: Region top-left corner
-            width, height: Region dimensions
-            pixel_format: Client's requested pixel format
-
-        Returns:
-            Pixel data for region or None on error
-        """
-        with self._capture_lock:
-            try:
-                self._ensure_pil()
-                # Grab specific region
-                bbox = (x, y, x + width, y + height)
-                screenshot = self._ImageGrab.grab(bbox=bbox)
-
-            # Apply scaling if needed
-                if self.scale_factor != 1.0:
-                    scaled_width = int(width * self.scale_factor)
-                    scaled_height = int(height * self.scale_factor)
-                    screenshot = screenshot.resize(
-                        (scaled_width, scaled_height),
-                        self._Image.Resampling.BILINEAR
-                    )
-
-            # Convert to pixel format
-                pixel_data = self._convert_to_pixel_format(screenshot, pixel_format)
-                return pixel_data
-
-            except Exception as e:
-                self.logger.error(f"Region capture error: {e}")
-                return None
 
     def _convert_bgra_to_pixel_format(self, bgra_bytes: bytes, width: int, height: int,
                                       num_pixels: int, pixel_format: dict) -> bytes | None:
@@ -941,18 +889,6 @@ class ScreenCapture:
             rgba_bytes[3::4] = [255] * num_pixels  # A (opaque)
             return bytes(rgba_bytes)
 
-    def _convert_to_pixel_format(self, image: Any, pixel_format: dict) -> bytes:
-        """
-        Convert PIL Image to client's requested pixel format
-        Legacy method for backward compatibility with region capture
-
-        Supports various pixel formats as per RFC 6143 Section 7.4
-        """
-        # Get RGB bytes and use the new optimized method
-        rgb_bytes = image.convert("RGB").tobytes()
-        width, height = image.size
-        return self._convert_rgb_to_pixel_format(rgb_bytes, width, height, pixel_format)
-
     def _convert_rgb_to_32bit_true_color(self, rgb_bytes: bytes, width: int, height: int,
                                          pixel_format: dict, big_endian: bool) -> bytes:
         """Convert RGB bytes to 32-bit true color format - ULTRA OPTIMIZED VERSION with memoryview"""
@@ -1024,14 +960,6 @@ class ScreenCapture:
 
         return bytes(data)
 
-    def _convert_to_32bit_true_color(self, image: Any,
-                                     pixel_format: dict, big_endian: bool) -> bytes:
-        """Legacy: Convert PIL Image to 32-bit true color format"""
-        # Get RGB data as bytes and use optimized method
-        rgb_image = image.convert("RGB")
-        width, height = rgb_image.size
-        rgb_bytes = rgb_image.tobytes()
-        return self._convert_rgb_to_32bit_true_color(rgb_bytes, width, height, pixel_format, big_endian)
 
     def _convert_rgb_to_16bit_true_color(self, rgb_bytes: bytes, width: int, height: int,
                                          pixel_format: dict, big_endian: bool) -> bytes:
@@ -1067,13 +995,6 @@ class ScreenCapture:
 
         return bytes(data)
 
-    def _convert_to_16bit_true_color(self, image: Any,
-                                     pixel_format: dict, big_endian: bool) -> bytes:
-        """Legacy: Convert PIL Image to 16-bit true color format"""
-        rgb_image = image.convert("RGB")
-        width, height = rgb_image.size
-        rgb_bytes = rgb_image.tobytes()
-        return self._convert_rgb_to_16bit_true_color(rgb_bytes, width, height, pixel_format, big_endian)
 
     def _convert_rgb_to_8bit_true_color(self, rgb_bytes: bytes, width: int, height: int,
                                         pixel_format: dict) -> bytes:
@@ -1106,19 +1027,4 @@ class ScreenCapture:
 
         return bytes(data)
 
-    def _convert_to_8bit_true_color(self, image: Any, pixel_format: dict) -> bytes:
-        """Legacy: Convert PIL Image to 8-bit true color format"""
-        rgb_image = image.convert("RGB")
-        width, height = rgb_image.size
-        rgb_bytes = rgb_image.tobytes()
-        return self._convert_rgb_to_8bit_true_color(rgb_bytes, width, height, pixel_format)
 
-    def has_changed(self, checksum: bytes) -> bool:
-        """Check if screen has changed since last capture"""
-        if self.last_checksum is None:
-            return True
-        return checksum != self.last_checksum
-
-    def update_checksum(self, checksum: bytes):
-        """Update last checksum"""
-        self.last_checksum = checksum

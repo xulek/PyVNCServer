@@ -10,6 +10,7 @@ from typing import Tuple, Optional, Dict, Iterable
 
 from vnc_lib.exceptions import ConnectionError, ProtocolError
 from vnc_lib.types import is_valid_pixel_format
+from vnc_lib.io_utils import recv_exact
 
 
 @dataclass(slots=True)
@@ -107,7 +108,7 @@ class RFBProtocol:
         self.logger.info("Sent server version: RFB 003.008")
 
         # Receive client version
-        client_version_data = self._recv_exact(client_socket, 12)
+        client_version_data = recv_exact(client_socket, 12)
         if not client_version_data:
             raise ConnectionError("Failed to receive client version")
 
@@ -177,7 +178,7 @@ class RFBProtocol:
                 client_socket.sendall(struct.pack("B", st))
 
             # Client selects security type
-            selected = self._recv_exact(client_socket, 1)
+            selected = recv_exact(client_socket, 1)
             if not selected:
                 raise ConnectionError("Client disconnected during security negotiation")
 
@@ -229,7 +230,7 @@ class RFBProtocol:
             )
             client_socket.sendall(struct.pack(">I", len(auth_caps)))
             self._send_tight_caps(client_socket, auth_caps)
-            selected_auth = self._recv_exact(client_socket, 4)
+            selected_auth = recv_exact(client_socket, 4)
             if not selected_auth:
                 raise ConnectionError("Client disconnected during Tight auth negotiation")
             auth_type = struct.unpack(">I", selected_auth)[0]
@@ -282,7 +283,7 @@ class RFBProtocol:
 
     def receive_client_init(self, client_socket) -> int:
         """Receive ClientInit message (RFC 6143 Section 7.3.1)"""
-        shared_flag = self._recv_exact(client_socket, 1)
+        shared_flag = recv_exact(client_socket, 1)
         if not shared_flag:
             raise ConnectionError("Failed to receive ClientInit")
         return struct.unpack("B", shared_flag)[0]
@@ -339,10 +340,10 @@ class RFBProtocol:
     def parse_set_pixel_format(self, client_socket) -> Dict:
         """Parse SetPixelFormat message (RFC 6143 Section 7.5.1)"""
         # 3 bytes padding
-        self._recv_exact(client_socket, 3)
+        recv_exact(client_socket, 3)
 
         # 16 bytes pixel format
-        pf_data = self._recv_exact(client_socket, 16)
+        pf_data = recv_exact(client_socket, 16)
         if not pf_data:
             raise ConnectionError("Failed to receive pixel format")
 
@@ -376,7 +377,7 @@ class RFBProtocol:
         IMPORTANT: Encoding types are SIGNED 32-bit integers per RFC 6143
         """
         # 1 byte padding + 2 bytes number of encodings
-        header = self._recv_exact(client_socket, 3)
+        header = recv_exact(client_socket, 3)
         if not header:
             raise ConnectionError("Failed to receive SetEncodings header")
 
@@ -387,7 +388,7 @@ class RFBProtocol:
             )
 
         # Receive encoding types (SIGNED integers per RFC)
-        enc_data = self._recv_exact(client_socket, 4 * num_encodings)
+        enc_data = recv_exact(client_socket, 4 * num_encodings)
         if not enc_data:
             raise ConnectionError("Failed to receive encoding types")
 
@@ -408,7 +409,7 @@ class RFBProtocol:
 
     def parse_framebuffer_update_request(self, client_socket) -> Dict:
         """Parse FramebufferUpdateRequest (RFC 6143 Section 7.5.3)"""
-        data = self._recv_exact(client_socket, 9)
+        data = recv_exact(client_socket, 9)
         if not data:
             raise ConnectionError("Failed to receive FramebufferUpdateRequest")
 
@@ -424,7 +425,7 @@ class RFBProtocol:
 
     def parse_key_event(self, client_socket) -> Dict:
         """Parse KeyEvent message (RFC 6143 Section 7.5.4)"""
-        data = self._recv_exact(client_socket, 7)
+        data = recv_exact(client_socket, 7)
         if not data:
             raise ConnectionError("Failed to receive KeyEvent")
 
@@ -437,7 +438,7 @@ class RFBProtocol:
 
     def parse_pointer_event(self, client_socket) -> Dict:
         """Parse PointerEvent message (RFC 6143 Section 7.5.5)"""
-        data = self._recv_exact(client_socket, 5)
+        data = recv_exact(client_socket, 5)
         if not data:
             raise ConnectionError("Failed to receive PointerEvent")
 
@@ -452,10 +453,10 @@ class RFBProtocol:
     def parse_client_cut_text(self, client_socket) -> str:
         """Parse ClientCutText message (RFC 6143 Section 7.5.6)"""
         # 3 bytes padding
-        self._recv_exact(client_socket, 3)
+        recv_exact(client_socket, 3)
 
         # 4 bytes length
-        length_data = self._recv_exact(client_socket, 4)
+        length_data = recv_exact(client_socket, 4)
         if not length_data:
             raise ConnectionError("Failed to receive ClientCutText length")
 
@@ -466,7 +467,7 @@ class RFBProtocol:
             )
 
         # Receive text
-        text_data = self._recv_exact(client_socket, length)
+        text_data = recv_exact(client_socket, length)
         if not text_data:
             raise ConnectionError("Failed to receive ClientCutText data")
 
@@ -510,23 +511,6 @@ class RFBProtocol:
         text_bytes = text.encode('latin-1', errors='replace')
         msg = struct.pack(">BxxxI", self.MSG_SERVER_CUT_TEXT, len(text_bytes)) + text_bytes
         client_socket.sendall(msg)
-
-    def _recv_exact(self, sock, n: int) -> Optional[bytes]:
-        """Receive exactly n bytes from socket"""
-        if n == 0:
-            return b''
-
-        buf = bytearray(n)
-        view = memoryview(buf)
-        total_received = 0
-        while total_received < n:
-            chunk = sock.recv(n - total_received)
-            if not chunk:
-                return None
-            chunk_len = len(chunk)
-            view[total_received:total_received + chunk_len] = chunk
-            total_received += chunk_len
-        return bytes(buf)
 
     def _send_large_data(self, sock, data: bytes, chunk_size: int = 1048576):
         """Send large data in chunks using memoryview to avoid copies"""

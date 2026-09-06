@@ -163,3 +163,88 @@ def test_recv_rejects_text_frame():
     ws.handshake_complete = True
 
     assert ws.recv(1024) is None
+
+
+def test_fragmented_message_limit_is_enforced_across_frames():
+    incoming = (
+        _make_client_frame(WebSocketOpcode.BINARY, b"a" * 700, fin=False)
+        + _make_client_frame(WebSocketOpcode.CONTINUATION, b"b" * 700, fin=True)
+    )
+    sock = FakeSocket(incoming)
+    ws = WebSocketWrapper(sock, max_payload_bytes=1024, max_message_bytes=1024)
+    ws.handshake_complete = True
+
+    assert ws.recv(4096) is None
+
+
+def test_handshake_preserves_first_frame_coalesced_with_http_headers():
+    frame = _make_client_frame(WebSocketOpcode.BINARY, b"RFB ")
+    sock = FakeSocket(_make_handshake(origin=None) + frame)
+    ws = WebSocketWrapper(sock)
+
+    assert ws.do_handshake() is True
+    assert ws.recv(4) == b"RFB "
+
+
+def test_handshake_rejects_unsupported_base64_subprotocol():
+    handshake = _make_handshake(origin=None).replace(
+        b"Sec-WebSocket-Version: 13\r\n",
+        b"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: base64\r\n",
+    )
+    sock = FakeSocket(handshake)
+    ws = WebSocketWrapper(sock)
+
+    assert ws.do_handshake() is False
+
+
+def test_handshake_accepts_binary_subprotocol_only():
+    handshake = _make_handshake(origin=None).replace(
+        b"Sec-WebSocket-Version: 13\r\n",
+        b"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: base64, binary\r\n",
+    )
+    sock = FakeSocket(handshake)
+    ws = WebSocketWrapper(sock)
+
+    assert ws.do_handshake() is True
+    assert b"Sec-WebSocket-Protocol: binary\r\n" in sock.sent
+
+
+def test_handshake_requires_websocket_version_13():
+    handshake = _make_handshake(origin=None).replace(
+        b"Sec-WebSocket-Version: 13",
+        b"Sec-WebSocket-Version: 12",
+    )
+    sock = FakeSocket(handshake)
+    ws = WebSocketWrapper(sock)
+
+    assert ws.do_handshake() is False
+
+
+def test_recv_rejects_rsv_bits_without_negotiated_extensions():
+    frame = bytearray(_make_client_frame(WebSocketOpcode.BINARY, b"hello"))
+    frame[0] |= 0x40  # RSV1
+    sock = FakeSocket(bytes(frame))
+    ws = WebSocketWrapper(sock)
+    ws.handshake_complete = True
+
+    assert ws.recv(1024) is None
+
+
+def test_recv_rejects_fragmented_control_frame():
+    incoming = _make_client_frame(WebSocketOpcode.PING, b"abc", fin=False)
+    sock = FakeSocket(incoming)
+    ws = WebSocketWrapper(sock)
+    ws.handshake_complete = True
+
+    assert ws.recv(1024) is None
+
+
+def test_adapter_msg_peek_does_not_consume_decoded_bytes():
+    incoming = _make_client_frame(WebSocketOpcode.BINARY, b"abcdef")
+    sock = FakeSocket(incoming)
+    adapter = WebSocketVNCAdapter(sock, do_handshake=False)
+    adapter.ws.handshake_complete = True
+
+    assert adapter.recv(3, socket.MSG_PEEK) == b"abc"
+    assert adapter.recv(3) == b"abc"
+    assert adapter.recv(3) == b"def"

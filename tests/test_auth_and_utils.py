@@ -6,7 +6,7 @@ Comprehensive coverage of auth.py and server_utils.py
 import pytest
 import time
 from unittest.mock import Mock, MagicMock, patch
-from vnc_lib.auth import VNCAuth, NoAuth
+from vnc_lib.auth import VNCAuth, NoAuth, CRYPTO_AVAILABLE
 from vnc_lib.server_utils import (
     GracefulShutdown, HealthChecker, ConnectionPool,
     PerformanceThrottler, HealthStatus
@@ -80,6 +80,7 @@ class TestDESCipher:
         pass
 
 
+@pytest.mark.skipif(not CRYPTO_AVAILABLE, reason="pycryptodome is not installed")
 class TestVNCAuth:
     """Test VNC authentication"""
 
@@ -133,22 +134,22 @@ class TestVNCAuth:
         assert len(encrypted) == 16
 
     def test_recv_exact_helper(self):
-        """Test _recv_exact helper method"""
-        auth = VNCAuth("test")
+        """Test recv_exact helper function"""
+        from vnc_lib.io_utils import recv_exact
         mock_socket = MockSocket(b"Hello, World!")
 
-        data = auth._recv_exact(mock_socket, 5)
+        data = recv_exact(mock_socket, 5)
         assert data == b"Hello"
 
-        data = auth._recv_exact(mock_socket, 8)
+        data = recv_exact(mock_socket, 8)
         assert data == b", World!"
 
     def test_recv_exact_insufficient_data(self):
-        """Test _recv_exact with insufficient data"""
-        auth = VNCAuth("test")
+        """Test recv_exact with insufficient data"""
+        from vnc_lib.io_utils import recv_exact
         mock_socket = MockSocket(b"Short")
 
-        data = auth._recv_exact(mock_socket, 100)
+        data = recv_exact(mock_socket, 100)
         assert data is None
 
     def test_read_only_password_sets_view_only(self):
@@ -177,6 +178,19 @@ class TestVNCAuth:
         assert success is True
         assert view_only is False
 
+    def test_read_only_only_configuration_does_not_accept_empty_primary_password(self):
+        """An empty primary password must never grant full-control access."""
+        challenge = b"\x03" * 16
+        auth = VNCAuth("", read_only_password="readonly")
+        empty_password_response = auth._encrypt_challenge(challenge, password="")
+        mock_socket = MockSocket(empty_password_response)
+
+        with patch("os.urandom", return_value=challenge):
+            success, view_only = auth.authenticate_with_access(mock_socket)
+
+        assert success is False
+        assert view_only is False
+
 
 class TestGracefulShutdown:
     """Test graceful shutdown handler"""
@@ -196,6 +210,18 @@ class TestGracefulShutdown:
 
         assert shutdown.is_shutting_down()
         assert shutdown.shutdown_event.is_set()
+
+    def test_cleanup_runs_even_if_shutdown_event_was_already_set(self):
+        """Signal handlers may set the event before explicit cleanup runs."""
+        shutdown = GracefulShutdown()
+        called = []
+        shutdown.register_cleanup(lambda: called.append(True))
+        shutdown.shutdown_event.set()
+
+        shutdown.shutdown()
+        shutdown.shutdown()
+
+        assert called == [True]
 
     def test_cleanup_registration(self):
         """Test cleanup function registration"""

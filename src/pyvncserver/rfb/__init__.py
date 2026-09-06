@@ -4,7 +4,7 @@ from .auth import NoAuth, VNCAuth
 from .exceptions import (
     AuthenticationError,
     ConfigurationError,
-    ConnectionError,
+    VNCConnectionError,
     EncodingError,
     ProtocolError,
     ScreenCaptureError,
@@ -17,7 +17,7 @@ from .protocol import RFBProtocol
 __all__ = [
     "AuthenticationError",
     "ConfigurationError",
-    "ConnectionError",
+    "VNCConnectionError",
     "EncodingError",
     "EncodingTypes",
     "MessageTypes",

@@ -8,7 +8,7 @@ import struct
 import zlib
 from vnc_lib.encodings import (
     RawEncoder, RREEncoder, HextileEncoder, ZlibEncoder, ZRLEEncoder,
-    EncoderManager, encoding_name, format_encoding_list
+    EncoderManager, EncodingNotSuitable, encoding_name, format_encoding_list
 )
 from vnc_lib.tight_encoding import TightEncoder
 try:
@@ -75,15 +75,11 @@ class TestEncoders(unittest.TestCase):
         # For solid color, should have 0 subrectangles
         self.assertLessEqual(len(result), len(self.solid_pixels))
 
-    def test_rre_encoder_mixed(self):
-        """Test RRE encoding on mixed colors"""
+    def test_rre_encoder_mixed_rejects_expanding_payload(self):
+        """RRE must not return Raw bytes while the rectangle is still labelled RRE."""
         encoder = RREEncoder()
-        result = encoder.encode(self.mixed_pixels, self.width, self.height, self.bpp)
-
-        # RRE might not compress checkerboard pattern well
-        # Just verify it produces valid output
-        self.assertIsInstance(result, bytes)
-        self.assertGreater(len(result), 0)
+        with self.assertRaises(EncodingNotSuitable):
+            encoder.encode(self.mixed_pixels, self.width, self.height, self.bpp)
 
     def test_hextile_encoder(self):
         """Test Hextile encoding"""
@@ -250,7 +246,7 @@ class TestEncoders(unittest.TestCase):
             pixels.extend([i & 0xFF, (i >> 2) & 0xFF, (i >> 4) & 0xFF, 0])
         encoded = encoder.encode(bytes(pixels), width, height, bpp)
         self.assertGreater(len(encoded), 1)
-        self.assertEqual(encoded[0] & 0x0F, 0x01)  # reset stream 0
+        self.assertTrue(encoded[0] & 0x01)  # stream 0 is reset
         self.assertEqual(encoded[0] >> 4, 0x00)  # basic compression, stream 0
 
     def test_tight_basic_small_payload_sent_uncompressed(self):
@@ -267,15 +263,85 @@ class TestEncoders(unittest.TestCase):
         encoder.set_stream_reset_mode(True)
         payload = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9])  # 9 bytes
         encoded = encoder._encode_basic(payload, width=3, height=1, bpp=3)
-        self.assertEqual(encoded[0] & 0x0F, 0x01)
+        self.assertTrue(encoded[0] & 0x01)
         self.assertEqual(encoded[1:], payload)
 
-    def test_rre_large_region_falls_back_to_raw(self):
-        """Large region should avoid expensive RRE path."""
+
+    def test_tight_solid_detection_never_uses_sparse_false_positive(self):
+        """A changed pixel between old sampling points must prevent Tight FILL."""
+        encoder = TightEncoder()
+        width, height, bpp = 64, 64, 4
+        pixels = bytearray([0, 0, 0, 0] * (width * height))
+        # The old detector sampled every 16th pixel for a 64x64 rectangle and
+        # therefore missed this change at pixel index 1.
+        pixels[4:8] = bytes([255, 255, 255, 0])
+
+        encoded = encoder.encode(bytes(pixels), width, height, bpp)
+        self.assertNotEqual(encoded[0] >> 4, 0x08)
+
+    def test_tight_stream_reset_round_trip_like_ultravnc(self):
+        """Per-rectangle reset mode must produce independently decodable Tight zlib data."""
+        encoder = TightEncoder(compression_level=3)
+        encoder.set_stream_reset_mode(True)
+        width, height, bpp = 32, 16, 4
+
+        def make_frame(seed):
+            data = bytearray()
+            for i in range(width * height):
+                data.extend([
+                    (i + seed) & 0xFF,
+                    ((i >> 8) + seed * 3) & 0xFF,
+                    ((i * 47) + seed * 7) & 0xFF,
+                    0,
+                ])
+            return bytes(data)
+
+        def compact_length(buf, offset=1):
+            b0 = buf[offset]
+            length = b0 & 0x7F
+            offset += 1
+            if b0 & 0x80:
+                b1 = buf[offset]
+                length |= (b1 & 0x7F) << 7
+                offset += 1
+                if b1 & 0x80:
+                    b2 = buf[offset]
+                    length |= b2 << 14
+                    offset += 1
+            return length, offset
+
+        for seed in (1, 9, 23):
+            frame = make_frame(seed)
+            encoded = encoder.encode(frame, width, height, bpp)
+            control = encoded[0]
+            self.assertTrue(control & 0x01)
+            self.assertEqual(control >> 4, 0x00)
+            compressed_len, payload_offset = compact_length(encoded)
+            compressed = encoded[payload_offset:payload_offset + compressed_len]
+            decoded_rgb = zlib.decompressobj().decompress(compressed)
+
+            expected_rgb = bytearray()
+            for i in range(0, len(frame), 4):
+                b, g, r, _ = frame[i:i + 4]
+                expected_rgb.extend((r, g, b))
+            self.assertEqual(decoded_rgb, bytes(expected_rgb))
+
+    def test_tight_requested_reset_bits_are_sent_even_on_fill(self):
+        """Tight reset bits are legal and must not be lost on a FILL rectangle."""
+        encoder = TightEncoder()
+        encoder.request_stream_reset()
+        pixels = bytes([10, 20, 30, 0] * 16)
+        encoded = encoder.encode(pixels, 4, 4, 4)
+        self.assertEqual(encoded[0] & 0x0F, 0x0F)
+        self.assertEqual(encoded[0] >> 4, 0x08)
+        self.assertEqual(encoded[1:4], bytes([30, 20, 10]))
+
+    def test_rre_large_region_requests_outer_fallback(self):
+        """Large RRE regions must ask the selection layer to choose another encoding."""
         encoder = RREEncoder(max_pixels=64)
         large_pixels = bytes([1, 2, 3, 4] * 100)  # 100 pixels
-        result = encoder.encode(large_pixels, width=10, height=10, bytes_per_pixel=4)
-        self.assertEqual(result, large_pixels)
+        with self.assertRaises(EncodingNotSuitable):
+            encoder.encode(large_pixels, width=10, height=10, bytes_per_pixel=4)
 
     def test_encoder_manager(self):
         """Test encoder manager selection"""

@@ -78,6 +78,11 @@ class TightEncoder:
         }
         self._compressor_lock = threading.Lock()
         self._reset_stream_each_rect = False
+        # Reset bits are part of the Tight wire format. Whenever server-side
+        # compressor state is reset (for example after SetEncodings), the
+        # corresponding bits must be emitted on the next Tight rectangle so
+        # that the client's four inflate streams stay synchronized.
+        self._pending_reset_mask = 0
         self._rgb_conversion_buffer = bytearray()
 
     def encode(self, pixel_data: PixelData, width: int, height: int,
@@ -92,8 +97,7 @@ class TightEncoder:
         4. Return encoded data
         """
         if bytes_per_pixel not in (1, 2, 3, 4):
-            self.logger.warning(f"Tight: unsupported bpp {bytes_per_pixel}, using raw")
-            return self._encode_raw(pixel_data, width, height, bytes_per_pixel)
+            raise ValueError(f"Tight encoding does not support {bytes_per_pixel} bytes per pixel")
 
         if bytes_per_pixel == 4:
             # Avoid full-frame BGRX->RGB conversion for fill/palette paths.
@@ -153,18 +157,36 @@ class TightEncoder:
         dst[2::3] = src[0::4]  # B
         return dst
 
-    def _is_solid_fill(self, pixel_data: PixelData, bpp: int,
-                       num_samples: int = 256) -> bool:
-        """Check if image is solid color (uniform stride sampling for accuracy)"""
-        if len(pixel_data) < bpp:
+    def _is_solid_fill(self, pixel_data: PixelData, bpp: int) -> bool:
+        """Return True only when every complete pixel is exactly identical."""
+        if bpp <= 0 or len(pixel_data) < bpp:
             return True
+        if len(pixel_data) % bpp:
+            return False
 
-        first_pixel = pixel_data[:bpp]
+        first_pixel = bytes(pixel_data[:bpp])
         total_pixels = len(pixel_data) // bpp
-        stride = max(1, total_pixels // num_samples)
 
-        for i in range(stride * bpp, len(pixel_data), stride * bpp):
-            if pixel_data[i:i+bpp] != first_pixel:
+        # Do an exact comparison, but in moderately sized byte chunks so the
+        # hot path stays in optimized C code without allocating a full-frame
+        # repeated-pixel buffer. The old sparse sampling implementation could
+        # classify a real desktop rectangle as a solid fill whenever changes
+        # happened between the sampled pixels, causing Tight updates to appear
+        # frozen in clients such as UltraVNC.
+        chunk_pixels = 4096
+        full_chunk = first_pixel * chunk_pixels
+        chunk_bytes = len(full_chunk)
+        full_chunks, remainder_pixels = divmod(total_pixels, chunk_pixels)
+
+        offset = 0
+        for _ in range(full_chunks):
+            if pixel_data[offset:offset + chunk_bytes] != full_chunk:
+                return False
+            offset += chunk_bytes
+
+        if remainder_pixels:
+            tail = first_pixel * remainder_pixels
+            if pixel_data[offset:offset + len(tail)] != tail:
                 return False
 
         return True
@@ -182,7 +204,7 @@ class TightEncoder:
 
         This is extremely efficient: 4 bytes for entire screen!
         """
-        control = TightCompressionControl.FILL
+        control = int(TightCompressionControl.FILL) | self._take_reset_mask()
 
         pixel_value = pixel_data[:bpp]
 
@@ -202,7 +224,8 @@ class TightEncoder:
         b = pixel_data[0]
         g = pixel_data[1]
         r = pixel_data[2]
-        result = struct.pack("B", TightCompressionControl.FILL) + bytes((r, g, b))
+        control = int(TightCompressionControl.FILL) | self._take_reset_mask()
+        result = struct.pack("B", control) + bytes((r, g, b))
         self.logger.debug(
             "Tight FILL (BGRX): %d -> %d bytes",
             len(pixel_data),
@@ -243,7 +266,7 @@ class TightEncoder:
             return self._encode_basic(self._convert_bgrx_to_rgb(pixel_data), width, height, 3)
 
         stream_id = self.STREAM_MONO if num_colors == 2 else self.STREAM_PALETTE
-        reset_mask = (1 << stream_id) if self._reset_stream_each_rect else 0
+        reset_mask = self._take_reset_mask(stream_id)
         control_nibble = stream_id | 0x04
         control = (control_nibble << 4) | reset_mask
 
@@ -293,7 +316,7 @@ class TightEncoder:
         # - stream 1 for two-color palette rectangles
         # - stream 2 for indexed palette rectangles
         stream_id = self.STREAM_MONO if num_colors == 2 else self.STREAM_PALETTE
-        reset_mask = (1 << stream_id) if self._reset_stream_each_rect else 0
+        reset_mask = self._take_reset_mask(stream_id)
         control_nibble = stream_id | 0x04  # rfbTightExplicitFilter
         control = (control_nibble << 4) | reset_mask
 
@@ -422,7 +445,7 @@ class TightEncoder:
         """
         # Compression control with explicit GRADIENT filter on stream 3.
         stream_id = self.STREAM_GRADIENT
-        reset_mask = (1 << stream_id) if self._reset_stream_each_rect else 0
+        reset_mask = self._take_reset_mask(stream_id)
         control_nibble = stream_id | 0x04  # rfbTightExplicitFilter
         control = (control_nibble << 4) | reset_mask
 
@@ -509,10 +532,11 @@ class TightEncoder:
         tight_bytes = pixel_data
 
         stream_id = self.STREAM_RAW
+        reset_mask = self._take_reset_mask(stream_id)
         if len(tight_bytes) < self.MIN_TO_COMPRESS:
             # Tight requires small basic payloads (<12 bytes) to be sent raw
             # without the compact-length field.
-            control = 1 << stream_id if self._reset_stream_each_rect else 0x00
+            control = reset_mask
             result = bytes([control]) + tight_bytes
             self.logger.debug(
                 "Tight BASIC (raw small): %d -> %d bytes, control=0x%02x",
@@ -522,14 +546,13 @@ class TightEncoder:
             )
             return result
 
+        control = reset_mask
         if self._reset_stream_each_rect:
-            # Compatibility mode for UltraVNC-like decoders: reset stream 0
-            # before every Tight basic rectangle.
-            control = 1 << stream_id
+            # Compatibility mode: each compressed rectangle starts a fresh
+            # zlib stream and advertises the matching reset bit.
             compressed = self._compress_fresh_stream(tight_bytes)
         else:
-            # Use persistent zlib stream 0 (LibVNCServer-style).
-            control = 0x00  # stream 0, basic, no explicit filter, no reset bits
+            # Use persistent zlib stream 0 (TightVNC/UltraVNC style).
             compressed = self._compress_with_stream(tight_bytes, stream_id)
 
         # Build result with compact length
@@ -555,7 +578,7 @@ class TightEncoder:
         Pixel data follows immediately after the control byte, without
         a compact-length prefix.
         """
-        control = TightCompressionControl.NO_ZLIB
+        control = int(TightCompressionControl.NO_ZLIB) | self._take_reset_mask()
         return bytes([control]) + pixel_data
 
     def _compress_fresh_stream(self, payload: bytes) -> bytes:
@@ -600,20 +623,48 @@ class TightEncoder:
                          0x80 | ((length >> 7) & 0x7F),
                          (length >> 14) & 0xFF])
 
+    def _take_reset_mask(self, stream_id: int | None = None) -> int:
+        """Return/reset the wire reset mask for the rectangle being encoded."""
+        with self._compressor_lock:
+            reset_mask = self._pending_reset_mask & 0x0F
+            self._pending_reset_mask = 0
+
+        if self._reset_stream_each_rect and stream_id is not None:
+            reset_mask |= 1 << stream_id
+        return reset_mask & 0x0F
+
+    def request_stream_reset(self, mask: int = 0x0F) -> None:
+        """
+        Reset server-side Tight zlib state and advertise the same reset to the
+        client on the next rectangle.
+
+        Tight has four persistent streams. Resetting only the Python
+        compressors without setting the low four control bits would corrupt the
+        next rectangle for a client that already has inflate history.
+        """
+        mask &= 0x0F
+        if mask == 0:
+            return
+        self.reset_compressors()
+        with self._compressor_lock:
+            self._pending_reset_mask |= mask
+
     def reset_compressors(self):
-        """Reset zlib compressors (for new client or stream reset)"""
-        self.compressors = {
+        """Reset all server-side Tight zlib compressors."""
+        compressors = {
             i: zlib.compressobj(self.compression_level, zlib.DEFLATED, zlib.MAX_WBITS)
             for i in range(4)
         }
+        with self._compressor_lock:
+            self.compressors = compressors
         self.logger.debug("Tight encoder compressors reset")
 
     def set_compression_level(self, level: int) -> None:
-        """Update compression level and reset stream state only when the level changes."""
+        """Update compression level while keeping client/server stream state synchronized."""
         new_level = max(self.COMPRESSION_MIN, min(self.COMPRESSION_MAX, int(level)))
         if new_level != self.compression_level:
             self.compression_level = new_level
-            self.reset_compressors()
+            self.request_stream_reset()
 
     def set_stream_reset_mode(self, enabled: bool):
         """
@@ -622,7 +673,7 @@ class TightEncoder:
         enabled = bool(enabled)
         if enabled != self._reset_stream_each_rect:
             self._reset_stream_each_rect = enabled
-            self.reset_compressors()
+            self.request_stream_reset()
             self.logger.info(
                 "Tight stream reset mode %s",
                 "enabled" if enabled else "disabled",

@@ -12,10 +12,9 @@ from vnc_lib.desktop_resize import (
 )
 from vnc_lib.exceptions import (
     VNCError, ProtocolError, AuthenticationError,
-    ExceptionCollector, categorize_exceptions, collect_exceptions
+    ExceptionCollector, categorize_exceptions
 )
 from vnc_lib.metrics import SlidingWindow
-from vnc_lib.types import Result, Ok, Err, is_valid_dimension, narrow_bytes
 
 
 class TestCopyRectEncoding:
@@ -280,20 +279,6 @@ class TestExceptionGroups:
         assert len(categories["ProtocolError"]) == 2
         assert len(categories["AuthenticationError"]) == 1
 
-    def test_collect_exceptions_function(self):
-        """Test collect_exceptions utility function"""
-        operations = [
-            ("op1", lambda: None),  # Success
-            ("op2", lambda: (_ for _ in ()).throw(ValueError("Error 2"))),  # Fail
-            ("op3", lambda: None),  # Success
-            ("op4", lambda: (_ for _ in ()).throw(TypeError("Error 4"))),  # Fail
-        ]
-
-        errors = collect_exceptions(operations)
-
-        assert errors is not None
-        assert len(errors.exceptions) == 2
-
     def test_exception_notes(self):
         """Test exception notes (Python 3.11+)"""
         with ExceptionCollector() as collector:
@@ -385,94 +370,6 @@ class TestSlidingWindowGeneric:
 
         assert len(window) == 0
         assert not window  # Test __bool__
-
-
-class TestResultType:
-    """Test Result type for functional error handling"""
-
-    def test_result_ok(self):
-        """Test Ok result"""
-        result: Result[int, str] = Ok(42)
-
-        assert result.is_ok()
-        assert not result.is_err()
-        assert result.unwrap() == 42
-
-    def test_result_err(self):
-        """Test Err result"""
-        result: Result[int, str] = Err("Something failed")
-
-        assert not result.is_ok()
-        assert result.is_err()
-        assert result.unwrap_err() == "Something failed"
-
-    def test_result_unwrap_err(self):
-        """Test unwrap on Err raises ValueError"""
-        result: Result[int, str] = Err("Failed")
-
-        with pytest.raises(ValueError):
-            result.unwrap()
-
-    def test_result_unwrap_or(self):
-        """Test unwrap_or with default value"""
-        ok_result: Result[int, str] = Ok(42)
-        err_result: Result[int, str] = Err("Failed")
-
-        assert ok_result.unwrap_or(0) == 42
-        assert err_result.unwrap_or(0) == 0
-
-    def test_result_division_example(self):
-        """Test Result with division example"""
-        def divide(a: float, b: float) -> Result[float, str]:
-            if b == 0:
-                return Err("Division by zero")
-            return Ok(a / b)
-
-        result1 = divide(10, 2)
-        assert result1.is_ok()
-        assert result1.unwrap() == 5.0
-
-        result2 = divide(10, 0)
-        assert result2.is_err()
-        assert "zero" in result2.unwrap_err()
-
-
-class TestTypeHelpers:
-    """Test type narrowing and validation helpers"""
-
-    def test_is_valid_dimension(self):
-        """Test dimension validation"""
-        assert is_valid_dimension(1920, 1080)
-        assert is_valid_dimension(1, 1)
-        assert not is_valid_dimension(0, 100)
-        assert not is_valid_dimension(100, 0)
-        assert not is_valid_dimension(-100, 200)
-        assert not is_valid_dimension(70000, 1080)  # Too large
-
-    def test_narrow_bytes(self):
-        """Test bytes type narrowing with pattern matching"""
-        # bytes input
-        result = narrow_bytes(b"test")
-        assert result == b"test"
-        assert isinstance(result, bytes)
-
-        # bytearray input
-        result = narrow_bytes(bytearray(b"test"))
-        assert result == b"test"
-        assert isinstance(result, bytes)
-
-        # memoryview input
-        result = narrow_bytes(memoryview(b"test"))
-        assert result == b"test"
-        assert isinstance(result, bytes)
-
-    def test_narrow_bytes_invalid_type(self):
-        """Test narrow_bytes with invalid type"""
-        with pytest.raises(TypeError):
-            narrow_bytes("not bytes")  # type: ignore
-
-        with pytest.raises(TypeError):
-            narrow_bytes(123)  # type: ignore
 
 
 class TestEncoderManagerPatternMatching:

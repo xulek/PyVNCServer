@@ -13,7 +13,12 @@ Uses Python 3.13 features:
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Protocol, Self
+from typing import Protocol
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -21,11 +26,7 @@ from enum import IntEnum
 class ClipboardFormat(IntEnum):
     """Clipboard data formats supported by VNC protocol."""
 
-    TEXT = 0  # Plain text (Latin-1)
-    RTF = 1  # Rich Text Format
-    HTML = 2  # HTML
-    DIB = 3  # Device Independent Bitmap
-    FILES = 4  # File list
+    TEXT = 0
 
 
 @dataclass(slots=True)
@@ -358,25 +359,3 @@ def sanitize_clipboard_text(text: str, max_length: int = 1_000_000) -> str:
     return result
 
 
-def estimate_clipboard_encoding(data: bytes) -> str:
-    """
-    Estimate the best encoding for clipboard data.
-
-    Tries to detect UTF-8, Latin-1, or other encodings.
-    """
-    # Try UTF-8 first (most common modern encoding)
-    try:
-        data.decode('utf-8')
-        return 'utf-8'
-    except UnicodeDecodeError:
-        pass
-
-    # Try Latin-1 (VNC default, never fails)
-    try:
-        data.decode('latin-1')
-        return 'latin-1'
-    except UnicodeDecodeError:
-        pass
-
-    # Fallback to ASCII with replacement
-    return 'ascii'

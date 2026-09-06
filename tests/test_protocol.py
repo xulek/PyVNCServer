@@ -431,21 +431,21 @@ class TestHelperMethods:
 
     def test_recv_exact(self):
         """Test receiving exactly n bytes"""
-        protocol = RFBProtocol()
+        from vnc_lib.io_utils import recv_exact
         mock_socket = MockSocket(b"Hello, World!")
 
-        data = protocol._recv_exact(mock_socket, 5)
+        data = recv_exact(mock_socket, 5)
         assert data == b"Hello"
 
-        data = protocol._recv_exact(mock_socket, 8)
+        data = recv_exact(mock_socket, 8)
         assert data == b", World!"
 
     def test_recv_exact_insufficient_data(self):
         """Test recv_exact with insufficient data"""
-        protocol = RFBProtocol()
+        from vnc_lib.io_utils import recv_exact
         mock_socket = MockSocket(b"Short")
 
-        data = protocol._recv_exact(mock_socket, 100)
+        data = recv_exact(mock_socket, 100)
         assert data is None
 
     def test_find_common_version(self):

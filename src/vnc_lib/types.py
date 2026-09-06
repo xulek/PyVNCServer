@@ -1,61 +1,39 @@
 """
 Type Aliases and Type Definitions for VNC Server
-Python 3.13 with enhanced type syntax (PEP 695)
 """
 
-from typing import Protocol, Callable, TypedDict, TypeAlias, Generic, TypeVar
-from collections.abc import Sequence
+from typing import Protocol, Callable, TypedDict, TypeAlias
 
 
 # ============================================================================
-# Basic Types (Python 3.12+ would use 'type' statement)
+# Basic Types
 # ============================================================================
 
-# Binary data types
 PixelData: TypeAlias = bytes
 EncodedData: TypeAlias = bytes
-AuthChallenge: TypeAlias = bytes
-AuthResponse: TypeAlias = bytes
 
-# Network types
 IPAddress: TypeAlias = str
 Port: TypeAlias = int
 ClientID: TypeAlias = str
-SocketAddress: TypeAlias = tuple[IPAddress, Port]
 
-# Dimensions and coordinates
 Width: TypeAlias = int
 Height: TypeAlias = int
 XCoordinate: TypeAlias = int
 YCoordinate: TypeAlias = int
-Dimension: TypeAlias = tuple[Width, Height]
-Position: TypeAlias = tuple[XCoordinate, YCoordinate]
 Rectangle: TypeAlias = tuple[XCoordinate, YCoordinate, Width, Height]
 
-# Time and performance
 Timestamp: TypeAlias = float
-Duration: TypeAlias = float  # in seconds
-Milliseconds: TypeAlias = float
+Duration: TypeAlias = float
 FPS: TypeAlias = float
 CompressionRatio: TypeAlias = float
 
-# Protocol types
-ProtocolVersion: TypeAlias = tuple[int, int]  # (major, minor)
-SecurityType: TypeAlias = int
 EncodingType: TypeAlias = int
 MessageType: TypeAlias = int
+SecurityType: TypeAlias = int
 
-# Color and pixel format
-RGB: TypeAlias = tuple[int, int, int]
-RGBA: TypeAlias = tuple[int, int, int, int]
-PixelValue: TypeAlias = int
-ColorDepth: TypeAlias = int
 BitsPerPixel: TypeAlias = int
 BytesPerPixel: TypeAlias = int
-
-# Configuration
-ConfigValue: TypeAlias = str | int | float | bool
-ConfigDict: TypeAlias = dict[str, ConfigValue]
+ColorDepth: TypeAlias = int
 
 
 # ============================================================================
@@ -135,7 +113,6 @@ class Encoder(Protocol):
 
     def encode(self, pixel_data: PixelData, width: Width,
                height: Height, bytes_per_pixel: BytesPerPixel) -> EncodedData:
-        """Encode pixel data to specified encoding"""
         ...
 
 
@@ -143,7 +120,6 @@ class ScreenCapture(Protocol):
     """Protocol for screen capture implementations"""
 
     def capture(self, pixel_format: PixelFormat) -> tuple[PixelData, Width, Height]:
-        """Capture screen with specified pixel format"""
         ...
 
 
@@ -151,7 +127,6 @@ class AuthHandler(Protocol):
     """Protocol for authentication handlers"""
 
     def authenticate(self, client_socket) -> bool:
-        """Authenticate client"""
         ...
 
 
@@ -163,134 +138,8 @@ ErrorCallback: TypeAlias = Callable[[Exception], None]
 ClientCallback: TypeAlias = Callable[[ClientID], None]
 FrameCallback: TypeAlias = Callable[[PixelData, Width, Height], None]
 ResizeCallback: TypeAlias = Callable[[Width, Height], None]
-LogCallback: TypeAlias = Callable[[str, str], None]  # (level, message)
-
-# Health check callback
+LogCallback: TypeAlias = Callable[[str, str], None]
 HealthCheckFunc: TypeAlias = Callable[[], bool]
-
-
-# ============================================================================
-# Generic Bounded Types (Python 3.13)
-# ============================================================================
-
-Numeric: TypeAlias = int | float
-# MetricValue is unused and requires Python 3.12+ generic syntax
-# type MetricValue[T: Numeric] = T
-WindowSize: TypeAlias = int
-
-
-# ============================================================================
-# Result Types (for error handling)
-# ============================================================================
-
-# Type variables for Result class
-T = TypeVar('T')
-E = TypeVar('E')
-
-
-class Result(Generic[T, E]):
-    """
-    Result type for operations that can fail
-    Generic class compatible with Python 3.9+
-
-    Example:
-        >>> def divide(a: float, b: float) -> Result[float, str]:
-        ...     if b == 0:
-        ...         return Err("Division by zero")
-        ...     return Ok(a / b)
-    """
-
-    def __init__(self, value: T | None = None, error: E | None = None):
-        self._value = value
-        self._error = error
-        self._is_ok = error is None
-
-    @classmethod
-    def ok(cls, value: T) -> 'Result[T, E]':
-        """Create successful result"""
-        return cls(value=value, error=None)
-
-    @classmethod
-    def err(cls, error: E) -> 'Result[T, E]':
-        """Create error result"""
-        return cls(value=None, error=error)
-
-    def is_ok(self) -> bool:
-        """Check if result is successful"""
-        return self._is_ok
-
-    def is_err(self) -> bool:
-        """Check if result is error"""
-        return not self._is_ok
-
-    def unwrap(self) -> T:
-        """Get value or raise exception"""
-        if self._is_ok:
-            return self._value  # type: ignore
-        raise ValueError(f"Called unwrap on error: {self._error}")
-
-    def unwrap_or(self, default: T) -> T:
-        """Get value or return default"""
-        return self._value if self._is_ok else default  # type: ignore
-
-    def unwrap_err(self) -> E:
-        """Get error or raise exception"""
-        if not self._is_ok:
-            return self._error  # type: ignore
-        raise ValueError("Called unwrap_err on ok result")
-
-
-# Convenience constructors
-def Ok(value: T) -> Result[T, E]:
-    """Create successful result"""
-    return Result.ok(value)
-
-
-def Err(error: E) -> Result[T, E]:
-    """Create error result"""
-    return Result.err(error)
-
-
-# ============================================================================
-# Encoding-specific types
-# ============================================================================
-
-RawData: TypeAlias = bytes
-CompressedData: TypeAlias = bytes
-RLEData: TypeAlias = bytes
-TileData: TypeAlias = bytes
-SubrectangleData: TypeAlias = bytes
-
-# CopyRect
-SourcePosition: TypeAlias = tuple[XCoordinate, YCoordinate]
-
-# Hextile
-SubencodingMask: TypeAlias = int
-TileIndex: TypeAlias = tuple[int, int]
-
-# ZRLE
-CPIXELData: TypeAlias = bytes
-CompressionLevel: TypeAlias = int
-
-
-# ============================================================================
-# Change detection types
-# ============================================================================
-
-TileChecksum: TypeAlias = bytes
-TileCoordinate: TypeAlias = tuple[int, int]
-ChangeScore: TypeAlias = float
-RegionList: TypeAlias = list[Rectangle]
-
-
-# ============================================================================
-# Cursor types
-# ============================================================================
-
-CursorPixelData: TypeAlias = bytes
-CursorBitmask: TypeAlias = bytes
-HotspotX: TypeAlias = int
-HotspotY: TypeAlias = int
 
 
 # ============================================================================
@@ -321,11 +170,6 @@ class ConnectionStats(TypedDict):
 # Type guards and validators
 # ============================================================================
 
-def is_valid_dimension(width: int, height: int) -> bool:
-    """Type guard for valid dimensions"""
-    return width > 0 and height > 0 and width <= 65535 and height <= 65535
-
-
 def is_valid_pixel_format(pf: PixelFormat) -> bool:
     """Type guard for valid pixel format"""
     return (
@@ -335,43 +179,6 @@ def is_valid_pixel_format(pf: PixelFormat) -> bool:
         pf['green_max'] > 0 and
         pf['blue_max'] > 0
     )
-
-
-def is_valid_encoding_type(enc: int) -> bool:
-    """Type guard for valid encoding type"""
-    # Standard encodings: 0-16, pseudo-encodings: negative
-    return -1000 <= enc <= 1000
-
-
-# ============================================================================
-# Type narrowing helpers (Python 3.13)
-# ============================================================================
-
-def narrow_bytes(data: bytes | bytearray | memoryview) -> bytes:
-    """
-    Narrow union type to bytes
-
-    Example with pattern matching:
-        match data:
-            case bytes() as b:
-                return b
-            case bytearray() | memoryview() as other:
-                return bytes(other)
-    """
-    match data:
-        case bytes():
-            return data
-        case bytearray() | memoryview():
-            return bytes(data)
-        case _:
-            raise TypeError(f"Expected bytes-like object, got {type(data)}")
-
-
-def narrow_positive_int(value: int, name: str = "value") -> int:
-    """Narrow int to positive int with validation"""
-    if value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}")
-    return value
 
 
 # ============================================================================

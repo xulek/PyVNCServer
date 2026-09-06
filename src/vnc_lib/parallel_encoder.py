@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from queue import Queue, Empty
 import threading
 
+from vnc_lib.encodings import EncodingNotSuitable
+
 # Type aliases
 PixelData: TypeAlias = bytes
 EncodedData: TypeAlias = bytes
@@ -72,7 +74,8 @@ class ParallelEncoder:
     - Minimal overhead for thread management
     """
 
-    def __init__(self, max_workers: int = None, tile_size: int = 256):
+    def __init__(self, max_workers: int = None, tile_size: int = 256,
+                 executor: ThreadPoolExecutor | None = None):
         """
         Initialize parallel encoder
 
@@ -92,11 +95,15 @@ class ParallelEncoder:
         self.max_workers = max_workers
         self.tile_size = tile_size
 
-        # Thread pool
-        self.executor = ThreadPoolExecutor(
+        # Prefer a server-wide executor to avoid creating up to N workers per
+        # connected client. Standalone callers still get an owned pool.
+        self._owns_executor = executor is None
+        self.executor = executor or ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="VNC-Encoder"
         )
+        if executor is not None:
+            self.max_workers = int(getattr(executor, "_max_workers", max_workers))
 
         # Statistics
         self.total_tasks = 0
@@ -211,6 +218,24 @@ class ParallelEncoder:
 
             return result
 
+        except EncodingNotSuitable as exc:
+            self.logger.debug(
+                "Encoding %d not suitable for region %d: %s; using Raw",
+                task.encoding_type,
+                task.region_id,
+                exc,
+            )
+            return EncodingResult(
+                region_id=task.region_id,
+                x=task.x, y=task.y,
+                width=task.width, height=task.height,
+                encoding_type=0,
+                encoded_data=task.pixel_data,
+                encoding_time=time.perf_counter() - start_time,
+                original_size=len(task.pixel_data),
+                compressed_size=len(task.pixel_data)
+            )
+
         except Exception as e:
             self.logger.error(f"Encoding failed for region {task.region_id}: {e}")
             # Return raw data as fallback
@@ -315,7 +340,9 @@ class ParallelEncoder:
         }
 
     def shutdown(self, wait: bool = True):
-        """Shutdown thread pool"""
+        """Shutdown an owned thread pool; shared executors are server-owned."""
+        if not self._owns_executor:
+            return
         self.logger.info("Shutting down parallel encoder...")
         self.executor.shutdown(wait=wait)
         self.logger.info("Parallel encoder shutdown complete")
@@ -333,8 +360,9 @@ class AdaptiveParallelEncoder(ParallelEncoder):
     For best performance under varying load conditions
     """
 
-    def __init__(self, max_workers: int = None, tile_size: int = 256):
-        super().__init__(max_workers, tile_size)
+    def __init__(self, max_workers: int = None, tile_size: int = 256,
+                 executor: ThreadPoolExecutor | None = None):
+        super().__init__(max_workers, tile_size, executor=executor)
 
         # Adaptive parameters
         self.min_workers = 1

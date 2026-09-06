@@ -16,10 +16,23 @@ import time
 import threading
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Self
+from typing import Any
+import sys
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 from dataclasses import dataclass, field, asdict
 from collections.abc import Callable
-from enum import StrEnum
+import enum
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    class StrEnum(str, enum.Enum):
+        """StrEnum polyfill for Python < 3.11."""
+        def __new__(cls, value):
+            return str.__new__(cls, value)
 from contextvars import ContextVar
 from pathlib import Path
 

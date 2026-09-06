@@ -86,6 +86,10 @@ def format_encoding_list(encodings: Iterable[int]) -> str:
     return ", ".join(f"{encoding_name(enc)} ({enc})" for enc in unique_ordered)
 
 
+class EncodingNotSuitable(RuntimeError):
+    """Raised when an encoding cannot safely represent a rectangle efficiently."""
+
+
 class Encoder(Protocol):
     """Protocol for encoder implementations (Python 3.13 style)"""
 
@@ -397,86 +401,6 @@ class CopyRectEncoder:
             return False
         return prev_region == target_region
 
-    def _find_matching_region(self, current: PixelData, previous: PixelData,
-                              width: int, height: int, bpp: int,
-                              min_match_size: int = 64) -> tuple[int, int] | None:
-        """
-        Find matching region in previous frame
-
-        Returns: (src_x, src_y) if match found with sufficient size
-        """
-        # Simple implementation: check if entire image shifted
-        # A full implementation would check multiple regions
-
-        # Check for vertical scroll (most common case)
-        for dy in [-10, -5, -3, -2, -1, 1, 2, 3, 5, 10]:
-            if self._is_vertical_shift(current, previous, width, height, bpp, dy):
-                # Determine source position based on shift direction
-                src_y = max(0, -dy) if dy < 0 else 0
-                return (0, src_y)
-
-        # Check for horizontal scroll
-        for dx in [-10, -5, -3, -2, -1, 1, 2, 3, 5, 10]:
-            if self._is_horizontal_shift(current, previous, width, height, bpp, dx):
-                src_x = max(0, -dx) if dx < 0 else 0
-                return (src_x, 0)
-
-        return None
-
-    def _is_vertical_shift(self, current: PixelData, previous: PixelData,
-                          width: int, height: int, bpp: int, dy: int) -> bool:
-        """Check if image shifted vertically by dy pixels"""
-        if abs(dy) >= height:
-            return False
-
-        # Check if lines match after shift
-        matches = 0
-        check_lines = min(10, height - abs(dy))  # Check 10 lines
-
-        for y in range(check_lines):
-            curr_y = y if dy > 0 else y + abs(dy)
-            prev_y = y + dy if dy > 0 else y
-
-            if 0 <= curr_y < height and 0 <= prev_y < height:
-                curr_offset = curr_y * width * bpp
-                prev_offset = prev_y * width * bpp
-                line_size = width * bpp
-
-                if current[curr_offset:curr_offset + line_size] == previous[prev_offset:prev_offset + line_size]:
-                    matches += 1
-
-        return matches >= check_lines * 0.8  # 80% match threshold
-
-    def _is_horizontal_shift(self, current: PixelData, previous: PixelData,
-                            width: int, height: int, bpp: int, dx: int) -> bool:
-        """Check if image shifted horizontally by dx pixels"""
-        if abs(dx) >= width:
-            return False
-
-        # Check if columns match after shift (sample-based)
-        matches = 0
-        check_cols = min(10, width - abs(dx))
-
-        for x in range(check_cols):
-            curr_x = x if dx > 0 else x + abs(dx)
-            prev_x = x + dx if dx > 0 else x
-
-            if 0 <= curr_x < width and 0 <= prev_x < width:
-                # Check a few pixels in this column
-                match_count = 0
-                for y in range(0, height, max(1, height // 10)):
-                    curr_offset = (y * width + curr_x) * bpp
-                    prev_offset = (y * width + prev_x) * bpp
-
-                    if current[curr_offset:curr_offset + bpp] == previous[prev_offset:prev_offset + bpp]:
-                        match_count += 1
-
-                if match_count >= 8:  # At least 8/10 pixels match
-                    matches += 1
-
-        return matches >= check_cols * 0.8  # 80% match threshold
-
-
 class RREEncoder:
     """
     RRE (Rise-and-Run-length Encoding) - RFC 6143 Section 7.6.4
@@ -507,20 +431,22 @@ class RREEncoder:
             - x, y, width, height (2 bytes each)
         """
         if bytes_per_pixel not in (1, 2, 4):
-            self.logger.warning(f"RRE: unsupported bpp {bytes_per_pixel}")
-            return pixel_data
+            raise EncodingNotSuitable(
+                f"RRE does not support {bytes_per_pixel} bytes per pixel"
+            )
 
         num_pixels = width * height
         if num_pixels <= 0:
-            return pixel_data
-        if len(pixel_data) < num_pixels * bytes_per_pixel:
-            self.logger.warning("RRE: pixel buffer smaller than expected, falling back to raw")
-            return pixel_data
-        if num_pixels > self.max_pixels:
-            self.logger.debug(
-                f"RRE: region too large ({num_pixels} px > {self.max_pixels}), using raw"
+            raise EncodingNotSuitable("RRE cannot encode an empty rectangle")
+        expected_size = num_pixels * bytes_per_pixel
+        if len(pixel_data) < expected_size:
+            raise EncodingNotSuitable(
+                "RRE pixel buffer is smaller than the rectangle requires"
             )
-            return pixel_data
+        if num_pixels > self.max_pixels:
+            raise EncodingNotSuitable(
+                f"RRE rectangle is too large ({num_pixels} px > {self.max_pixels})"
+            )
 
         # Find background color (most common pixel)
         background = self._find_background(pixel_data, bytes_per_pixel)
@@ -531,8 +457,9 @@ class RREEncoder:
             max_subrectangles=self.max_subrectangles
         )
         if subrects is None:
-            self.logger.debug("RRE: too many subrectangles, using raw")
-            return pixel_data
+            raise EncodingNotSuitable(
+                f"RRE rectangle needs more than {self.max_subrectangles} subrectangles"
+            )
 
         # Build encoded data
         result = bytearray()
@@ -543,13 +470,18 @@ class RREEncoder:
             result.extend(pixel_value)
             result.extend(struct.pack(">HHHH", x, y, w, h))
 
-        # Only use RRE if it's more efficient
-        if len(result) < len(pixel_data):
-            self.logger.debug(f"RRE: {len(pixel_data)} -> {len(result)} bytes")
-            return bytes(result)
-        else:
-            # Fallback to raw if RRE doesn't help
-            return pixel_data
+        # Never return Raw bytes from an RRE encoder. The caller would still
+        # advertise encoding type 2 in the rectangle header, which makes an
+        # RFB client parse arbitrary pixel bytes as an RRE subrectangle count
+        # and desynchronizes the connection. Instead, tell the selection layer
+        # to choose another encoding (Raw is always legal in RFB).
+        if len(result) >= len(pixel_data):
+            raise EncodingNotSuitable(
+                f"RRE payload would expand the rectangle ({len(result)} >= {len(pixel_data)})"
+            )
+
+        self.logger.debug(f"RRE: {len(pixel_data)} -> {len(result)} bytes")
+        return bytes(result)
 
     def _find_background(self, pixel_data: PixelData, bpp: int) -> bytes:
         """Find most common pixel value (background)"""
@@ -1620,15 +1552,6 @@ class ZRLEEncoder:
             index += run_length
         return bytes(result)
 
-    def _encode_run_length(self, run_length: int) -> bytes:
-        remaining = max(0, run_length - 1)
-        encoded = bytearray()
-        while remaining >= 255:
-            encoded.append(255)
-            remaining -= 255
-        encoded.append(remaining)
-        return bytes(encoded)
-
     def _encode_run_length_into(self, result: bytearray, run_length: int) -> None:
         remaining = max(0, run_length - 1)
         while remaining >= 255:
@@ -1680,6 +1603,7 @@ class EncoderManager:
     def __init__(self, enable_tight: bool = True, enable_h264: bool = False,
                  enable_jpeg: bool = True, disable_tight_for_ultravnc: bool = False,
                  enable_copyrect: bool = False, enable_zrle: bool = False):
+        self.logger = logging.getLogger(__name__)
         self.encoders: dict[int, Encoder] = {
             0: RawEncoder(),
             2: RREEncoder(),
@@ -1687,22 +1611,17 @@ class EncoderManager:
             6: ZlibEncoder(),
         }
 
-        # Keep experimental/non-compliant encoders opt-in only until their
-        # wire-format implementation matches the RFCs we claim to support.
         if enable_copyrect:
             self.encoders[1] = CopyRectEncoder()
         if enable_zrle:
             self.encoders[16] = ZRLEEncoder()
 
-        # Add advanced encoders if enabled
         if enable_tight:
             try:
                 from vnc_lib.tight_encoding import TightEncoder
                 self.encoders[7] = TightEncoder()
-                self.logger = logging.getLogger(__name__)
                 self.logger.info("Tight encoding enabled")
             except ImportError as e:
-                self.logger = logging.getLogger(__name__)
                 self.logger.warning(f"Tight encoding unavailable: {e}")
 
         if enable_jpeg:
@@ -1711,21 +1630,10 @@ class EncoderManager:
                 self.encoders[21] = JPEGEncoder()
                 self.logger.info("JPEG encoding enabled")
             except ImportError as e:
-                if not hasattr(self, 'logger'):
-                    self.logger = logging.getLogger(__name__)
                 self.logger.warning(f"JPEG encoding unavailable (PIL needed): {e}")
 
         if enable_h264:
-            try:
-                # H.264 is managed separately per-client
-                self.logger.info("H.264 encoding enabled (per-client initialization)")
-            except Exception as e:
-                if not hasattr(self, 'logger'):
-                    self.logger = logging.getLogger(__name__)
-                self.logger.warning(f"H.264 encoding unavailable: {e}")
-
-        if not hasattr(self, 'logger'):
-            self.logger = logging.getLogger(__name__)
+            self.logger.info("H.264 encoding enabled (per-client initialization)")
 
         self._disable_tight_for_ultravnc = disable_tight_for_ultravnc
 

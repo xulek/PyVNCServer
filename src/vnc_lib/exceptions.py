@@ -4,6 +4,7 @@ Python 3.13 with Exception Groups (PEP 654)
 """
 
 import builtins
+import sys
 from typing import Sequence
 
 
@@ -43,8 +44,34 @@ class ConfigurationError(VNCError):
     pass
 
 
-# Exception group utilities (Python 3.13)
-class VNCExceptionGroup(ExceptionGroup):
+# Exception group utilities (Python 3.11+)
+if sys.version_info >= (3, 11):
+    _BaseExceptionGroup = ExceptionGroup
+else:
+    class _BaseExceptionGroup(BaseException):
+        """Minimal ExceptionGroup polyfill for Python < 3.11."""
+
+        def __init__(self, message: str, exceptions: Sequence[Exception]):
+            super().__init__(message, exceptions)
+            self._message = message
+            self._exceptions = list(exceptions)
+
+        @property
+        def message(self) -> str:
+            return self._message
+
+        @property
+        def exceptions(self) -> list[Exception]:
+            return self._exceptions
+
+        def __str__(self) -> str:
+            return self._message
+
+        def __repr__(self) -> str:
+            return f"{type(self).__name__}({self._message!r}, {self._exceptions!r})"
+
+
+class VNCExceptionGroup(_BaseExceptionGroup):
     """Custom exception group for VNC operations"""
 
     @classmethod
@@ -68,104 +95,8 @@ class MultiClientError(VNCExceptionGroup):
     pass
 
 
-class EncodingErrorGroup(VNCExceptionGroup):
-    """Exception group for multiple encoding failures"""
-    pass
-
-
-# Exception handling utilities
-def collect_exceptions(operations: list[tuple[str, callable]]) -> VNCExceptionGroup | None:
-    """
-    Execute multiple operations and collect exceptions
-
-    Args:
-        operations: List of (name, callable) tuples
-
-    Returns:
-        VNCExceptionGroup if any operations failed, None if all succeeded
-
-    Example:
-        >>> ops = [
-        ...     ("encode_1", lambda: encoder1.encode(data)),
-        ...     ("encode_2", lambda: encoder2.encode(data)),
-        ... ]
-        >>> errors = collect_exceptions(ops)
-        >>> if errors:
-        ...     handle_errors(errors)
-    """
-    exceptions: list[Exception] = []
-
-    for name, operation in operations:
-        try:
-            operation()
-        except Exception as e:
-            # Annotate exception with operation name
-            e.add_note(f"Failed during: {name}")
-            exceptions.append(e)
-
-    if exceptions:
-        return VNCExceptionGroup.from_exceptions(
-            f"Multiple operations failed: {len(exceptions)}/{len(operations)}",
-            exceptions
-        )
-
-    return None
-
-
-def handle_client_errors(client_errors: dict[str, Exception]) -> None:
-    """
-    Handle errors from multiple clients using exception groups
-
-    Args:
-        client_errors: Dict mapping client_id to exception
-
-    Raises:
-        MultiClientError: If any client errors occurred
-
-    Example:
-        >>> errors = {}
-        >>> for client_id, client in clients.items():
-        ...     try:
-        ...         handle_client(client)
-        ...     except Exception as e:
-        ...         errors[client_id] = e
-        >>> if errors:
-        ...     handle_client_errors(errors)
-    """
-    if not client_errors:
-        return
-
-    # Annotate exceptions with client IDs
-    exceptions = []
-    for client_id, exc in client_errors.items():
-        exc.add_note(f"Client: {client_id}")
-        exceptions.append(exc)
-
-    # Raise exception group
-    raise MultiClientError(
-        f"Errors from {len(client_errors)} client(s)",
-        exceptions
-    )
-
-
-def categorize_exceptions(exc_group: ExceptionGroup) -> dict[str, list[Exception]]:
-    """
-    Categorize exceptions in a group by type
-
-    Args:
-        exc_group: Exception group to categorize
-
-    Returns:
-        Dict mapping exception type names to lists of exceptions
-
-    Example:
-        >>> try:
-        ...     # Multiple operations
-        ... except ExceptionGroup as eg:
-        ...     categories = categorize_exceptions(eg)
-        ...     if "ConnectionError" in categories:
-        ...         log.error(f"Connection errors: {len(categories['ConnectionError'])}")
-    """
+def categorize_exceptions(exc_group: _BaseExceptionGroup) -> dict[str, list[Exception]]:
+    """Categorize exceptions in a group by type"""
     categories: dict[str, list[Exception]] = {}
 
     for exc in exc_group.exceptions:
@@ -179,58 +110,43 @@ def categorize_exceptions(exc_group: ExceptionGroup) -> dict[str, list[Exception
 
 # Context manager for exception collection
 class ExceptionCollector:
-    """
-    Context manager for collecting multiple exceptions
-
-    Example:
-        >>> with ExceptionCollector() as collector:
-        ...     for item in items:
-        ...         with collector.catch("process_item"):
-        ...             process(item)
-        >>> if collector.has_exceptions():
-        ...     raise collector.create_exception_group("Processing failed")
-    """
+    """Context manager for collecting multiple exceptions"""
 
     def __init__(self):
         self.exceptions: list[Exception] = []
         self.current_operation: str | None = None
 
     def __enter__(self) -> 'ExceptionCollector':
-        """Enter context"""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Exit context - don't suppress exceptions"""
         return False
 
     def catch(self, operation_name: str):
-        """
-        Return a context manager that catches exceptions for a specific operation
-
-        Usage:
-            with collector.catch("operation_name"):
-                do_something()
-        """
         return _CatchContext(self, operation_name)
 
     def add_exception(self, exc: Exception, operation: str | None = None) -> None:
-        """Add an exception to the collection"""
         if operation:
-            exc.add_note(f"During: {operation}")
+            note = f"During: {operation}"
+            if hasattr(exc, 'add_note'):
+                exc.add_note(note)
+            else:
+                existing = getattr(exc, '__notes__', None)
+                if existing is not None:
+                    existing.append(note)
+                else:
+                    exc.__notes__ = [note]
         self.exceptions.append(exc)
 
     def has_exceptions(self) -> bool:
-        """Check if any exceptions were collected"""
         return bool(self.exceptions)
 
     def create_exception_group(self, message: str) -> VNCExceptionGroup | None:
-        """Create exception group from collected exceptions"""
         if not self.exceptions:
             return None
         return VNCExceptionGroup.from_exceptions(message, self.exceptions)
 
     def raise_if_errors(self, message: str = "Multiple errors occurred") -> None:
-        """Raise exception group if any exceptions were collected"""
         if self.exceptions:
             raise self.create_exception_group(message)
 
@@ -248,5 +164,5 @@ class _CatchContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_val is not None:
             self.collector.add_exception(exc_val, self.operation)
-            return True  # Suppress exception
+        return True
         return False

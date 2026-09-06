@@ -5,14 +5,16 @@ Implements proper DES-based VNC authentication
 
 import os
 import logging
+import hmac
 from typing import Optional
+
+from vnc_lib.io_utils import recv_exact
 
 try:
     from Crypto.Cipher import DES
     CRYPTO_AVAILABLE = True
 except ImportError:
     CRYPTO_AVAILABLE = False
-    logging.warning("pycryptodome not available - VNC authentication will not work")
 
 
 class VNCAuth:
@@ -55,20 +57,20 @@ class VNCAuth:
         try:
             # Generate random challenge
             challenge = os.urandom(self.CHALLENGE_SIZE)
-            self.logger.debug(f"Generated challenge: {challenge.hex()}")
 
             # Send challenge to client
             client_socket.sendall(challenge)
 
             # Receive encrypted response
-            response = self._recv_exact(client_socket, self.CHALLENGE_SIZE)
+            response = recv_exact(client_socket, self.CHALLENGE_SIZE)
             if not response:
                 self.logger.warning("Failed to receive authentication response")
                 return False, False
 
-            self.logger.debug(f"Received response: {response.hex()}")
 
-            if self._response_matches_password(challenge, response, self.password):
+            if self.password and self._response_matches_password(
+                challenge, response, self.password
+            ):
                 self.logger.info("VNC authentication successful")
                 return True, False
 
@@ -89,8 +91,7 @@ class VNCAuth:
         self, challenge: bytes, response: bytes, password: str
     ) -> bool:
         expected_response = self._encrypt_challenge(challenge, password=password)
-        self.logger.debug(f"Expected response: {expected_response.hex()}")
-        return response == expected_response
+        return hmac.compare_digest(response, expected_response)
 
     def _encrypt_challenge(self, challenge: bytes, password: str | None = None) -> bytes:
         """
@@ -127,23 +128,6 @@ class VNCAuth:
             if byte & (1 << i):
                 result |= (1 << (7 - i))
         return result
-
-    def _recv_exact(self, sock, n: int) -> Optional[bytes]:
-        """Receive exactly n bytes from socket"""
-        if n == 0:
-            return b''
-
-        buf = bytearray(n)
-        view = memoryview(buf)
-        total_received = 0
-        while total_received < n:
-            chunk = sock.recv(n - total_received)
-            if not chunk:
-                return None
-            chunk_len = len(chunk)
-            view[total_received:total_received + chunk_len] = chunk
-            total_received += chunk_len
-        return bytes(buf)
 
 
 class NoAuth:

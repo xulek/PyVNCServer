@@ -92,44 +92,6 @@ def test_convert_bgra_to_8bit_true_color_uses_lut_cache():
     assert len(cap._palette_lut_cache) == 1
 
 
-def test_capture_region_uses_pil_backend_when_available():
-    cap = _capture_without_init()
-    cap.scale_factor = 1.0
-    cap._ensure_pil = lambda: None
-
-    class _FakeScreenshot:
-        def resize(self, size, _mode):
-            return self
-
-        def convert(self, _mode):
-            return self
-
-        def tobytes(self):
-            return b"pixel-data"
-
-        @property
-        def size(self):
-            return (2, 2)
-
-    class _FakeGrabber:
-        @staticmethod
-        def grab(*, bbox):
-            assert bbox == (1, 2, 4, 6)
-            return _FakeScreenshot()
-
-    class _FakeImage:
-        class Resampling:
-            BILINEAR = object()
-
-    cap._ImageGrab = _FakeGrabber()
-    cap._Image = _FakeImage()
-    cap._convert_to_pixel_format = lambda screenshot, pixel_format: b"converted"
-
-    result = cap.capture_region(1, 2, 3, 4, {'bits_per_pixel': 32})
-
-    assert result == b"converted"
-
-
 def test_get_mss_session_is_thread_local():
     cap = _capture_without_init()
 

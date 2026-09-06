@@ -16,7 +16,13 @@ import time
 import gzip
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Protocol, Self
+from typing import BinaryIO, Protocol
+import sys
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import IntEnum, auto

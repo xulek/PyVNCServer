@@ -10,10 +10,14 @@ import time
 import logging
 import argparse
 import struct
+import os
+import ssl
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from vnc_lib.protocol import RFBProtocol
-from vnc_lib.auth import VNCAuth
+from vnc_lib.io_utils import recv_exact
+from vnc_lib.auth import VNCAuth, CRYPTO_AVAILABLE
 from vnc_lib.input_handler import InputHandler
 from vnc_lib.screen_capture import ScreenCapture
 from vnc_lib.capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
@@ -24,17 +28,23 @@ from vnc_lib.metrics import ServerMetrics, ConnectionMetrics, PerformanceMonitor
 from vnc_lib.types import is_valid_pixel_format
 from vnc_lib.clipboard import sanitize_clipboard_text
 from vnc_lib.server_utils import (
-    GracefulShutdown, HealthChecker, ConnectionPool, PerformanceThrottler,
+    GracefulShutdown, HealthChecker, ConnectionLimiter, PerformanceThrottler,
     NetworkProfile, detect_network_profile
 )
 from vnc_lib.exceptions import (
-    VNCError, ProtocolError, AuthenticationError, ConnectionError,
-    ExceptionCollector, categorize_exceptions
+    VNCError, ProtocolError, AuthenticationError, ConnectionError as VNCConnectionError,
+    ConfigurationError,
 )
-from pyvncserver.config import DEFAULT_CONFIG_PATH, load_config_file
+from pyvncserver.config import DEFAULT_CONFIG_PATH, ServerSettings, load_config_file
+from pyvncserver._version import __version__, SERVER_NAME
+from pyvncserver.platform.producer import CaptureProducer, FrameSnapshot
+from pyvncserver.runtime.security import AuthRateLimiter, PerIPConnectionLimiter
+from pyvncserver.session_state import ClientSessionState
+from pyvncserver.session.loop import SessionLoopMixin
+from pyvncserver.session.runtime import SessionRuntimeMixin
 
 
-class VNCServerV3:
+class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
     """
     RFC 6143 compliant VNC Server - Enhanced Version 3.0
 
@@ -49,7 +59,7 @@ class VNCServerV3:
     """
 
     DEFAULT_PORT = 5900
-    DEFAULT_HOST = '0.0.0.0'
+    DEFAULT_HOST = '127.0.0.1'
     DEFAULT_FRAME_RATE = 30
     DEFAULT_SCALE_FACTOR = 1.0
     MAX_CONNECTIONS = 10
@@ -58,30 +68,45 @@ class VNCServerV3:
         """Initialize enhanced VNC Server with configuration"""
         self.logger = logging.getLogger(__name__)
 
-        # Load configuration
+        # Load and validate configuration. Configuration errors are fatal: a
+        # VNC server must never silently fall back to insecure defaults.
         self.config = self._load_config(config_file or DEFAULT_CONFIG_PATH)
+        self.settings = ServerSettings.from_mapping(self.config)
 
         # Setup logging
         self._setup_logging()
 
         # Server configuration
-        self.host = self.config.get('host', self.DEFAULT_HOST)
-        self.port = self.config.get('port', self.DEFAULT_PORT)
-        self.password = self.config.get('password', '')
-        self.read_only_password = self.config.get('read_only_password', '')
-        self.frame_rate = max(1, min(60, self.config.get('frame_rate', self.DEFAULT_FRAME_RATE)))
-        self.lan_frame_rate = max(1, min(120, self.config.get('lan_frame_rate', 30)))
-        self.network_profile_override = self.config.get('network_profile_override', None)
-        self.scale_factor = self.config.get('scale_factor', self.DEFAULT_SCALE_FACTOR)
-        self.capture_backend = str(self.config.get('capture_backend', 'auto')).strip().lower() or 'auto'
+        self.host = self.settings.host
+        self.port = self.settings.port
+        self.password = self.settings.security.password
+        self.read_only_password = self.settings.security.read_only_password
+        self.frame_rate = self.settings.frame_rate
+        self.lan_frame_rate = self.settings.lan_frame_rate
+        self.network_profile_override = self.settings.network_profile_override
+        self.scale_factor = self.settings.scale_factor
+        self.capture_backend = self.settings.capture_backend
         self.capture_probe_frames = max(0, int(self.config.get('capture_probe_frames', 0)))
         self.capture_probe_warn_ms = max(
             1.0, float(self.config.get('capture_probe_warn_ms', 40.0))
         )
-        self.max_connections = self.config.get('max_connections', self.MAX_CONNECTIONS)
-        self.client_socket_timeout = max(
-            1.0, float(self.config.get('client_socket_timeout', 60.0))
-        )
+        self.max_connections = self.settings.max_connections
+        self.max_connections_per_ip = self.settings.max_connections_per_ip
+        self.max_unauthenticated_connections = self.settings.max_unauthenticated_connections
+        self.handshake_timeout = self.settings.handshake_timeout
+        self.client_socket_timeout = self.settings.client_socket_timeout
+        if (self.password or self.read_only_password) and not CRYPTO_AVAILABLE:
+            raise ConfigurationError(
+                "VNC authentication is configured but pycryptodome is not installed"
+            )
+        self.tls_context: ssl.SSLContext | None = None
+        if self.settings.security.tls_enabled:
+            self.tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self.tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            self.tls_context.load_cert_chain(
+                self.settings.security.tls_cert_file,
+                self.settings.security.tls_key_file,
+            )
 
         # Features
         self.enable_region_detection = self.config.get('enable_region_detection', True)
@@ -89,8 +114,15 @@ class VNCServerV3:
         cursor_probe = SystemCursorCapture(scale_factor=self.scale_factor)
         self.enable_cursor_encoding = requested_cursor_encoding and cursor_probe.enabled
         self.enable_metrics = self.config.get('enable_metrics', True)
+        self.enable_health_checks = self.config.get('enable_health_checks', True)
         self.enable_websocket = self.config.get('enable_websocket', False)
-        self.enable_tight_security = self.config.get('enable_tight_security', True)
+        self.enable_capture_producer = self.config.get('enable_capture_producer', True)
+        # Tight is an RFB extension negotiation mechanism, not transport
+        # encryption. Keep the legacy key as a compatibility fallback.
+        self.enable_tight_extensions = self.config.get(
+            'enable_tight_extensions', self.config.get('enable_tight_security', True)
+        )
+        self.enable_tight_security = self.enable_tight_extensions
         self.enable_lan_adaptive_encoding = self.config.get('enable_lan_adaptive_encoding', True)
         self.enable_request_coalescing = self.config.get('enable_request_coalescing', True)
         self.enable_copyrect_encoding = self.config.get('enable_copyrect_encoding', True)
@@ -184,24 +216,22 @@ class VNCServerV3:
                 )
             ),
         )
+        self.websocket_max_message_bytes = max(
+            self.websocket_max_payload_bytes,
+            int(self.config.get('websocket_max_message_bytes', 16 * 1024 * 1024)),
+        )
         self.websocket_allowed_origins = self._coerce_allowed_origins(
             self.config.get('websocket_allowed_origins', [])
         )
 
-        input_policy = str(
-            self.config.get('input_control_policy', 'single-controller')
-        ).strip().lower()
-        if input_policy not in {'single-controller', 'shared'}:
-            self.logger.warning(
-                f"Invalid input_control_policy '{input_policy}', using single-controller"
-            )
-            input_policy = 'single-controller'
-        self.input_control_policy = input_policy
+        self.input_control_policy = self.settings.input_control_policy
         self._input_control_lock = threading.Lock()
         self._input_controller_client_id: str | None = None
         self._input_control_rejections_logged: set[str] = set()
         self._client_registry_lock = threading.Lock()
         self._authenticated_client_sockets: dict[str, socket.socket] = {}
+        self._all_client_sockets: dict[str, object] = {}
+        self._client_threads: dict[str, threading.Thread] = {}
 
         # Shared OS-facing services. Capture is internally locked to avoid
         # racing its backend state across client threads.
@@ -213,9 +243,41 @@ class VNCServerV3:
 
         # Server components
         self.shutdown_handler = GracefulShutdown()
-        self.connection_pool = ConnectionPool(max_connections=self.max_connections)
+        self.connection_limiter = ConnectionLimiter(max_connections=self.max_connections)
+        # Compatibility attribute for older callers.
+        self.connection_pool = self.connection_limiter
+        self.unauthenticated_limiter = ConnectionLimiter(
+            max_connections=self.max_unauthenticated_connections
+        )
+        self.per_ip_limiter = PerIPConnectionLimiter(self.max_connections_per_ip)
+        self.auth_rate_limiter = AuthRateLimiter(
+            max_failures=self.settings.security.auth_max_failures,
+            window_seconds=self.settings.security.auth_failure_window_seconds,
+            max_backoff_seconds=self.settings.security.auth_backoff_max_seconds,
+        )
         self.metrics = ServerMetrics.get_instance() if self.enable_metrics else None
         self.health_checker = HealthChecker(check_interval=30.0)
+
+        # One executor is shared across clients to avoid N-clients × N-workers
+        # thread explosions. ParallelEncoder instances become lightweight views.
+        configured_workers = self.config.get('encoding_threads', None)
+        if isinstance(configured_workers, int) and configured_workers <= 0:
+            configured_workers = None
+        auto_workers = max(1, min((os.cpu_count() or 4) - 1, 8))
+        self.encoding_workers = configured_workers or auto_workers
+        self.encoding_executor = ThreadPoolExecutor(
+            max_workers=self.encoding_workers,
+            thread_name_prefix="VNC-Encoder",
+        )
+
+        producer_fps = float(
+            self.config.get('capture_producer_fps', max(self.frame_rate, self.lan_frame_rate, 60))
+        )
+        self.capture_producer = (
+            CaptureProducer(self.screen_capture, fps=producer_fps)
+            if self.enable_capture_producer
+            else None
+        )
 
         # Register health checks
         self._setup_health_checks()
@@ -235,7 +297,7 @@ class VNCServerV3:
         # Register cleanup
         self.shutdown_handler.register_cleanup(self._cleanup)
 
-        self.logger.info(f"VNC Server v3.0 listening on {self.host}:{self.port}")
+        self.logger.info(f"{SERVER_NAME} listening on {self.host}:{self.port}")
         self.logger.info(f"Frame rate: {self.frame_rate} FPS, Scale: {self.scale_factor}")
         self.logger.info(
             "Capture backend: %s (requested=%s)",
@@ -253,22 +315,30 @@ class VNCServerV3:
         self.logger.info(f"Features: region_detection={self.enable_region_detection}, "
                         f"cursor={self.enable_cursor_encoding}, metrics={self.enable_metrics}, "
                         f"websocket={self.enable_websocket}")
-        if not self.password:
+        if not (self.password or self.read_only_password):
             self.logger.warning(
-                "Server is running without authentication (SecurityType None). "
-                "Use a password or network-level protections for untrusted environments."
+                "Server is running without VNC authentication on loopback only. "
+                "Use a password before binding to a non-loopback interface."
             )
+        elif self.tls_context is None and self.host not in {'127.0.0.1', '::1', 'localhost'}:
+            self.logger.warning(
+                "Classic VNC authentication protects the password challenge but does not "
+                "encrypt framebuffer/input traffic. Consider TLS, SSH, or a VPN."
+            )
+        if self.tls_context is not None:
+            self.logger.info("TLS transport enabled (minimum TLS 1.2)")
         self._log_capture_probe()
 
     def _load_config(self, config_file: str | Path) -> dict:
-        """Load configuration from a supported file format."""
+        """Load configuration and fail closed on any error."""
         try:
             config = load_config_file(config_file)
-            logging.info("Configuration loaded from %s", config_file)
-            return config
-        except Exception as e:
-            logging.error("Error loading configuration from %s: %s, using defaults", config_file, e)
-            return {}
+        except Exception as exc:
+            raise ConfigurationError(
+                f"Failed to load secure server configuration from {config_file}: {exc}"
+            ) from exc
+        logging.info("Configuration loaded from %s", config_file)
+        return config
 
     def _log_capture_probe(self) -> None:
         """Optionally benchmark startup capture cost for the active backend."""
@@ -349,61 +419,72 @@ class VNCServerV3:
                 root_logger.addHandler(handler)
 
     def _setup_health_checks(self):
-        """Setup health check functions"""
+        """Register liveness checks only; capacity is reported as readiness."""
         def check_socket() -> bool:
-            """Check if server socket is healthy"""
             try:
                 return self.server_socket.fileno() != -1
-            except:
+            except OSError:
                 return False
 
-        def check_connections() -> bool:
-            """Check if connection pool is not overloaded"""
-            return not self.connection_pool.is_full()
+        def check_capture() -> bool:
+            backend = getattr(self.screen_capture, "_backend", None)
+            if backend is None:
+                return False
+            try:
+                return bool(backend.healthcheck())
+            except Exception:
+                return False
 
         self.health_checker.register_check('socket', check_socket)
-        self.health_checker.register_check('connections', check_connections)
+        self.health_checker.register_check('capture', check_capture)
 
     def start(self):
-        """Start accepting client connections"""
-        self.logger.info("VNC Server v3.0 started")
+        """Start accepting client connections."""
+        self.logger.info("%s started", SERVER_NAME)
 
-        # Start health checker
-        if self.enable_metrics:
+        if self.enable_health_checks:
             self.health_checker.start()
+        if self.capture_producer is not None:
+            self.capture_producer.start()
 
         try:
             while not self.shutdown_handler.is_shutting_down():
                 try:
-                    # Accept with timeout for shutdown responsiveness
                     client_socket, addr = self.server_socket.accept()
-
-                    # Check if we can accept more connections
                     client_id = f"{addr[0]}:{addr[1]}"
 
-                    if not self.connection_pool.acquire(client_id, timeout=0.1):
-                        self.logger.warning(f"Connection pool full, rejecting {addr}")
+                    if not self.per_ip_limiter.acquire(addr[0]):
+                        self.logger.warning(
+                            "Per-IP connection limit reached for %s, rejecting %s",
+                            addr[0], addr,
+                        )
                         client_socket.close()
                         continue
 
-                    self.logger.info(f"New connection from {addr}")
+                    if not self.connection_limiter.acquire(client_id, timeout=0.1):
+                        self.per_ip_limiter.release(addr[0])
+                        self.logger.warning("Connection limit reached, rejecting %s", addr)
+                        client_socket.close()
+                        continue
 
-                    # Handle in separate thread
+                    self.logger.info("New connection from %s", addr)
                     thread = threading.Thread(
                         target=self._handle_client_wrapper,
                         args=(client_socket, addr, client_id),
                         name=f"Client-{client_id}",
-                        daemon=True
+                        daemon=False,
                     )
+                    with self._client_registry_lock:
+                        self._all_client_sockets[client_id] = client_socket
+                        self._client_threads[client_id] = thread
                     thread.start()
 
                 except socket.timeout:
-                    # Normal timeout, check for shutdown
                     continue
-                except OSError as e:
+                except OSError as exc:
                     if self.shutdown_handler.is_shutting_down():
                         break
-                    self.logger.error(f"Socket error: {e}")
+                    self.logger.error("Socket error: %s", exc)
                     time.sleep(0.1)
 
         except KeyboardInterrupt:
@@ -414,11 +495,15 @@ class VNCServerV3:
 
     def _handle_client_wrapper(self, client_socket: socket.socket,
                                addr: tuple, client_id: str):
-        """Wrapper for client handling with cleanup"""
+        """Wrapper for client handling with deterministic cleanup."""
         try:
             self.handle_client(client_socket, addr, client_id)
         finally:
-            self.connection_pool.release(client_id)
+            self.connection_limiter.release(client_id)
+            self.per_ip_limiter.release(addr[0])
+            with self._client_registry_lock:
+                self._all_client_sockets.pop(client_id, None)
+                self._client_threads.pop(client_id, None)
 
     def handle_client(self, client_socket: socket.socket,
                      addr: tuple, client_id: str):
@@ -426,8 +511,37 @@ class VNCServerV3:
         conn_metrics: ConnectionMetrics | None = None
         parallel_encoder = None
         registered_client_socket = False
+        unauthenticated_slot_acquired = False
 
         try:
+            auth_decision = self.auth_rate_limiter.check(addr[0])
+            if not auth_decision.allowed:
+                self.logger.warning(
+                    "Temporarily rejecting %s after repeated authentication failures; retry in %.2fs",
+                    addr[0], auth_decision.retry_after,
+                )
+                return
+
+            if not self.unauthenticated_limiter.acquire(client_id, timeout=0.1):
+                self.logger.warning("Pre-authentication connection limit reached for %s", addr)
+                return
+            unauthenticated_slot_acquired = True
+
+            if self.tls_context is not None:
+                try:
+                    client_socket.settimeout(self.handshake_timeout)
+                    client_socket = self.tls_context.wrap_socket(
+                        client_socket,
+                        server_side=True,
+                        do_handshake_on_connect=False,
+                    )
+                    with self._client_registry_lock:
+                        self._all_client_sockets[client_id] = client_socket
+                    client_socket.do_handshake()
+                except (ssl.SSLError, OSError) as exc:
+                    self.logger.warning("TLS handshake failed for %s: %s", addr, exc)
+                    return
+
             # Detect network profile for performance optimization
             if self.network_profile_override:
                 network_profile = NetworkProfile(self.network_profile_override)
@@ -438,9 +552,9 @@ class VNCServerV3:
             self.logger.info(f"Connection from {addr[0]}: network profile = {network_profile.value}")
 
             try:
-                client_socket.settimeout(self.client_socket_timeout)
+                client_socket.settimeout(self.handshake_timeout)
             except Exception as e:
-                self.logger.warning(f"Could not set client socket timeout: {e}")
+                self.logger.warning(f"Could not set handshake timeout: {e}")
 
             # Enable TCP_NODELAY for all connections (VNC is interactive;
             # Nagle's algorithm only adds latency with zero benefit)
@@ -477,9 +591,12 @@ class VNCServerV3:
                             client_socket,
                             max_handshake_bytes=self.websocket_max_handshake_bytes,
                             max_payload_bytes=self.websocket_max_payload_bytes,
+                            max_message_bytes=self.websocket_max_message_bytes,
                             allowed_origins=self.websocket_allowed_origins,
                             max_buffer_bytes=self.websocket_max_buffer_bytes,
                         )
+                        with self._client_registry_lock:
+                            self._all_client_sockets[client_id] = client_socket
                 except Exception as e:
                     self.logger.error(f"WebSocket setup failed: {e}")
                     return
@@ -512,13 +629,26 @@ class VNCServerV3:
                     protocol.send_security_result(client_socket, auth_success)
 
                 if not auth_success:
-                    self.logger.warning(f"Client {addr} authentication failed")
+                    delay = self.auth_rate_limiter.record_failure(addr[0])
+                    self.logger.warning("Client %s authentication failed", addr)
                     if self.metrics:
                         self.metrics.record_failed_auth()
+                    if delay > 0:
+                        time.sleep(delay)
                     return
+                self.auth_rate_limiter.record_success(addr[0])
             else:
                 if security.send_security_result_on_success:
                     protocol.send_security_result(client_socket, True)
+
+            if unauthenticated_slot_acquired:
+                self.unauthenticated_limiter.release(client_id)
+                unauthenticated_slot_acquired = False
+
+            try:
+                client_socket.settimeout(self.client_socket_timeout)
+            except Exception as exc:
+                self.logger.warning("Could not set authenticated client timeout: %s", exc)
 
             self.logger.info(f"Client {addr} authenticated successfully")
             if view_only_session:
@@ -557,20 +687,23 @@ class VNCServerV3:
             }
 
             # Get initial screen dimensions
-            initial_frame = self._capture_frame(screen_capture, current_pixel_format)
+            initial_snapshot = self._capture_frame_with_generation(
+                screen_capture, current_pixel_format
+            )
+            initial_frame = initial_snapshot.frame
             initial_result = initial_frame.result
             if (
                 initial_result.pixel_data is None
                 or initial_result.width <= 0
                 or initial_result.height <= 0
             ):
-                raise ConnectionError("Initial screen capture failed")
+                raise VNCConnectionError("Initial screen capture failed")
 
             width, height = initial_result.width, initial_result.height
 
             protocol.send_server_init(
                 client_socket, width, height,
-                current_pixel_format, "Python VNC Server v3.0"
+                current_pixel_format, SERVER_NAME
             )
             if security.tight_enabled:
                 protocol.send_tight_interaction_caps(client_socket)
@@ -617,31 +750,46 @@ class VNCServerV3:
             if use_parallel:
                 try:
                     from vnc_lib.parallel_encoder import ParallelEncoder
-                    max_workers = self.config.get('encoding_threads', None)
-                    if isinstance(max_workers, int) and max_workers <= 0:
-                        max_workers = None
-                    parallel_encoder = ParallelEncoder(max_workers=max_workers)
-                    self.logger.info(f"Parallel encoding enabled with {parallel_encoder.max_workers} workers")
+                    parallel_encoder = ParallelEncoder(
+                        max_workers=self.encoding_workers,
+                        executor=self.encoding_executor,
+                    )
+                    self.logger.info(
+                        "Parallel encoding enabled with shared %d-worker executor",
+                        parallel_encoder.max_workers,
+                    )
                 except ImportError as e:
                     self.logger.warning(f"Parallel encoding unavailable: {e}")
 
             if is_localhost and self.enable_region_detection:
                 self.logger.info("Change detection disabled for localhost connection (optimization)")
 
-            # Main message loop
-            self._client_message_loop(
-                client_socket, protocol, screen_capture, input_handler,
-                current_pixel_format, client_encodings, width, height,
-                encoder_manager, change_detector, conn_metrics,
-                client_id, cursor_capture, cursor_encoder,
-                view_only_session, is_localhost, parallel_encoder, network_profile
+            # Main message loop. Keep all mutable per-client state in one object.
+            session = ClientSessionState(
+                client_id=client_id,
+                pixel_format=current_pixel_format,
+                encodings=client_encodings,
+                fb_width=width,
+                fb_height=height,
+                encoder_manager=encoder_manager,
+                network_profile=network_profile,
+                view_only=view_only_session,
+                change_detector=change_detector,
+                conn_metrics=conn_metrics,
+                cursor_capture=cursor_capture,
+                cursor_encoder=cursor_encoder,
+                parallel_encoder=parallel_encoder,
+                last_frame_generation=-1,
             )
+            self._client_message_loop(client_socket, protocol, session)
 
         except Exception as e:
             self.logger.error(f"Error handling client {addr}: {e}", exc_info=True)
             if conn_metrics:
                 conn_metrics.record_error()
         finally:
+            if unauthenticated_slot_acquired:
+                self.unauthenticated_limiter.release(client_id)
             if parallel_encoder:
                 try:
                     parallel_encoder.shutdown(wait=False)
@@ -658,621 +806,6 @@ class VNCServerV3:
                 self.metrics.unregister_connection(client_id)
             self.logger.info(f"Client {addr} disconnected")
 
-    def _client_message_loop(self, client_socket: socket.socket,
-                            protocol: RFBProtocol,
-                            screen_capture: ScreenCapture,
-                            input_handler: InputHandler,
-                              current_pixel_format: dict,
-                               client_encodings: list[int],
-                              fb_width: int, fb_height: int,
-                              encoder_manager: EncoderManager,
-                              change_detector: AdaptiveChangeDetector | None,
-                              conn_metrics: ConnectionMetrics | None,
-                              client_id: str,
-                              cursor_capture: SystemCursorCapture | None,
-                              cursor_encoder: CursorEncoder | None,
-                              view_only_session: bool = False,
-                              is_localhost: bool = False,
-                              parallel_encoder = None,
-                              network_profile: NetworkProfile = NetworkProfile.WAN):
-        """
-        Enhanced client message handling loop with network-aware optimization
-
-        Localhost optimizations:
-        - Up to 120 FPS frame rate
-        - Raw encoding only (no compression overhead)
-        - TCP_NODELAY enabled (lower latency)
-        - Change detection disabled (unnecessary overhead)
-
-        LAN optimizations:
-        - Up to 60 FPS frame rate (configurable)
-        - Client-preferred encoding order with LAN-specific transport tuning
-        - TCP_NODELAY enabled
-        """
-
-        # Frame rate based on network profile
-        match network_profile:
-            case NetworkProfile.LOCALHOST:
-                max_frame_rate = 120
-            case NetworkProfile.LAN:
-                max_frame_rate = self.lan_frame_rate
-            case _:
-                max_frame_rate = self.frame_rate
-        throttler = PerformanceThrottler(max_rate=max_frame_rate)
-        lan_adaptive = (
-            network_profile == NetworkProfile.LAN
-            and self.enable_lan_adaptive_encoding
-        )
-        target_frame_time = 1.0 / max_frame_rate if max_frame_rate > 0 else 0.0
-        lan_jpeg_quality = self.lan_jpeg_quality_initial
-        if lan_adaptive:
-            self._configure_lan_encoders(encoder_manager, lan_jpeg_quality)
-        parallel_enabled_for_client = parallel_encoder is not None
-        last_pointer_pos: tuple[int, int] | None = None
-
-        while not self.shutdown_handler.is_shutting_down():
-            try:
-                # Receive message type
-                msg_type_data = protocol._recv_exact(client_socket, 1)
-                if not msg_type_data:
-                    break
-
-                msg_type = msg_type_data[0]
-
-                # Handle different message types using Python 3.13 pattern matching
-                match msg_type:
-                    case protocol.MSG_SET_PIXEL_FORMAT:
-                        new_format = protocol.parse_set_pixel_format(client_socket)
-                        if not self._is_supported_pixel_format(new_format):
-                            raise ProtocolError(
-                                f"Unsupported client pixel format requested: {new_format}"
-                            )
-                        current_pixel_format.update(new_format)
-                        filtered_after_pf, dropped = self._filter_encodings_for_pixel_format(
-                            client_encodings, encoder_manager, current_pixel_format
-                        )
-                        if dropped:
-                            self.logger.info(
-                                "Pixel format disables negotiated encodings: %s",
-                                format_encoding_list(dropped),
-                            )
-                            self.logger.info(
-                                "Filtered usable encodings: %s",
-                                format_encoding_list(filtered_after_pf),
-                            )
-                        self.logger.info(f"Pixel format updated: {new_format}")
-
-                    case protocol.MSG_SET_ENCODINGS:
-                        encodings = protocol.parse_set_encodings(client_socket)
-                        client_encodings[:] = encodings
-                        self._configure_tight_compatibility(
-                            encoder_manager
-                        )
-                        self.logger.info(
-                            f"Client encoding preference order: {format_encoding_list(client_encodings)}"
-                        )
-                        selection_preview, dropped = self._filter_encodings_for_pixel_format(
-                            client_encodings, encoder_manager, current_pixel_format
-                        )
-                        negotiated_rect = [
-                            enc for enc in selection_preview if enc in encoder_manager.encoders
-                        ]
-                        self.logger.info(
-                            f"Negotiated rectangle encodings: {format_encoding_list(negotiated_rect)}"
-                        )
-                        if dropped:
-                            self.logger.info(
-                                "Skipping incompatible negotiated encodings for current pixel format: %s",
-                                format_encoding_list(dropped),
-                            )
-
-                    case protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
-                        request = protocol.parse_framebuffer_update_request(client_socket)
-                        if self.enable_request_coalescing:
-                            request = self._coalesce_framebuffer_update_requests(
-                                client_socket, protocol, request
-                            )
-                        selection_encodings, _ = self._filter_encodings_for_pixel_format(
-                            client_encodings, encoder_manager, current_pixel_format
-                        )
-
-                        # Throttle before expensive capture/encoding work.
-                        throttler.throttle()
-                        start_time = time.perf_counter()
-                        frame = self._capture_frame(screen_capture, current_pixel_format)
-                        result = frame.result
-                        capture_metadata = frame.metadata
-
-                        if result.pixel_data is None:
-                            continue
-
-                        # Handle dimension changes
-                        if result.width != fb_width or result.height != fb_height:
-                            fb_width, fb_height = result.width, result.height
-                            self.logger.info(f"Framebuffer size changed to {fb_width}x{fb_height}")
-
-                            if change_detector:
-                                change_detector.resize(fb_width, fb_height)
-
-                            # Send DesktopSize if supported
-                            if protocol.ENCODING_DESKTOP_SIZE in client_encodings:
-                                self._reset_stateful_encoders(encoder_manager)
-                                protocol.send_framebuffer_update(client_socket, [
-                                    (0, 0, fb_width, fb_height, protocol.ENCODING_DESKTOP_SIZE, None)
-                                ])
-                                continue
-
-                        cursor_rectangles, last_pointer_pos = self._build_cursor_pseudo_rectangles(
-                            protocol,
-                            client_encodings,
-                            current_pixel_format,
-                            cursor_capture,
-                            cursor_encoder,
-                            last_pointer_pos,
-                        )
-
-                        request_region = self._normalize_request_region(request, fb_width, fb_height)
-                        if request_region is None:
-                            protocol.send_framebuffer_update(client_socket, cursor_rectangles)
-                            continue
-                        req_x, req_y, req_w, req_h = request_region
-
-                        backend_copyrect_rectangles: list[tuple[int, int, int, int, int, bytes]] = []
-
-                        # Check for changes (incremental update)
-                        if request['incremental']:
-                            changed_regions, backend_copyrect_rectangles = (
-                                self._resolve_incremental_update_hints(
-                                    protocol,
-                                    client_encodings,
-                                    capture_metadata,
-                                    request_region,
-                                )
-                            )
-                            if changed_regions is None and change_detector:
-                                changed_regions = change_detector.detect_changes(
-                                    result.pixel_data,
-                                    current_pixel_format['bits_per_pixel'] // 8
-                                )
-                                if changed_regions is not None:
-                                    changed_regions = self._intersect_regions(changed_regions, request_region)
-
-                            if changed_regions is not None and len(changed_regions) == 0:
-                                protocol.send_framebuffer_update(
-                                    client_socket,
-                                    cursor_rectangles + backend_copyrect_rectangles,
-                                )
-                                continue
-
-                            # Send region updates if available using parallel encoding
-                            if changed_regions is not None and len(changed_regions) < 10 and parallel_enabled_for_client and parallel_encoder:
-                                # Use parallel encoding for changed regions
-                                bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
-                                content_type = network_profile.value if network_profile != NetworkProfile.WAN else "dynamic"
-
-                                # Prepare regions for parallel encoding
-                                regions_to_encode = []
-                                parallel_safe = True
-                                jpeg_original_bytes = 0
-                                jpeg_encoded_bytes = 0
-                                for x, y, w, h in changed_regions:
-                                    # Extract region pixel data
-                                    region_data = self._extract_region(
-                                        result.pixel_data, fb_width, fb_height,
-                                        x, y, w, h, bytes_per_pixel
-                                    )
-                                    encoding_type, encoder = self._select_encoder_for_update(
-                                        encoder_manager,
-                                        selection_encodings,
-                                        network_profile,
-                                        w,
-                                        h,
-                                        fb_width,
-                                        fb_height,
-                                        content_type=content_type,
-                                        allow_jpeg=False,
-                                        allow_zlib=True,
-                                        bytes_per_pixel=bytes_per_pixel,
-                                        pixel_format=current_pixel_format,
-                                    )
-                                    self._prepare_encoder_for_send(
-                                        encoding_type, encoder, lan_jpeg_quality
-                                    )
-                                    parallel_safe = parallel_safe and self._is_parallel_safe_encoding(
-                                        encoding_type
-                                    )
-                                    regions_to_encode.append(((x, y, w, h), region_data, encoding_type, encoder))
-                                if not parallel_safe:
-                                    self.logger.debug(
-                                        "Falling back to sequential region encoding due to stateful encoder selection"
-                                    )
-                                else:
-                                    # Encode regions in parallel
-                                    encoded_results = parallel_encoder.encode_regions(regions_to_encode, bytes_per_pixel)
-
-                                    # Build rectangles from results
-                                    rectangles = cursor_rectangles + backend_copyrect_rectangles + [
-                                        (r.x, r.y, r.width, r.height, r.encoding_type, r.encoded_data)
-                                        for r in encoded_results
-                                    ]
-                                    self._log_selected_region_encodings(
-                                        [r.encoding_type for r in encoded_results]
-                                    )
-
-                                    self.logger.debug(
-                                        "Sending framebuffer update with %d rectangle(s)",
-                                        len(rectangles),
-                                    )
-                                    protocol.send_framebuffer_update(client_socket, rectangles)
-                                    self._commit_frame_state(
-                                        encoder_manager,
-                                        result.pixel_data,
-                                        fb_width,
-                                        fb_height,
-                                        bytes_per_pixel,
-                                    )
-                                    self.logger.debug("Framebuffer update sent successfully")
-
-                                    # Record metrics
-                                    if conn_metrics:
-                                        encoding_time = time.perf_counter() - start_time
-                                        total_bytes = sum(r.original_size for r in encoded_results)
-                                        compressed_bytes = sum(r.compressed_size for r in encoded_results)
-                                        conn_metrics.record_frame(
-                                            compressed_bytes, encoding_time, total_bytes
-                                        )
-                                        if lan_adaptive:
-                                            for r in encoded_results:
-                                                if r.encoding_type == 21:
-                                                    jpeg_original_bytes += r.original_size
-                                                    jpeg_encoded_bytes += r.compressed_size
-                                            if jpeg_original_bytes > 0:
-                                                lan_jpeg_quality = self._adjust_lan_jpeg_quality(
-                                                    lan_jpeg_quality,
-                                                    encoding_time,
-                                                    jpeg_encoded_bytes,
-                                                    jpeg_original_bytes,
-                                                    target_frame_time,
-                                                )
-                                    continue
-
-                            # Non-parallel region encoding fallback
-                            if changed_regions is not None and len(changed_regions) > 0:
-                                bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
-                                content_type = network_profile.value if network_profile != NetworkProfile.WAN else "dynamic"
-
-                                rectangles = list(cursor_rectangles) + list(backend_copyrect_rectangles)
-                                original_total_bytes = 0
-                                compressed_total_bytes = 0
-                                jpeg_original_bytes = 0
-                                jpeg_encoded_bytes = 0
-                                pixel_rectangles_sent = 0
-                                for x, y, w, h in changed_regions:
-                                    region_data = self._extract_region(
-                                        result.pixel_data, fb_width, fb_height,
-                                        x, y, w, h, bytes_per_pixel
-                                    )
-                                    original_total_bytes += len(region_data)
-                                    allow_copyrect = pixel_rectangles_sent == 0 and len(changed_regions) == 1
-                                    preferred_encoding_type, preferred_encoder = self._select_encoder_for_update(
-                                        encoder_manager,
-                                        selection_encodings,
-                                        network_profile,
-                                        w,
-                                        h,
-                                        fb_width,
-                                        fb_height,
-                                        content_type=content_type,
-                                        allow_jpeg=True,
-                                        allow_zlib=True,
-                                        allow_copyrect=allow_copyrect,
-                                        bytes_per_pixel=bytes_per_pixel,
-                                        pixel_format=current_pixel_format,
-                                    )
-                                    split_rectangles = self._split_rectangles_for_encoding(
-                                        preferred_encoding_type, x, y, w, h
-                                    )
-                                    if len(split_rectangles) > 1:
-                                        for sx, sy, sw, sh in split_rectangles:
-                                            split_pixels = self._extract_region(
-                                                result.pixel_data,
-                                                fb_width,
-                                                fb_height,
-                                                sx,
-                                                sy,
-                                                sw,
-                                                sh,
-                                                bytes_per_pixel,
-                                            )
-                                            split_payload = self._encode_with_selected_encoder(
-                                                preferred_encoding_type,
-                                                preferred_encoder,
-                                                split_pixels,
-                                                sw,
-                                                sh,
-                                                lan_jpeg_quality,
-                                                bytes_per_pixel,
-                                                current_pixel_format,
-                                            )
-                                            compressed_total_bytes += len(split_payload)
-                                            if preferred_encoding_type == 21:
-                                                jpeg_original_bytes += len(split_pixels)
-                                                jpeg_encoded_bytes += len(split_payload)
-                                            rectangles.append(
-                                                (sx, sy, sw, sh, preferred_encoding_type, split_payload)
-                                            )
-                                        pixel_rectangles_sent += len(split_rectangles)
-                                        continue
-
-                                    encoding_type, encoder, encoded_data = self._encode_rectangle_for_update(
-                                        encoder_manager,
-                                        selection_encodings,
-                                        network_profile,
-                                        x,
-                                        y,
-                                        w,
-                                        h,
-                                        fb_width,
-                                        fb_height,
-                                        content_type=content_type,
-                                        pixel_data=region_data,
-                                        full_frame=result.pixel_data,
-                                        request_region=request_region,
-                                        allow_copyrect=allow_copyrect,
-                                        lan_jpeg_quality=lan_jpeg_quality,
-                                        bytes_per_pixel=bytes_per_pixel,
-                                        pixel_format=current_pixel_format,
-                                    )
-                                    if len(split_rectangles) == 1:
-                                        compressed_total_bytes += len(encoded_data)
-                                        if encoding_type == 21:
-                                            jpeg_original_bytes += len(region_data)
-                                            jpeg_encoded_bytes += len(encoded_data)
-                                        rectangles.append((x, y, w, h, encoding_type, encoded_data))
-                                        pixel_rectangles_sent += 1
-                                self._log_selected_region_encodings(
-                                    [enc_type for _, _, _, _, enc_type, _ in rectangles if enc_type >= 0]
-                                )
-
-                                self.logger.debug(
-                                    "Sending framebuffer update with %d rectangle(s)",
-                                    len(rectangles),
-                                )
-                                protocol.send_framebuffer_update(client_socket, rectangles)
-                                self._commit_frame_state(
-                                    encoder_manager,
-                                    result.pixel_data,
-                                    fb_width,
-                                    fb_height,
-                                    bytes_per_pixel,
-                                )
-                                self.logger.debug("Framebuffer update sent successfully")
-
-                                if conn_metrics:
-                                    encoding_time = time.perf_counter() - start_time
-                                    conn_metrics.record_frame(
-                                        compressed_total_bytes,
-                                        encoding_time,
-                                        original_total_bytes,
-                                    )
-                                    if lan_adaptive and jpeg_original_bytes > 0:
-                                        lan_jpeg_quality = self._adjust_lan_jpeg_quality(
-                                            lan_jpeg_quality,
-                                            encoding_time,
-                                            jpeg_encoded_bytes,
-                                            jpeg_original_bytes,
-                                            target_frame_time,
-                                        )
-                                continue
-
-                        # Select best encoding based on network profile
-                        content_type = network_profile.value if network_profile != NetworkProfile.WAN else "dynamic"
-                        bytes_per_pixel = current_pixel_format['bits_per_pixel'] // 8
-                        # Encode pixel data (single-threaded for full frame)
-                        full_request = (
-                            req_x == 0 and req_y == 0 and req_w == fb_width and req_h == fb_height
-                        )
-                        if full_request:
-                            frame_pixels = result.pixel_data
-                        else:
-                            frame_pixels = self._extract_region(
-                                result.pixel_data,
-                                fb_width,
-                                fb_height,
-                                req_x,
-                                req_y,
-                                req_w,
-                                req_h,
-                                bytes_per_pixel,
-                            )
-
-                        self.logger.debug(
-                            f"Encoding frame: {req_w}x{req_h}, bpp={bytes_per_pixel}, "
-                            f"data_size={len(frame_pixels)}"
-                        )
-
-                        preferred_encoding_type, preferred_encoder = self._select_encoder_for_update(
-                            encoder_manager,
-                            selection_encodings,
-                            network_profile,
-                            req_w,
-                            req_h,
-                            fb_width,
-                            fb_height,
-                            content_type=content_type,
-                            allow_jpeg=True,
-                            allow_zlib=True,
-                            allow_copyrect=True,
-                            bytes_per_pixel=bytes_per_pixel,
-                            pixel_format=current_pixel_format,
-                        )
-                        split_rectangles = self._split_rectangles_for_encoding(
-                            preferred_encoding_type, req_x, req_y, req_w, req_h
-                        )
-                        selected_encoding_type = preferred_encoding_type
-                        selected_encoded_bytes = encoded_bytes_total = 0
-                        if len(split_rectangles) > 1:
-                            rectangles = list(cursor_rectangles)
-                            for sx, sy, sw, sh in split_rectangles:
-                                split_pixels = self._extract_region(
-                                    result.pixel_data,
-                                    fb_width,
-                                    fb_height,
-                                    sx,
-                                    sy,
-                                    sw,
-                                    sh,
-                                    bytes_per_pixel,
-                                )
-                                split_payload = self._encode_with_selected_encoder(
-                                    preferred_encoding_type,
-                                    preferred_encoder,
-                                    split_pixels,
-                                    sw,
-                                    sh,
-                                    lan_jpeg_quality,
-                                    bytes_per_pixel,
-                                    current_pixel_format,
-                                )
-                                encoded_bytes_total += len(split_payload)
-                                selected_encoded_bytes += len(split_payload)
-                                rectangles.append((sx, sy, sw, sh, preferred_encoding_type, split_payload))
-                            self._log_selected_region_encodings(
-                                [preferred_encoding_type] * len(split_rectangles)
-                            )
-                        else:
-                            encoding_type, encoder, encoded_data = self._encode_rectangle_for_update(
-                                encoder_manager,
-                                selection_encodings,
-                                network_profile,
-                                req_x,
-                                req_y,
-                                req_w,
-                                req_h,
-                                fb_width,
-                                fb_height,
-                                content_type=content_type,
-                                pixel_data=frame_pixels,
-                                full_frame=result.pixel_data,
-                                request_region=request_region,
-                                allow_copyrect=True,
-                                lan_jpeg_quality=lan_jpeg_quality,
-                                bytes_per_pixel=bytes_per_pixel,
-                                pixel_format=current_pixel_format,
-                            )
-                            self._log_selected_encoding(encoding_type, content_type)
-                            self.logger.debug(f"Encoded data size: {len(encoded_data)} bytes")
-                            rectangles = list(cursor_rectangles) + [
-                                (req_x, req_y, req_w, req_h, encoding_type, encoded_data)
-                            ]
-                            selected_encoding_type = encoding_type
-                            selected_encoded_bytes = len(encoded_data)
-                            encoded_bytes_total = len(encoded_data)
-                        self.logger.debug(f"Sending framebuffer update with {len(rectangles)} rectangle(s)")
-                        protocol.send_framebuffer_update(client_socket, rectangles)
-                        self._commit_frame_state(
-                            encoder_manager,
-                            result.pixel_data,
-                            fb_width,
-                            fb_height,
-                            bytes_per_pixel,
-                        )
-                        self.logger.debug("Framebuffer update sent successfully")
-
-                        # Record metrics
-                        if conn_metrics:
-                            encoding_time = time.perf_counter() - start_time
-                            conn_metrics.record_frame(
-                                encoded_bytes_total, encoding_time, len(frame_pixels)
-                            )
-                            if lan_adaptive and selected_encoding_type == 21:
-                                lan_jpeg_quality = self._adjust_lan_jpeg_quality(
-                                    lan_jpeg_quality,
-                                    encoding_time,
-                                    selected_encoded_bytes,
-                                    len(frame_pixels),
-                                    target_frame_time,
-                                )
-
-                    case protocol.MSG_KEY_EVENT:
-                        key_event = protocol.parse_key_event(client_socket)
-                        if view_only_session:
-                            self.logger.info(
-                                "Ignoring key event from read-only client %s",
-                                client_id,
-                            )
-                        elif self._try_acquire_input_control(client_id):
-                            input_handler.handle_key_event(
-                                key_event['down_flag'],
-                                key_event['key']
-                            )
-                            if conn_metrics:
-                                conn_metrics.record_input('key')
-
-                    case protocol.MSG_POINTER_EVENT:
-                        pointer_event = protocol.parse_pointer_event(client_socket)
-                        pointer_event = self._coalesce_pointer_events(
-                            client_socket, protocol, pointer_event
-                        )
-                        if view_only_session:
-                            self.logger.info(
-                                "Ignoring pointer event from read-only client %s",
-                                client_id,
-                            )
-                        elif self._try_acquire_input_control(client_id):
-                            input_handler.handle_pointer_event(
-                                pointer_event['button_mask'],
-                                pointer_event['x'],
-                                pointer_event['y']
-                            )
-                            if conn_metrics:
-                                conn_metrics.record_input('pointer')
-
-                    case protocol.MSG_CLIENT_CUT_TEXT:
-                        text = protocol.parse_client_cut_text(client_socket)
-                        if view_only_session:
-                            self.logger.info(
-                                "Ignoring client cut text from read-only client %s",
-                                client_id,
-                            )
-                        else:
-                            preview = sanitize_clipboard_text(text, max_length=80).replace('\n', '\\n')
-                            self.logger.info(
-                                "Client cut text received (%d chars): %s",
-                                len(text),
-                                preview,
-                            )
-
-                    case _:
-                        self.logger.warning(f"Unknown message type: {msg_type}")
-                        break
-
-            except VNCError as e:
-                # Specific VNC errors - log and continue or break based on type
-                match e:
-                    case ProtocolError():
-                        self.logger.error(f"Protocol error: {e}")
-                        break  # Protocol errors are fatal
-                    case AuthenticationError():
-                        self.logger.warning(f"Auth error: {e}")
-                        break
-                    case ConnectionError():
-                        self.logger.warning(f"Connection error: {e}")
-                        break
-                    case _:
-                        self.logger.error(f"VNC error: {e}", exc_info=True)
-                        if conn_metrics:
-                            conn_metrics.record_error()
-                        break
-
-            except Exception as e:
-                if isinstance(e, OSError):
-                    self.logger.warning(f"Socket error in message loop: {e}")
-                    break
-                self.logger.error(f"Unexpected error in message loop: {e}", exc_info=True)
-                if conn_metrics:
-                    conn_metrics.record_error()
-                break
 
     def _coerce_allowed_origins(self, raw_origins) -> tuple[str, ...]:
         """Normalize configured WebSocket origins into an immutable tuple."""
@@ -1289,844 +822,79 @@ class VNCServerV3:
                 normalized.append(text)
         return tuple(dict.fromkeys(normalized))
 
-    def _is_supported_pixel_format(self, pixel_format: dict) -> bool:
-        """Restrict runtime to formats the server can actually encode correctly."""
-        if not is_valid_pixel_format(pixel_format):
-            return False
-        if int(pixel_format.get('true_colour_flag', 0)) != 1:
-            return False
-        if int(pixel_format.get('big_endian_flag', 0)) != 0:
-            return False
-
-        bpp = int(pixel_format.get('bits_per_pixel', 0))
-        depth = int(pixel_format.get('depth', 0))
-        if bpp == 32 and depth != 24:
-            return False
-        if bpp not in (8, 16, 32):
-            return False
-
-        for max_key, shift_key in (
-            ('red_max', 'red_shift'),
-            ('green_max', 'green_shift'),
-            ('blue_max', 'blue_shift'),
-        ):
-            channel_max = int(pixel_format.get(max_key, 0))
-            channel_shift = int(pixel_format.get(shift_key, -1))
-            if channel_shift < 0:
-                return False
-            if channel_max.bit_length() + channel_shift > bpp:
-                return False
-
-        return True
-
-    def _is_native_bgr0_pixel_format(self, pixel_format: dict | None) -> bool:
-        """Return True only for the server's native 32bpp little-endian BGR0 layout."""
-        if not pixel_format:
-            return False
-        return (
-            int(pixel_format.get('bits_per_pixel', 0)) == 32
-            and int(pixel_format.get('depth', 0)) == 24
-            and int(pixel_format.get('true_colour_flag', 0)) == 1
-            and int(pixel_format.get('big_endian_flag', 0)) == 0
-            and int(pixel_format.get('red_max', 0)) == 255
-            and int(pixel_format.get('green_max', 0)) == 255
-            and int(pixel_format.get('blue_max', 0)) == 255
-            and int(pixel_format.get('red_shift', -1)) == 16
-            and int(pixel_format.get('green_shift', -1)) == 8
-            and int(pixel_format.get('blue_shift', -1)) == 0
-        )
-
-    def _encoding_supported_for_pixel_format(self, encoding_type: int,
-                                             pixel_format: dict | None) -> bool:
-        """Limit encoder selection to wire formats the current implementation really supports."""
-        if encoding_type in (7, 21, 50):
-            return self._is_native_bgr0_pixel_format(pixel_format)
-        return True
-
-    def _filter_encodings_for_pixel_format(self, client_encodings: list[int],
-                                           encoder_manager: EncoderManager,
-                                           pixel_format: dict | None) -> tuple[list[int], list[int]]:
-        """Drop server-supported encodings that are incompatible with the current pixel format."""
-        filtered: list[int] = []
-        dropped: list[int] = []
-        for enc_type in client_encodings:
-            if enc_type in encoder_manager.encoders and not self._encoding_supported_for_pixel_format(
-                enc_type, pixel_format
-            ):
-                dropped.append(enc_type)
-                continue
-            filtered.append(enc_type)
-        return filtered, dropped
-
-    def _is_parallel_safe_encoding(self, encoding_type: int) -> bool:
-        """Allow parallel encoding only for stateless encoder implementations."""
-        return encoding_type in {0, 2, 5}
-
-    def _reset_stateful_encoders(self, encoder_manager: EncoderManager) -> None:
-        """Reset encoder state that depends on the client's framebuffer contents."""
-        copyrect_encoder = encoder_manager.encoders.get(1)
-        if copyrect_encoder is not None and hasattr(copyrect_encoder, 'reset'):
-            try:
-                copyrect_encoder.reset()
-            except Exception:
-                pass
-
-    def _commit_frame_state(self, encoder_manager: EncoderManager,
-                            pixel_data: bytes, fb_width: int, fb_height: int,
-                            bytes_per_pixel: int) -> None:
-        """Commit the framebuffer that the client now holds after a successful update."""
-        copyrect_encoder = encoder_manager.encoders.get(1)
-        if copyrect_encoder is not None and hasattr(copyrect_encoder, 'commit_frame'):
-            try:
-                copyrect_encoder.commit_frame(pixel_data, fb_width, fb_height, bytes_per_pixel)
-            except Exception:
-                pass
-
-    def _register_authenticated_client_socket(self, client_id: str, client_socket: socket.socket) -> None:
-        """Track authenticated clients so shared-flag=0 can evict peers per RFC 6143."""
-        with self._client_registry_lock:
-            self._authenticated_client_sockets[client_id] = client_socket
-
-    def _unregister_authenticated_client_socket(self, client_id: str) -> None:
-        """Remove a client from the authenticated socket registry."""
-        with self._client_registry_lock:
-            self._authenticated_client_sockets.pop(client_id, None)
-
-    def _disconnect_other_authenticated_clients(self, keep_client_id: str) -> None:
-        """Close all authenticated client sockets except the requesting client."""
-        with self._client_registry_lock:
-            to_close = [
-                (client_id, sock)
-                for client_id, sock in self._authenticated_client_sockets.items()
-                if client_id != keep_client_id
-            ]
-            for client_id, _ in to_close:
-                self._authenticated_client_sockets.pop(client_id, None)
-
-        for client_id, client_socket in to_close:
-            try:
-                self.logger.info(
-                    "Disconnecting client %s due to exclusive shared-flag=0 request",
-                    client_id,
-                )
-                try:
-                    client_socket.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                client_socket.close()
-            except OSError:
-                pass
-
-    def _try_acquire_input_control(self, client_id: str) -> bool:
-        """Grant input control to exactly one client unless policy allows sharing."""
-        if self.input_control_policy != 'single-controller':
-            return True
-
-        with self._input_control_lock:
-            if self._input_controller_client_id in (None, client_id):
-                newly_assigned = self._input_controller_client_id is None
-                self._input_controller_client_id = client_id
-                if newly_assigned:
-                    self._input_control_rejections_logged.discard(client_id)
-                    self.logger.info("Input control assigned to %s", client_id)
-                return True
-
-            controller = self._input_controller_client_id
-
-        if client_id not in self._input_control_rejections_logged:
-            self._input_control_rejections_logged.add(client_id)
-            self.logger.info(
-                "Ignoring input from %s because %s currently controls the server",
-                client_id,
-                controller,
-            )
-        return False
-
-    def _release_input_control(self, client_id: str) -> None:
-        """Release single-controller input ownership on disconnect."""
-        if self.input_control_policy != 'single-controller':
-            return
-
-        with self._input_control_lock:
-            self._input_control_rejections_logged.discard(client_id)
-            if self._input_controller_client_id == client_id:
-                self._input_controller_client_id = None
-                self.logger.info("Input control released from %s", client_id)
-
-    def handle_multiple_clients_batch(self, client_data: list[tuple[socket.socket, tuple, str]]) -> None:
-        """
-        Handle multiple clients with exception group support (Python 3.13)
-
-        Args:
-            client_data: List of (socket, addr, client_id) tuples
-
-        This method demonstrates exception groups for batch client handling
-        """
-        with ExceptionCollector() as collector:
-            for client_socket, addr, client_id in client_data:
-                with collector.catch(f"client_{client_id}"):
-                    self.handle_client(client_socket, addr, client_id)
-
-        # Handle collected errors
-        if collector.has_exceptions():
-            exc_group = collector.create_exception_group("Multiple client errors")
-            if exc_group:
-                # Categorize by exception type
-                categories = categorize_exceptions(exc_group)
-
-                for exc_type, exceptions in categories.items():
-                    self.logger.error(f"{exc_type}: {len(exceptions)} occurrences")
-                    for exc in exceptions[:3]:  # Log first 3 of each type
-                        self.logger.error(f"  - {exc}")
-
-                # Re-raise if any critical errors
-                if "ProtocolError" in categories or "ConnectionError" in categories:
-                    raise exc_group
-
-    def _extract_region(self, pixel_data: bytes, fb_width: int, fb_height: int,
-                       x: int, y: int, width: int, height: int,
-                       bytes_per_pixel: int) -> bytes:
-        """Extract a rectangular region from framebuffer"""
-        if bytes_per_pixel <= 0 or width <= 0 or height <= 0:
-            return b''
-
-        if x < 0:
-            width += x
-            x = 0
-        if y < 0:
-            height += y
-            y = 0
-        if x >= fb_width or y >= fb_height:
-            return b''
-
-        width = min(width, fb_width - x)
-        height = min(height, fb_height - y)
-        if width <= 0 or height <= 0:
-            return b''
-
-        row_size = width * bytes_per_pixel
-        result = bytearray(height * row_size)
-        dst_offset = 0
-
-        for row in range(height):
-            src_offset = ((y + row) * fb_width + x) * bytes_per_pixel
-            result[dst_offset:dst_offset + row_size] = pixel_data[src_offset:src_offset + row_size]
-            dst_offset += row_size
-
-        return bytes(result)
-
-    def _split_rectangles_for_encoding(self, encoding_type: int, x: int, y: int,
-                                       width: int, height: int) -> list[tuple[int, int, int, int]]:
-        """
-        Split large rectangles the way TightVNC does for Tight encoding.
-
-        Reference TightVNC aggressively splits large Tight rectangles before encoding,
-        while ZRLE keeps the original rectangle and handles 64x64 tiling internally.
-        """
-        if width <= 0 or height <= 0:
-            return []
-        if encoding_type != 7:
-            return [(x, y, width, height)]
-
-        max_rect_size = 524288
-        max_rect_width = 2048
-        if width <= 2048 and width * height <= max_rect_size:
-            return [(x, y, width, height)]
-
-        split_rects: list[tuple[int, int, int, int]] = []
-        step_width = min(max_rect_width, width)
-        step_height = max(1, max_rect_size // max(1, step_width))
-
-        for y0 in range(y, y + height, step_height):
-            h = min(step_height, (y + height) - y0)
-            for x0 in range(x, x + width, step_width):
-                w = min(step_width, (x + width) - x0)
-                split_rects.append((x0, y0, w, h))
-        return split_rects
-
-    def _capture_frame(self, screen_capture: ScreenCapture, pixel_format: dict):
-        """Capture a frame for a single client connection."""
-        if hasattr(screen_capture, 'capture_frame'):
-            return screen_capture.capture_frame(pixel_format)
-        result = screen_capture.capture_fast(pixel_format)
-        return CaptureFrame(result=result, metadata=CaptureMetadata(backend_name="legacy"))
-
-    def _resolve_incremental_update_hints(
-        self,
-        protocol: RFBProtocol,
-        client_encodings: list[int],
-        capture_metadata: CaptureMetadata,
-        request_region: tuple[int, int, int, int],
-    ) -> tuple[list[tuple[int, int, int, int]] | None, list[tuple[int, int, int, int, int, bytes]]]:
-        """Use backend-supplied dirty/move hints when available."""
-        changed_regions = capture_metadata.dirty_regions
-        if changed_regions is not None:
-            changed_regions = self._intersect_regions(changed_regions, request_region)
-
-        copyrect_rectangles: list[tuple[int, int, int, int, int, bytes]] = []
-        if (
-            self.enable_copyrect_encoding
-            and protocol.ENCODING_COPYRECT in client_encodings
-            and capture_metadata.move_rects
-        ):
-            copyrect_rectangles = self._build_copyrect_rectangles_from_moves(
-                capture_metadata.move_rects,
-                request_region,
-            )
-
-        return changed_regions, copyrect_rectangles
-
-    def _build_copyrect_rectangles_from_moves(
-        self,
-        move_rects: list[CaptureMoveRect],
-        request_region: tuple[int, int, int, int],
-    ) -> list[tuple[int, int, int, int, int, bytes]]:
-        """Translate backend move hints into RFB CopyRect rectangles."""
-        req_x, req_y, req_w, req_h = request_region
-        req_x2 = req_x + req_w
-        req_y2 = req_y + req_h
-        rectangles: list[tuple[int, int, int, int, int, bytes]] = []
-
-        for move in move_rects:
-            dst_x1 = max(move.dst_x, req_x)
-            dst_y1 = max(move.dst_y, req_y)
-            dst_x2 = min(move.dst_x + move.width, req_x2)
-            dst_y2 = min(move.dst_y + move.height, req_y2)
-            if dst_x1 >= dst_x2 or dst_y1 >= dst_y2:
-                continue
-
-            offset_x = dst_x1 - move.dst_x
-            offset_y = dst_y1 - move.dst_y
-            src_x = move.src_x + offset_x
-            src_y = move.src_y + offset_y
-            width = dst_x2 - dst_x1
-            height = dst_y2 - dst_y1
-            rectangles.append(
-                (
-                    dst_x1,
-                    dst_y1,
-                    width,
-                    height,
-                    1,
-                    struct.pack(">HH", src_x, src_y),
-                )
-            )
-
-        return rectangles
-
-    def _configure_lan_encoders(self, encoder_manager: EncoderManager,
-                                jpeg_quality: int) -> None:
-        """Apply LAN-specific encoder settings."""
-        zrle_encoder = encoder_manager.encoders.get(16)
-        if zrle_encoder is not None:
-            try:
-                if hasattr(zrle_encoder, 'set_compression_level'):
-                    zrle_encoder.set_compression_level(self.lan_zrle_compression_level)
-                elif hasattr(zrle_encoder, 'compression_level'):
-                    zrle_encoder.compression_level = self.lan_zrle_compression_level
-            except Exception:
-                pass
-
-        tight_encoder = encoder_manager.encoders.get(7)
-        if tight_encoder is not None and hasattr(tight_encoder, 'set_compression_level'):
-            try:
-                tight_encoder.set_compression_level(self.lan_tight_compression_level)
-            except Exception:
-                pass
-
-        zlib_encoder = encoder_manager.encoders.get(6)
-        if zlib_encoder is not None:
-            try:
-                if hasattr(zlib_encoder, 'set_compression_level'):
-                    zlib_encoder.set_compression_level(self.lan_zlib_compression_level)
-                elif hasattr(zlib_encoder, 'compression_level'):
-                    zlib_encoder.compression_level = self.lan_zlib_compression_level
-            except Exception:
-                pass
-
-        jpeg_encoder = encoder_manager.encoders.get(21)
-        if jpeg_encoder is not None and hasattr(jpeg_encoder, 'set_quality'):
-            try:
-                jpeg_encoder.set_quality(jpeg_quality)
-            except Exception:
-                pass
-
-    def _prepare_encoder_for_send(self, encoding_type: int, encoder,
-                                  lan_jpeg_quality: int) -> None:
-        """Prepare encoder before a frame/region encode."""
-        if encoding_type != 21:
-            return
-        if hasattr(encoder, 'set_quality'):
-            try:
-                encoder.set_quality(lan_jpeg_quality)
-            except Exception:
-                pass
-
-    def _log_selected_region_encodings(self, encoding_types: list[int]) -> None:
-        """Log the actually used region encodings for a framebuffer update."""
-        if not encoding_types:
-            return
-        enc_counts: dict[int, int] = {}
-        for enc_type in encoding_types:
-            enc_counts[enc_type] = enc_counts.get(enc_type, 0) + 1
-        enc_summary = ", ".join(
-            f"{encoding_name(enc)} ({enc}) x{count}"
-            for enc, count in sorted(enc_counts.items())
-        )
-        self.logger.info("Selected region encodings: %s", enc_summary)
-
-    def _log_selected_encoding(self, encoding_type: int, content_type: str) -> None:
-        """Log the actually used rectangle encoding for a framebuffer update."""
-        self.logger.info(
-            "Selected encoding: %s (%d) for content type: %s",
-            encoding_name(encoding_type),
-            encoding_type,
-            content_type,
-        )
-
-    def _build_cursor_pseudo_rectangles(
-        self,
-        protocol: RFBProtocol,
-        client_encodings: list[int],
-        current_pixel_format: dict,
-        cursor_capture: SystemCursorCapture | None,
-        cursor_encoder: CursorEncoder | None,
-        last_pointer_pos: tuple[int, int] | None,
-    ) -> tuple[list[tuple[int, int, int, int, int, bytes]], tuple[int, int] | None]:
-        """Build RichCursor/PointerPos pseudo-rectangles for the current frame."""
-        if (
-            not self.enable_cursor_encoding
-            or cursor_capture is None
-            or cursor_encoder is None
-        ):
-            return [], last_pointer_pos
-
-        rectangles: list[tuple[int, int, int, int, int, bytes]] = []
-        bytes_per_pixel = max(1, current_pixel_format.get("bits_per_pixel", 32) // 8)
-
-        if protocol.ENCODING_CURSOR in client_encodings:
-            cursor_data = cursor_capture.capture_cursor()
-            if cursor_data is not None and cursor_encoder.has_cursor_changed(cursor_data):
-                hotspot_x, hotspot_y, encoded_data = cursor_encoder.encode_cursor(
-                    cursor_data,
-                    bytes_per_pixel=bytes_per_pixel,
-                )
-                rectangles.append(
-                    (
-                        hotspot_x,
-                        hotspot_y,
-                        cursor_data.width,
-                        cursor_data.height,
-                        protocol.ENCODING_CURSOR,
-                        encoded_data,
-                    )
-                )
-
-        if protocol.ENCODING_POINTER_POS in client_encodings:
-            pointer_pos = cursor_capture.get_pointer_position()
-            if pointer_pos is not None and pointer_pos != last_pointer_pos:
-                rectangles.append(
-                    (
-                        pointer_pos[0],
-                        pointer_pos[1],
-                        0,
-                        0,
-                        protocol.ENCODING_POINTER_POS,
-                        b"",
-                    )
-                )
-                last_pointer_pos = pointer_pos
-
-        return rectangles, last_pointer_pos
-
-    def _configure_tight_compatibility(self, encoder_manager: EncoderManager) -> None:
-        """Apply the explicit Tight stream-reset compatibility switch, if enabled."""
-        tight_encoder = encoder_manager.encoders.get(7)
-        if tight_encoder is None or not hasattr(tight_encoder, 'set_stream_reset_mode'):
-            return
-
-        try:
-            tight_encoder.set_stream_reset_mode(self.tight_stream_reset_for_ultravnc)
-        except Exception:
-            pass
-
-    def _encode_with_selected_encoder(self, encoding_type: int, encoder,
-                                      pixel_data: bytes, width: int, height: int,
-                                      lan_jpeg_quality: int, bytes_per_pixel: int,
-                                      pixel_format: dict | None) -> bytes:
-        """Encode bytes with an already-selected encoder instance."""
-        self._prepare_encoder_for_send(encoding_type, encoder, lan_jpeg_quality)
-        if encoding_type == 16:
-            return encoder.encode(
-                pixel_data, width, height, bytes_per_pixel, pixel_format=pixel_format
-            )
-        return encoder.encode(pixel_data, width, height, bytes_per_pixel)
-
-    def _select_encoder_for_update(self,
-                                   encoder_manager: EncoderManager,
-                                   client_encodings: list[int],
-                                   network_profile: NetworkProfile,
-                                   width: int,
-                                   height: int,
-                                   fb_width: int,
-                                   fb_height: int,
-                                   content_type: str,
-                                   allow_jpeg: bool = True,
-                                   allow_zlib: bool = True,
-                                   allow_copyrect: bool = True,
-                                   bytes_per_pixel: int | None = None,
-                                   pixel_format: dict | None = None) -> tuple[int, object]:
-        """
-        Pick the first usable encoding in client-preferred order.
-        """
-        ordered_client_encodings, _ = self._filter_encodings_for_pixel_format(
-            client_encodings, encoder_manager, pixel_format
-        )
-        encoders = encoder_manager.encoders
-        def available(enc_type: int) -> bool:
-            if not self._encoding_supported_for_pixel_format(enc_type, pixel_format):
-                return False
-            if enc_type == 1 and not allow_copyrect:
-                return False
-            if enc_type == 21 and not allow_jpeg:
-                return False
-            if enc_type == 6 and not allow_zlib:
-                return False
-            if enc_type == 21 and bytes_per_pixel not in (3, 4):
-                return False
-            return enc_type in encoders
-
-        for enc_type in ordered_client_encodings:
-            if available(enc_type):
-                return enc_type, encoders[enc_type]
-
-        # RFC 6143 allows Raw even if not listed explicitly by the client.
-        if 0 in encoders and self._encoding_supported_for_pixel_format(0, pixel_format):
-            return 0, encoders[0]
-
-        return encoder_manager.get_best_encoder(
-            ordered_client_encodings, content_type=content_type
-        )
-
-    def _encode_rectangle_for_update(self,
-                                     encoder_manager: EncoderManager,
-                                     client_encodings: list[int],
-                                     network_profile: NetworkProfile,
-                                     x: int,
-                                     y: int,
-                                     width: int,
-                                     height: int,
-                                     fb_width: int,
-                                     fb_height: int,
-                                     content_type: str,
-                                     pixel_data: bytes,
-                                     full_frame: bytes,
-                                     request_region: tuple[int, int, int, int] | None,
-                                     allow_jpeg: bool = True,
-                                     allow_zlib: bool = True,
-                                     allow_copyrect: bool = True,
-                                     lan_jpeg_quality: int = 75,
-                                     bytes_per_pixel: int | None = None,
-                                     pixel_format: dict | None = None) -> tuple[int, object, bytes]:
-        """Encode a rectangle using the first client-preferred encoding that produces valid payload."""
-        if bytes_per_pixel is None:
-            bytes_per_pixel = max(1, int(pixel_format.get('bits_per_pixel', 32)) // 8) if pixel_format else 4
-
-        ordered_client_encodings, _ = self._filter_encodings_for_pixel_format(
-            client_encodings, encoder_manager, pixel_format
-        )
-        encoders = encoder_manager.encoders
-
-        def available(enc_type: int) -> bool:
-            if enc_type not in encoders:
-                return False
-            if not self._encoding_supported_for_pixel_format(enc_type, pixel_format):
-                return False
-            if enc_type == 1 and not allow_copyrect:
-                return False
-            if enc_type == 21 and (not allow_jpeg or bytes_per_pixel not in (3, 4)):
-                return False
-            if enc_type == 6 and not allow_zlib:
-                return False
-            return True
-
-        for enc_type in ordered_client_encodings:
-            if not available(enc_type):
-                continue
-            if enc_type == 1:
-                encoder = encoders[enc_type]
-                payload = encoder.encode_copyrect(
-                    full_frame,
-                    fb_width,
-                    fb_height,
-                    x,
-                    y,
-                    width,
-                    height,
-                    bytes_per_pixel,
-                    request_region=request_region,
-                )
-                if payload is not None:
-                    return enc_type, encoder, payload
-                continue
-
-            encoder = encoders[enc_type]
-            self._prepare_encoder_for_send(enc_type, encoder, lan_jpeg_quality)
-            if enc_type == 16:
-                encoded_data = encoder.encode(
-                    pixel_data, width, height, bytes_per_pixel, pixel_format=pixel_format
-                )
-            else:
-                encoded_data = encoder.encode(pixel_data, width, height, bytes_per_pixel)
-            return enc_type, encoder, encoded_data
-
-        raw_encoder = encoders[0]
-        return 0, raw_encoder, raw_encoder.encode(pixel_data, width, height, bytes_per_pixel)
-
-    def _adjust_lan_jpeg_quality(self, current_quality: int,
-                                 frame_time: float,
-                                 encoded_bytes: int,
-                                 original_bytes: int,
-                                 target_frame_time: float) -> int:
-        """Adapt JPEG quality based on frame timing and achieved compression."""
-        if target_frame_time <= 0 or original_bytes <= 0:
-            return current_quality
-
-        compression_ratio = encoded_bytes / max(1, original_bytes)
-        next_quality = current_quality
-
-        if frame_time > target_frame_time * 1.35:
-            next_quality -= 5
-        elif frame_time > target_frame_time * 1.10:
-            next_quality -= 2
-        elif frame_time < target_frame_time * 0.70 and compression_ratio < 0.28:
-            next_quality += 3
-        elif frame_time < target_frame_time * 0.85 and compression_ratio < 0.40:
-            next_quality += 1
-
-        return max(self.lan_jpeg_quality_min, min(self.lan_jpeg_quality_max, next_quality))
-
-    def _coalesce_framebuffer_update_requests(self, client_socket,
-                                              protocol: RFBProtocol,
-                                              first_request: dict) -> dict:
-        """
-        Coalesce queued FramebufferUpdateRequest messages and keep only newest.
-        """
-        latest = first_request
-        if not hasattr(client_socket, 'recv'):
-            return latest
-
-        original_timeout = None
-        try:
-            original_timeout = client_socket.gettimeout()
-            client_socket.settimeout(0.0)
-
-            while True:
-                try:
-                    # FramebufferUpdateRequest is 1-byte type + 9-byte payload.
-                    peek = client_socket.recv(10, socket.MSG_PEEK)
-                except (BlockingIOError, InterruptedError, socket.timeout):
-                    break
-                except OSError:
-                    break
-
-                if len(peek) < 10 or peek[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
-                    break
-
-                msg_type_data = protocol._recv_exact(client_socket, 1)
-                if (
-                    not msg_type_data
-                    or msg_type_data[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST
-                ):
-                    break
-
-                latest = protocol.parse_framebuffer_update_request(client_socket)
-        except Exception:
-            # Best-effort optimization; fall back to first request.
-            pass
-        finally:
-            if original_timeout is not None:
-                try:
-                    client_socket.settimeout(original_timeout)
-                except Exception:
-                    pass
-
-        return latest
-
-    def _coalesce_pointer_events(self, client_socket,
-                                 protocol: RFBProtocol,
-                                 first_event: dict) -> dict:
-        """
-        Coalesce a burst of PointerEvent messages and keep only the newest one.
-
-        This prevents cursor "catch-up" behavior when the socket queue contains
-        many stale pointer positions.
-        """
-        latest = first_event
-        if not hasattr(client_socket, 'recv'):
-            return latest
-
-        original_timeout = None
-        try:
-            original_timeout = client_socket.gettimeout()
-            client_socket.settimeout(0.0)
-
-            while True:
-                try:
-                    # PointerEvent message is 1-byte type + 5-byte payload.
-                    peek = client_socket.recv(6, socket.MSG_PEEK)
-                except (BlockingIOError, InterruptedError, socket.timeout):
-                    break
-                except OSError:
-                    break
-
-                if len(peek) < 6 or peek[0] != protocol.MSG_POINTER_EVENT:
-                    break
-                if peek[1] != latest.get('button_mask', peek[1]):
-                    # Preserve button transitions (press/release) as separate events.
-                    break
-
-                msg_type_data = protocol._recv_exact(client_socket, 1)
-                if not msg_type_data or msg_type_data[0] != protocol.MSG_POINTER_EVENT:
-                    break
-
-                latest = protocol.parse_pointer_event(client_socket)
-        except Exception:
-            # Best-effort optimization; fall back to single-event handling.
-            pass
-        finally:
-            if original_timeout is not None:
-                try:
-                    client_socket.settimeout(original_timeout)
-                except Exception:
-                    pass
-
-        return latest
-
-    def _normalize_request_region(self, request: dict, fb_width: int,
-                                  fb_height: int) -> tuple[int, int, int, int] | None:
-        """Clamp client-requested update rectangle to framebuffer bounds."""
-        if fb_width <= 0 or fb_height <= 0:
-            return None
-
-        x = int(request.get('x', 0))
-        y = int(request.get('y', 0))
-        width = int(request.get('width', 0))
-        height = int(request.get('height', 0))
-
-        if width <= 0 or height <= 0:
-            return None
-        if x >= fb_width or y >= fb_height:
-            return None
-
-        x = max(0, x)
-        y = max(0, y)
-        width = min(width, fb_width - x)
-        height = min(height, fb_height - y)
-        if width <= 0 or height <= 0:
-            return None
-
-        return x, y, width, height
-
-    def _intersect_rectangles(self, first: tuple[int, int, int, int],
-                              second: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
-        """Return intersection of two rectangles or None if disjoint."""
-        x1, y1, w1, h1 = first
-        x2, y2, w2, h2 = second
-
-        left = max(x1, x2)
-        top = max(y1, y2)
-        right = min(x1 + w1, x2 + w2)
-        bottom = min(y1 + h1, y2 + h2)
-
-        if right <= left or bottom <= top:
-            return None
-        return left, top, right - left, bottom - top
-
-    def _intersect_regions(self, regions, request_region: tuple[int, int, int, int]) -> list[tuple[int, int, int, int]]:
-        """Filter changed regions to the client-requested area."""
-        filtered: list[tuple[int, int, int, int]] = []
-        for region in regions:
-            if hasattr(region, 'x'):
-                rect = (int(region.x), int(region.y), int(region.width), int(region.height))
-            else:
-                rect = (
-                    int(region[0]),
-                    int(region[1]),
-                    int(region[2]),
-                    int(region[3]),
-                )
-            intersection = self._intersect_rectangles(rect, request_region)
-            if intersection is not None:
-                filtered.append(intersection)
-        return filtered
-
-    def _collapse_regions_to_bounding_box(self, regions) -> list[tuple[int, int, int, int]]:
-        """
-        Collapse multiple regions into one bounding rectangle.
-
-        Compatibility path for clients that behave poorly with frequent
-        multi-rectangle updates.
-        """
-        if not regions:
-            return []
-        if len(regions) == 1:
-            region = regions[0]
-            if hasattr(region, 'x'):
-                return [(int(region.x), int(region.y), int(region.width), int(region.height))]
-            return [(int(region[0]), int(region[1]), int(region[2]), int(region[3]))]
-
-        normalized: list[tuple[int, int, int, int]] = []
-        for region in regions:
-            if hasattr(region, 'x'):
-                x, y, w, h = int(region.x), int(region.y), int(region.width), int(region.height)
-            else:
-                x, y, w, h = int(region[0]), int(region[1]), int(region[2]), int(region[3])
-            if w > 0 and h > 0:
-                normalized.append((x, y, w, h))
-
-        if not normalized:
-            return []
-
-        left = min(r[0] for r in normalized)
-        top = min(r[1] for r in normalized)
-        right = max(r[0] + r[2] for r in normalized)
-        bottom = max(r[1] + r[3] for r in normalized)
-        if right <= left or bottom <= top:
-            return []
-        return [(left, top, right - left, bottom - top)]
 
     def _cleanup(self):
-        """Cleanup server resources"""
+        """Gracefully stop listeners, sessions, workers, capture and health checks."""
         self.logger.info("Cleaning up server resources...")
 
-        # Stop health checker
-        self.health_checker.stop()
-
-        # Close server socket
+        # 1. Stop accepting new connections.
         try:
             self.server_socket.close()
-        except:
+        except OSError:
             pass
 
-        # Print metrics summary
+        # 2. Stop producing new desktop frames.
+        if self.capture_producer is not None:
+            self.capture_producer.stop(timeout=3.0)
+
+        # 3. Interrupt all active and pre-authentication client sessions.
+        with self._client_registry_lock:
+            sockets = list(self._all_client_sockets.values())
+            threads = list(self._client_threads.values())
+        for client_socket in sockets:
+            try:
+                shutdown = getattr(client_socket, 'shutdown', None)
+                if callable(shutdown):
+                    shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                client_socket.close()
+            except Exception:
+                pass
+
+        # 4. Wait briefly for non-daemon session threads to release their state.
+        deadline = time.monotonic() + 3.0
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is current or not thread.is_alive():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+
+        # 5. Stop background health checks and shared encoding workers.
+        self.health_checker.stop()
+        try:
+            self.encoding_executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            self.encoding_executor.shutdown(wait=False)
+        self.screen_capture.close_current_thread_sessions()
+
         if self.metrics:
             summary = self.metrics.format_summary()
             self.logger.info(f"Final metrics:\n{summary}")
 
     def get_status(self) -> dict:
-        """Get server status"""
-        if self.metrics:
-            return self.metrics.get_summary()
-        return {
-            'active_connections': self.connection_pool.get_active_count(),
+        """Return liveness metrics separately from readiness/capacity."""
+        active = self.connection_limiter.get_active_count()
+        status = self.metrics.get_summary() if self.metrics else {}
+        health = self.health_checker.last_status
+        status.update({
+            'version': __version__,
+            'active_connections': active,
             'max_connections': self.max_connections,
-        }
+            'ready': active < self.max_connections and not self.shutdown_handler.is_shutting_down(),
+            'saturated': active >= self.max_connections,
+            'healthy': health.is_healthy if health is not None else True,
+        })
+        return status
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the legacy CLI parser."""
-    parser = argparse.ArgumentParser(description="PyVNCServer v3.0")
+    parser = argparse.ArgumentParser(description=SERVER_NAME)
     parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),

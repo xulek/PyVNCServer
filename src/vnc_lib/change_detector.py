@@ -257,9 +257,9 @@ class AdaptiveChangeDetector:
         # Tile-based detection for normal activity
         self.tile_grid = TileGrid(width, height, tile_size=64)
 
-        # Full-screen sampled bytes for quick-check (faster than MD5)
-        self._prev_sample: bytes | None = None
-        self._prev_length: int = 0
+        # Do not use sparse byte sampling as a correctness shortcut. Sparse
+        # sampling can miss small changes located between sampled offsets.
+        # Tile checksums below are always evaluated for incremental updates.
 
         # Activity tracking
         self.change_history: list[float] = []  # % of screen changed
@@ -279,18 +279,9 @@ class AdaptiveChangeDetector:
         Returns:
             List of changed regions, or None if full update needed
         """
-        # Quick-check: sample every 4096th byte for O(n/4096) comparison
-        data_len = len(pixel_data)
-        if data_len == self._prev_length and self._prev_sample is not None:
-            sample = pixel_data[::4096]
-            if sample == self._prev_sample:
-                return []
-            self._prev_sample = sample
-        else:
-            self._prev_sample = pixel_data[::4096]
-            self._prev_length = data_len
-
-        # Use tile-based detection
+        # Always evaluate tile checksums. A previous implementation sampled
+        # every 4096th byte and returned early when the sample matched; that
+        # could permanently miss small screen changes.
         changed_regions = self.tile_grid.update_and_get_changed(
             pixel_data, bytes_per_pixel
         )

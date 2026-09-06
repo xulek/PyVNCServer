@@ -81,6 +81,8 @@ class GracefulShutdown:
         self.shutdown_event = threading.Event()
         self.cleanup_callbacks: list[Callable[[], None]] = []
         self._signal_received = False
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_done = False
 
         # Register signal handlers
         self._register_signals()
@@ -133,15 +135,18 @@ class GracefulShutdown:
         return self.shutdown_event.wait(timeout=timeout)
 
     def shutdown(self):
-        """Initiate graceful shutdown"""
-        if self.shutdown_event.is_set():
-            self.logger.warning("Shutdown already in progress")
-            return
+        """Initiate shutdown and run cleanup exactly once.
+
+        Signal handlers set ``shutdown_event`` before the server loop exits, so
+        cleanup must not be skipped merely because the event is already set.
+        """
+        self.shutdown_event.set()
+        with self._cleanup_lock:
+            if self._cleanup_done:
+                return
+            self._cleanup_done = True
 
         self.logger.info("Initiating graceful shutdown...")
-        self.shutdown_event.set()
-
-        # Run cleanup callbacks
         for callback in self.cleanup_callbacks:
             try:
                 self.logger.debug(f"Running cleanup: {callback.__name__}")
@@ -266,7 +271,7 @@ class HealthChecker:
                 if not check_func():
                     all_healthy = False
                     break
-            except:
+            except Exception:
                 all_healthy = False
                 break
 
@@ -281,15 +286,15 @@ class HealthChecker:
         return status
 
 
-class ConnectionPool:
+class ConnectionLimiter:
     """
-    Thread-safe connection pool
+    Thread-safe concurrent connection limiter
     Python 3.13 compatible
     """
 
     def __init__(self, max_connections: int = 10):
         """
-        Initialize connection pool
+        Initialize connection limiter
 
         Args:
             max_connections: Maximum number of concurrent connections
@@ -358,6 +363,12 @@ class ConnectionPool:
         return self.get_active_count() >= self.max_connections
 
 
+# Backward-compatible name retained for callers that imported ConnectionPool.
+# New code should use ConnectionLimiter to avoid confusion with the reusable
+# socket pool in vnc_lib.connection_pool.
+ConnectionPool = ConnectionLimiter
+
+
 class PerformanceThrottler:
     """
     Rate limiter for performance control
@@ -394,17 +405,4 @@ class PerformanceThrottler:
 
             self.last_operation_time = time.perf_counter()
 
-    def can_proceed(self) -> bool:
-        """
-        Check if operation can proceed without sleeping
 
-        Returns:
-            True if enough time has passed since last operation
-        """
-        if self.max_rate <= 0:
-            return True
-
-        with self._lock:
-            current_time = time.perf_counter()
-            time_since_last = current_time - self.last_operation_time
-            return time_since_last >= self.min_interval

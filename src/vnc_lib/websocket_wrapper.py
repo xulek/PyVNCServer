@@ -12,6 +12,7 @@ from typing import Iterable, Optional
 from enum import IntEnum
 
 from vnc_lib.exceptions import ConnectionError, ProtocolError
+from vnc_lib.io_utils import recv_exact
 
 
 class WebSocketOpcode(IntEnum):
@@ -41,11 +42,13 @@ class WebSocketWrapper:
 
     MAGIC_STRING = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # RFC 6455
     DEFAULT_MAX_HANDSHAKE_BYTES = 64 * 1024  # 64 KiB
-    DEFAULT_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024  # 8 MiB
+    DEFAULT_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024  # 8 MiB per frame
+    DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024 * 1024  # 16 MiB after fragmentation
 
     def __init__(self, client_socket: socket.socket,
                  max_handshake_bytes: int = DEFAULT_MAX_HANDSHAKE_BYTES,
                  max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+                 max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
                  allowed_origins: Iterable[str] | None = None):
         """
         Initialize WebSocket wrapper
@@ -58,7 +61,9 @@ class WebSocketWrapper:
         self.logger = logging.getLogger(__name__)
         self.max_handshake_bytes = max(1024, int(max_handshake_bytes))
         self.max_payload_bytes = max(1024, int(max_payload_bytes))
+        self.max_message_bytes = max(self.max_payload_bytes, int(max_message_bytes))
         self._fragment_buffer = bytearray()
+        self._raw_prebuffer = bytearray()
         self._fragment_opcode: int | None = None
         self.allowed_origins = frozenset(
             self._normalize_origin(origin)
@@ -74,22 +79,30 @@ class WebSocketWrapper:
             True if handshake successful, False otherwise
         """
         try:
-            # Read HTTP request
+            # Read HTTP request. TCP may coalesce the first WebSocket frame
+            # with the HTTP headers, so preserve any bytes after the terminator.
             request = bytearray()
-            while b"\r\n\r\n" not in request:
+            terminator = b"\r\n\r\n"
+            while terminator not in request:
                 chunk = self.socket.recv(4096)
                 if not chunk:
                     return False
                 request.extend(chunk)
-                if len(request) > self.max_handshake_bytes:
+                if len(request) > self.max_handshake_bytes and terminator not in request:
                     self.logger.warning(
-                        f"WebSocket handshake exceeds max header size: "
-                        f"{len(request)} > {self.max_handshake_bytes}"
+                        "WebSocket handshake exceeds max header size: %d > %d",
+                        len(request), self.max_handshake_bytes,
                     )
                     return False
 
+            header_bytes, remainder = bytes(request).split(terminator, 1)
+            if len(header_bytes) + len(terminator) > self.max_handshake_bytes:
+                self.logger.warning("WebSocket handshake headers exceed configured limit")
+                return False
+            self._raw_prebuffer.extend(remainder)
+
             # Parse request
-            request_str = bytes(request).decode('utf-8', errors='ignore')
+            request_str = header_bytes.decode('utf-8', errors='strict') + "\r\n\r\n"
             request_line = request_str.split('\r\n', 1)[0]
             if not self._validate_request_line(request_line):
                 self.logger.warning(f"Invalid WebSocket request line: {request_line!r}")
@@ -116,12 +129,19 @@ class WebSocketWrapper:
             selected_protocol = None
             proto_header = headers.get('sec-websocket-protocol', '')
             if proto_header:
-                # Client may send a comma-separated list, e.g. "binary, base64"
+                # The implementation supports the binary noVNC transport only.
+                # Never advertise the legacy base64 transport unless it is actually decoded.
                 for proto in proto_header.split(','):
                     p = proto.strip().lower()
-                    if p in ('binary', 'base64'):
+                    if p == 'binary':
                         selected_protocol = p
                         break
+                if selected_protocol is None:
+                    self.logger.warning(
+                        "Client requested only unsupported WebSocket subprotocols: %s",
+                        proto_header,
+                    )
+                    return False
 
             # Build handshake response
             lines = [
@@ -181,11 +201,17 @@ class WebSocketWrapper:
         if 'sec-websocket-key' not in headers:
             return False
 
-        # RFC 6455 requires version 13. Keep compatibility with clients
-        # that omit the header, but reject explicitly unsupported versions.
+        # RFC 6455 requires version 13.
         version = headers.get('sec-websocket-version')
-        if version and version.strip() != '13':
+        if version is None or version.strip() != '13':
             self.logger.warning(f"Unsupported Sec-WebSocket-Version: {version}")
+            return False
+
+        try:
+            decoded_key = base64.b64decode(headers['sec-websocket-key'], validate=True)
+        except Exception:
+            return False
+        if len(decoded_key) != 16:
             return False
 
         origin = headers.get('origin')
@@ -212,6 +238,22 @@ class WebSocketWrapper:
         sha1.update((ws_key + self.MAGIC_STRING).encode('utf-8'))
         return base64.b64encode(sha1.digest()).decode('utf-8')
 
+    def _recv_raw_exact(self, size: int) -> bytes | None:
+        """Receive exact raw WebSocket bytes, consuming handshake remainder first."""
+        if size <= 0:
+            return b""
+        out = bytearray()
+        if self._raw_prebuffer:
+            take = min(size, len(self._raw_prebuffer))
+            out.extend(self._raw_prebuffer[:take])
+            del self._raw_prebuffer[:take]
+        if len(out) < size:
+            tail = recv_exact(self.socket, size - len(out))
+            if tail is None or len(tail) != size - len(out):
+                return None
+            out.extend(tail)
+        return bytes(out)
+
     def recv(self, size: int) -> Optional[bytes]:
         """
         Receive data from WebSocket (unwrap from frames)
@@ -229,12 +271,14 @@ class WebSocketWrapper:
         try:
             while True:
                 # Read frame header
-                header = self._recv_exact(2)
+                header = self._recv_raw_exact(2)
                 if header is None:
                     return None
 
                 # Parse frame
                 byte1, byte2 = header[0], header[1]
+                if byte1 & 0x70:
+                    raise ProtocolError("WebSocket RSV bits set without negotiated extension")
 
                 # Check FIN bit
                 fin = (byte1 & 0x80) != 0
@@ -252,15 +296,17 @@ class WebSocketWrapper:
 
                 # Extended payload length
                 if payload_len == 126:
-                    ext_len = self._recv_exact(2)
+                    ext_len = self._recv_raw_exact(2)
                     if ext_len is None:
                         return None
                     payload_len = struct.unpack(">H", ext_len)[0]
                 elif payload_len == 127:
-                    ext_len = self._recv_exact(8)
+                    ext_len = self._recv_raw_exact(8)
                     if ext_len is None:
                         return None
                     payload_len = struct.unpack(">Q", ext_len)[0]
+                    if payload_len & (1 << 63):
+                        raise ProtocolError("Invalid 64-bit WebSocket payload length")
 
                 if payload_len > self.max_payload_bytes:
                     self.logger.warning(
@@ -282,12 +328,12 @@ class WebSocketWrapper:
                 # Read masking key
                 masking_key = None
                 if masked:
-                    masking_key = self._recv_exact(4)
+                    masking_key = self._recv_raw_exact(4)
                     if masking_key is None:
                         return None
 
                 # Read payload
-                payload = self._recv_exact(payload_len)
+                payload = self._recv_raw_exact(payload_len)
                 if payload is None:
                     return None
 
@@ -309,6 +355,11 @@ class WebSocketWrapper:
                     if self._fragment_opcode is None:
                         raise ProtocolError("Continuation frame without active fragment")
 
+                    if len(self._fragment_buffer) + len(payload) > self.max_message_bytes:
+                        raise ProtocolError(
+                            f"Fragmented WebSocket message exceeds limit: "
+                            f"{len(self._fragment_buffer) + len(payload)} > {self.max_message_bytes}"
+                        )
                     self._fragment_buffer.extend(payload)
                     if fin:
                         message = bytes(self._fragment_buffer)
@@ -333,6 +384,8 @@ class WebSocketWrapper:
                     return payload
 
                 # Start of fragmented message.
+                if len(payload) > self.max_message_bytes:
+                    raise ProtocolError("Fragmented WebSocket message exceeds limit")
                 self._fragment_opcode = opcode
                 self._fragment_buffer = bytearray(payload)
 
@@ -416,22 +469,6 @@ class WebSocketWrapper:
             unmasked.append(byte ^ masking_key[i % 4])
         return bytes(unmasked)
 
-    def _recv_exact(self, n: int) -> Optional[bytes]:
-        """Receive exactly n bytes"""
-        if n == 0:
-            return b''
-        buf = bytearray(n)
-        view = memoryview(buf)
-        total_received = 0
-        while total_received < n:
-            chunk = self.socket.recv(n - total_received)
-            if not chunk:
-                return None
-            chunk_len = len(chunk)
-            view[total_received:total_received + chunk_len] = chunk
-            total_received += chunk_len
-        return bytes(buf)
-
     def close(self):
         """Close WebSocket connection"""
         if self.handshake_complete:
@@ -460,6 +497,7 @@ class WebSocketVNCAdapter:
     def __init__(self, client_socket: socket.socket, do_handshake: bool = True,
                  max_handshake_bytes: int = WebSocketWrapper.DEFAULT_MAX_HANDSHAKE_BYTES,
                  max_payload_bytes: int = WebSocketWrapper.DEFAULT_MAX_PAYLOAD_BYTES,
+                 max_message_bytes: int = WebSocketWrapper.DEFAULT_MAX_MESSAGE_BYTES,
                  allowed_origins: Iterable[str] | None = None,
                  max_buffer_bytes: int = 16 * 1024 * 1024):
         """
@@ -473,6 +511,7 @@ class WebSocketVNCAdapter:
             client_socket,
             max_handshake_bytes=max_handshake_bytes,
             max_payload_bytes=max_payload_bytes,
+            max_message_bytes=max_message_bytes,
             allowed_origins=allowed_origins,
         )
         self.logger = logging.getLogger(__name__)
@@ -483,24 +522,27 @@ class WebSocketVNCAdapter:
             if not self.ws.do_handshake():
                 raise ConnectionError("WebSocket handshake failed")
 
-    def recv(self, size: int) -> bytes:
-        """Receive data (socket-compatible interface)"""
-        # Try to fill buffer
+    def _fill_recv_buffer(self, size: int) -> None:
         while len(self.recv_buffer) < size:
             data = self.ws.recv(size)
             if data is None:
                 break
-            if len(data) > 0:  # Skip empty frames (ping/pong)
-                if len(self.recv_buffer) + len(data) > self.max_buffer_bytes:
-                    raise ConnectionError(
-                        f"WebSocket receive buffer exceeded limit: "
-                        f"{len(self.recv_buffer) + len(data)} > {self.max_buffer_bytes}"
-                    )
-                self.recv_buffer.extend(data)
+            if not data:  # Ping/Pong control traffic.
+                continue
+            if len(self.recv_buffer) + len(data) > self.max_buffer_bytes:
+                raise ConnectionError(
+                    f"WebSocket receive buffer exceeded limit: "
+                    f"{len(self.recv_buffer) + len(data)} > {self.max_buffer_bytes}"
+                )
+            self.recv_buffer.extend(data)
 
-        # Return requested amount
+    def recv(self, size: int, flags: int = 0) -> bytes:
+        """Receive decoded VNC bytes with socket-compatible MSG_PEEK support."""
+        self._fill_recv_buffer(size)
         result = bytes(self.recv_buffer[:size])
-        self.recv_buffer = self.recv_buffer[size:]
+        if flags & socket.MSG_PEEK:
+            return result
+        del self.recv_buffer[:size]
         return result
 
     def send(self, data: bytes) -> int:
@@ -514,6 +556,16 @@ class WebSocketVNCAdapter:
     def close(self):
         """Close connection (socket-compatible interface)"""
         self.ws.close()
+
+    def shutdown(self, how=socket.SHUT_RDWR):
+        """Socket-compatible shutdown pass-through."""
+        try:
+            self.ws.socket.shutdown(how)
+        except OSError:
+            pass
+
+    def fileno(self) -> int:
+        return self.ws.socket.fileno()
 
     def setsockopt(self, level, optname, value):
         """Socket option setter (pass-through)"""

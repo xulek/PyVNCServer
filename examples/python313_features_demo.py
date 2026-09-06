@@ -29,10 +29,7 @@ from vnc_lib.exceptions import (
     VNCError, ProtocolError, AuthenticationError,
     ExceptionCollector, categorize_exceptions
 )
-from vnc_lib.types import (
-    Result, Ok, Err, PixelFormat,
-    is_valid_dimension, narrow_bytes
-)
+from vnc_lib.types import PixelFormat
 from vnc_lib.desktop_resize import (
     Screen, DesktopSizeHandler,
     create_single_screen_layout, create_dual_screen_layout
@@ -186,36 +183,19 @@ def demo_result_type():
     print("DEMO 4: Result Type for Error Handling")
     print("="*70)
 
-    def divide(a: float, b: float) -> Result[float, str]:
-        """Division with Result type"""
+    def divide(a: float, b: float):
+        """Division with explicit error return"""
         if b == 0:
-            return Err("Division by zero")
-        return Ok(a / b)
+            return None, "Division by zero"
+        return a / b, None
 
-    def validate_dimensions(width: int, height: int) -> Result[tuple[int, int], str]:
-        """Validate screen dimensions"""
-        if not is_valid_dimension(width, height):
-            return Err(f"Invalid dimensions: {width}x{height}")
-        return Ok((width, height))
-
-    print("  Division examples:")
+    print(" Division examples:")
     for a, b in [(10, 2), (5, 0), (100, 4)]:
-        result = divide(a, b)
-        if result.is_ok():
-            print(f"    {a} / {b} = {result.unwrap()}")
+        result, err = divide(a, b)
+        if err is None:
+            print(f" {a} / {b} = {result}")
         else:
-            print(f"    {a} / {b} = Error: {result.unwrap_err()}")
-
-    print("\n  Dimension validation:")
-    test_dims = [(1920, 1080), (-100, 200), (0, 0), (65536, 1000)]
-
-    for width, height in test_dims:
-        result = validate_dimensions(width, height)
-        if result.is_ok():
-            w, h = result.unwrap()
-            print(f"    ✓ {w}x{h} is valid")
-        else:
-            print(f"    ✗ {result.unwrap_err()}")
+            print(f" {a} / {b} = Error: {err}")
 
 
 def demo_desktop_resize():
@@ -284,31 +264,11 @@ def demo_type_narrowing():
         memoryview(b"Screen buffer"),
     ]
 
-    print("  Converting various byte-like types to bytes:")
+    print(" Converting various byte-like types to bytes:")
     for data in test_data:
         original_type = type(data).__name__
-        result = narrow_bytes(data)
-        print(f"    {original_type:12} -> bytes: {result[:20]!r}")
-
-    # Dimension validation
-    print("\n  Validating dimensions:")
-    test_sizes = [
-        (1920, 1080),
-        (800, 600),
-        (65536, 1000),
-        (-100, 200),
-    ]
-
-    for width, height in test_sizes:
-        try:
-            w = narrow_positive_int(width, "width")
-            h = narrow_positive_int(height, "height")
-            if is_valid_dimension(w, h):
-                print(f"    ✓ {w}x{h} is valid")
-            else:
-                print(f"    ✗ {w}x{h} exceeds maximum size")
-        except ValueError as e:
-            print(f"    ✗ {width}x{height}: {e}")
+        result = bytes(data)
+        print(f" {original_type:12} -> bytes: {result[:20]!r}")
 
 
 # Helper functions

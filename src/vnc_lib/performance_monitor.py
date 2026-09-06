@@ -15,7 +15,11 @@ import threading
 import sys
 import gc
 from dataclasses import dataclass, field
-from typing import Self, Any
+from typing import Any
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 from collections.abc import Callable
 from collections import deque
 from statistics import mean, median, stdev

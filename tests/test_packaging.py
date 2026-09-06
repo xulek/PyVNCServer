@@ -19,8 +19,10 @@ def test_packaged_exports_are_available():
 def test_default_toml_config_loads():
     config = load_config_file(DEFAULT_CONFIG_PATH)
 
-    assert config["host"] == "0.0.0.0"
+    assert config["host"] == "127.0.0.1"
     assert config["port"] == 5900
+    assert config["network_profile_override"] is None
+    assert config["allow_insecure_no_auth"] is False
     assert config["enable_tight_encoding"] is True
     assert config["encoding_threads"] is None
     assert config["log_file"] is None

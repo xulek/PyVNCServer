@@ -35,7 +35,19 @@ The WebSocket implementation enforces or bounds:
 
 ## noVNC frontend
 
-The repository contains browser client assets under `web/`. Serve the frontend with a normal static HTTP server or reverse proxy and point it at the PyVNCServer WebSocket endpoint.
+noVNC is tracked as the `web/noVNC` Git submodule. Clone recursively when you want the browser client assets:
+
+```bash
+git clone --recurse-submodules https://github.com/xulek/PyVNCServer.git
+```
+
+For an existing checkout:
+
+```bash
+git submodule update --init --recursive
+```
+
+Serve the noVNC frontend with a normal static HTTP server or reverse proxy and point it at the PyVNCServer WebSocket endpoint.
 
 A typical topology is:
 
@@ -65,7 +77,8 @@ Keep `max_message_bytes >= max_payload_bytes`; configuration validation rejects 
 If the TCP viewer works but noVNC does not:
 
 1. verify `enable_websocket = true`;
-2. inspect the browser console for Origin/Upgrade failures;
-3. ensure the Origin is explicitly allowlisted;
-4. confirm the frontend is using binary WebSocket RFB transport;
-5. if TLS terminates at a reverse proxy, verify the proxy forwards Upgrade/Connection headers.
+2. verify the `web/noVNC` submodule is initialized;
+3. inspect the browser console for Origin/Upgrade failures;
+4. ensure the Origin is explicitly allowlisted;
+5. confirm the frontend is using binary WebSocket RFB transport;
+6. if TLS terminates at a reverse proxy, verify the proxy forwards Upgrade/Connection headers.

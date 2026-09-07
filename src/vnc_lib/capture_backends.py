@@ -217,10 +217,14 @@ class DXCamCaptureBackend(BaseCaptureBackend):
         return True
 
     def healthcheck(self) -> bool:
-        try:
-            return self.is_available() and self._get_camera() is not None
-        except Exception:
-            return False
+        # Do not create a DXCamera during backend probing. DXCam keeps one
+        # singleton camera per (device, output, backend), while PyVNCServer's
+        # capture producer runs on a dedicated thread. Creating the camera here
+        # on the server thread makes the producer call dxcam.create() again and
+        # triggers an "instance already exists" warning before first capture.
+        # The first real grab initializes the camera on the capture thread; any
+        # initialization failure is handled by the normal backend failover path.
+        return self.is_available()
 
     def build_metadata(self, width: int, height: int) -> CaptureMetadata:
         try:

@@ -211,3 +211,16 @@ def test_dxcam_backend_keeps_move_destination_dirty_for_safe_fallback():
     assert metadata.move_rects == [move]
     assert metadata.supports_dirty_regions is True
     assert metadata.supports_move_rects is True
+
+
+def test_dxcam_healthcheck_does_not_create_camera():
+    class FakeOwner:
+        logger = logging.getLogger("test.dxgi.healthcheck")
+        _dxcam_available = True
+
+        def _get_dxcam_session(self):
+            raise AssertionError("healthcheck must not create a DXCamera")
+
+    backend = DXCamCaptureBackend(FakeOwner())
+
+    assert backend.healthcheck() is True

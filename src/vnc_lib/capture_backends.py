@@ -257,9 +257,22 @@ class DXCamCaptureBackend(BaseCaptureBackend):
                 supports_move_rects=True,
             )
 
+        # Conservative v3.3 safety rule: move destinations are included in the
+        # pixel-dirty list as well as exposed as CopyRect hints. This guarantees
+        # correctness for clients without CopyRect and for clients that skip
+        # producer generations. A later optimization may suppress the redundant
+        # pixel rectangle for clients that are exactly one generation behind
+        # and advertise CopyRect.
+        dirty_regions = list(hints.dirty_regions)
+        dirty_regions.extend(
+            (move.dst_x, move.dst_y, move.width, move.height)
+            for move in hints.move_rects
+        )
+        dirty_regions = list(dict.fromkeys(dirty_regions))
+
         return CaptureMetadata(
             backend_name="dxcam+dxgi-metadata",
-            dirty_regions=list(hints.dirty_regions),
+            dirty_regions=dirty_regions,
             move_rects=list(hints.move_rects),
             supports_dirty_regions=True,
             supports_move_rects=True,

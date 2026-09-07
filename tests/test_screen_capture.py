@@ -4,6 +4,7 @@ Tests for screen capture pixel conversion helpers.
 
 import logging
 import threading
+from types import SimpleNamespace
 
 from vnc_lib.capture_backends import CaptureFrame
 from vnc_lib.screen_capture import ScreenCapture, CaptureResult
@@ -289,3 +290,42 @@ def test_grab_screen_bgra_retries_after_backend_failover():
     assert data == b"abcd"
     assert (width, height) == (1, 1)
     assert cap.get_backend_name() == "mss"
+
+
+def test_multi_monitor_layout_normalizes_negative_virtual_origin():
+    cap = _capture_without_init()
+    cap.capture_all_monitors = True
+    cap._active_backend = "mss"
+    cap._thread_local.sct = SimpleNamespace(monitors=[
+        {"left": -1280, "top": 0, "width": 3200, "height": 1080},
+        {"left": -1280, "top": 0, "width": 1280, "height": 1024},
+        {"left": 0, "top": 0, "width": 1920, "height": 1080},
+    ])
+
+    layout = cap.get_monitor_layout(3200, 1080)
+
+    assert layout == [
+        {"id": 0, "x": 0, "y": 0, "width": 1280, "height": 1024, "flags": 0},
+        {"id": 1, "x": 1280, "y": 0, "width": 1920, "height": 1080, "flags": 0},
+    ]
+
+
+def test_auto_backend_prefers_mss_for_combined_multi_monitor_capture():
+    cap = _capture_without_init()
+    cap.capture_all_monitors = True
+    cap.backend_preference = "auto"
+    cap._dxcam_available = True
+
+    class _FakeMSSModule:
+        def mss(self):
+            return SimpleNamespace(monitors=[
+                {"left": 0, "top": 0, "width": 1920, "height": 1080}
+            ])
+
+    cap._mss_available = True
+    cap._mss = _FakeMSSModule()
+    cap._build_backend_registry()
+
+    cap._apply_backend_preference()
+
+    assert cap._active_backend == "mss"

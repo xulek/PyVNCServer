@@ -55,6 +55,10 @@ class TestEncoders(unittest.TestCase):
         self.assertEqual(encoding_name(-24), "JPEGQualityLevel8")
         self.assertEqual(encoding_name(-250), "CompressLevel6")
         self.assertEqual(encoding_name(-223), "DesktopSize")
+        self.assertEqual(encoding_name(-224), "LastRect")
+        self.assertEqual(encoding_name(-308), "ExtendedDesktopSize")
+        self.assertEqual(encoding_name(-312), "Fence")
+        self.assertEqual(encoding_name(-313), "ContinuousUpdates")
         self.assertEqual(encoding_name(123456), "Unknown(123456)")
 
     def test_format_encoding_list_human_readable(self):

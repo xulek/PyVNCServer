@@ -8,6 +8,8 @@ lan_frame_rate = 90
 network_profile_override = "auto"
 scale_factor = 1.0
 capture_backend = "auto"
+monitor_index = 0
+capture_all_monitors = false
 capture_probe_frames = 0
 capture_probe_warn_ms = 40.0
 max_connections = 10
@@ -44,6 +46,12 @@ enable_jpeg_encoding = true
 enable_h264_encoding = false
 enable_parallel_encoding = true
 enable_capture_producer = true
+enable_dxgi_metadata = true
+enable_continuous_updates = true
+enable_fence = true
+enable_last_rect = false
+enable_extended_desktop_size = true
+allow_client_resize = false
 tight_stream_reset_for_ultravnc = false
 
 [lan]

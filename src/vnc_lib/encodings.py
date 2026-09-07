@@ -34,7 +34,8 @@ _ENCODING_NAME_MAP: dict[int, str] = {
     -232: "PointerPos",
     -239: "Cursor",
     -308: "ExtendedDesktopSize",
-    -314: "ContinuousUpdates",
+    -312: "Fence",
+    -313: "ContinuousUpdates",
 }
 
 

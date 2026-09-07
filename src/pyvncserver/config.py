@@ -52,6 +52,8 @@ class ServerSettings:
     network_profile_override: str | None = None
     scale_factor: float = 1.0
     capture_backend: str = "auto"
+    monitor_index: int = 0
+    capture_all_monitors: bool = False
     max_connections: int = 10
     max_connections_per_ip: int = 4
     max_unauthenticated_connections: int = 4
@@ -101,7 +103,8 @@ class ServerSettings:
 
         known = {
             "host", "port", "frame_rate", "lan_frame_rate", "network_profile_override",
-            "scale_factor", "capture_backend", "max_connections",
+            "scale_factor", "capture_backend", "monitor_index", "capture_all_monitors",
+            "max_connections",
             "max_connections_per_ip", "max_unauthenticated_connections",
             "handshake_timeout", "client_socket_timeout",
             "input_control_policy", "password", "read_only_password", "allow_insecure_no_auth",
@@ -121,6 +124,8 @@ class ServerSettings:
             network_profile_override=network_override,
             scale_factor=float(data.get("scale_factor", 1.0)),
             capture_backend=str(data.get("capture_backend", "auto")).strip().lower() or "auto",
+            monitor_index=int(data.get("monitor_index", 0)),
+            capture_all_monitors=bool(data.get("capture_all_monitors", False)),
             max_connections=int(data.get("max_connections", 10)),
             max_connections_per_ip=int(data.get("max_connections_per_ip", 4)),
             max_unauthenticated_connections=int(data.get("max_unauthenticated_connections", 4)),
@@ -145,6 +150,8 @@ class ServerSettings:
             raise ConfigurationError("server.lan_frame_rate must be between 1 and 240")
         if self.scale_factor <= 0:
             raise ConfigurationError("server.scale_factor must be greater than 0")
+        if self.monitor_index < 0:
+            raise ConfigurationError("server.monitor_index must not be negative")
         if self.max_connections < 1:
             raise ConfigurationError("server.max_connections must be at least 1")
         if not 1 <= self.max_connections_per_ip <= self.max_connections:
@@ -235,6 +242,8 @@ class ServerSettings:
             "network_profile_override": self.network_profile_override,
             "scale_factor": self.scale_factor,
             "capture_backend": self.capture_backend,
+            "monitor_index": self.monitor_index,
+            "capture_all_monitors": self.capture_all_monitors,
             "max_connections": self.max_connections,
             "max_connections_per_ip": self.max_connections_per_ip,
             "max_unauthenticated_connections": self.max_unauthenticated_connections,

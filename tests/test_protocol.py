@@ -426,6 +426,59 @@ class TestMessageSending:
         assert len(mock_socket.data_sent) > 4
 
 
+class TestModernRFBExtensions:
+    def test_parse_enable_continuous_updates(self):
+        protocol = RFBProtocol()
+        sock = MockSocket(struct.pack(">BHHHH", 1, 10, 20, 640, 480))
+        request = protocol.parse_enable_continuous_updates(sock)
+        assert request.enabled is True
+        assert (request.x, request.y, request.width, request.height) == (10, 20, 640, 480)
+
+    def test_parse_client_fence(self):
+        protocol = RFBProtocol()
+        payload = b"abc"
+        sock = MockSocket(struct.pack(">3sIB", b"\x00\x00\x00", 0x80000001, len(payload)) + payload)
+        fence = protocol.parse_client_fence(sock)
+        assert fence.flags == 0x80000001
+        assert fence.payload == payload
+
+    def test_send_server_fence(self):
+        protocol = RFBProtocol()
+        sock = MockSocket()
+        protocol.send_server_fence(sock, protocol.FENCE_FLAG_REQUEST, b"x")
+        expected = struct.pack(">BxxxIB", 248, protocol.FENCE_FLAG_REQUEST, 1) + b"x"
+        assert bytes(sock.data_sent) == expected
+
+    def test_parse_set_desktop_size(self):
+        protocol = RFBProtocol()
+        screen = struct.pack(">IHHHHI", 7, 0, 0, 800, 600, 0x1234)
+        sock = MockSocket(struct.pack(">BHHBB", 0, 800, 600, 1, 0) + screen)
+        request = protocol.parse_set_desktop_size(sock)
+        assert (request.width, request.height) == (800, 600)
+        assert request.screens == ((7, 0, 0, 800, 600, 0x1234),)
+
+    def test_last_rect_framing_is_opt_in(self):
+        protocol = RFBProtocol()
+        sock = MockSocket()
+        assert protocol.configure_last_rect([0, protocol.ENCODING_LAST_RECT]) is True
+        protocol.send_framebuffer_update(sock, [(1, 2, 3, 4, 0, b"abcd")])
+
+        msg_type, count = struct.unpack(">BxH", bytes(sock.data_sent[:4]))
+        assert msg_type == 0
+        assert count == 0xFFFF
+
+        first = struct.unpack(">HHHHi", bytes(sock.data_sent[4:16]))
+        assert first == (1, 2, 3, 4, 0)
+        last = struct.unpack(">HHHHi", bytes(sock.data_sent[20:32]))
+        assert last == (0, 0, 0, 0, protocol.ENCODING_LAST_RECT)
+
+    def test_continuous_updates_signal_is_one_byte(self):
+        protocol = RFBProtocol()
+        sock = MockSocket()
+        protocol.send_end_of_continuous_updates(sock)
+        assert bytes(sock.data_sent) == b"\x96"
+
+
 class TestHelperMethods:
     """Test helper methods"""
 

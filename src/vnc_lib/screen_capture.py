@@ -43,7 +43,8 @@ class ScreenCapture:
     """
 
     def __init__(self, scale_factor: float = 1.0, monitor: int = 0,
-                 backend_preference: str = "auto"):
+                 backend_preference: str = "auto",
+                 capture_all_monitors: bool = False):
         """
         Initialize screen capture
 
@@ -52,7 +53,8 @@ class ScreenCapture:
             monitor: Monitor index for multi-monitor setups (0 = all monitors)
         """
         self.scale_factor = scale_factor
-        self.monitor = monitor
+        self.capture_all_monitors = bool(capture_all_monitors)
+        self.monitor = 0 if self.capture_all_monitors else max(0, int(monitor))
         self.backend_preference = str(backend_preference).strip().lower() or "auto"
         self.logger = logging.getLogger(__name__)
         self._capture_lock = threading.RLock()
@@ -232,7 +234,26 @@ class ScreenCapture:
             )
             self.backend_preference = "auto"
 
+        if (
+            bool(getattr(self, "capture_all_monitors", False))
+            and self.backend_preference == "auto"
+            and self._backend_registry["mss"].healthcheck()
+        ):
+            # DXCam currently exposes one output per camera. MSS monitor 0 is a
+            # virtual framebuffer spanning all displays, so prefer it when the
+            # user explicitly requests one combined multi-monitor desktop.
+            self._set_active_backend("mss")
+            self.logger.info(
+                "capture_all_monitors=true: using MSS virtual desktop capture"
+            )
+            return
+
         if self.backend_preference == "dxcam":
+            if bool(getattr(self, "capture_all_monitors", False)):
+                self.logger.warning(
+                    "capture_all_monitors=true with capture_backend='dxcam' "
+                    "captures one DXGI output; use auto or mss for a virtual desktop"
+                )
             if self._backend_registry["dxcam"].healthcheck():
                 self._set_active_backend("dxcam")
             else:
@@ -382,6 +403,70 @@ class ScreenCapture:
             except Exception:
                 pass
             self._thread_local.dxcam_camera = None
+
+    def get_monitor_layout(self, width: int, height: int) -> list[dict[str, int]]:
+        """Return the RFB screen layout corresponding to the captured framebuffer.
+
+        In combined multi-monitor mode MSS exposes monitor 0 as the virtual
+        desktop and monitors 1..N as physical displays. Physical coordinates
+        can be negative on Windows, so they are normalized to the virtual
+        framebuffer origin before being sent through ExtendedDesktopSize.
+        """
+        width = max(0, int(width))
+        height = max(0, int(height))
+        if (
+            self.capture_all_monitors
+            and self._active_backend == "mss"
+            and width > 0
+            and height > 0
+        ):
+            try:
+                sct = getattr(self._thread_local, "sct", None)
+                if sct is None:
+                    sct = self._get_mss_session()
+                monitors = list(getattr(sct, "monitors", ()) or ())
+                if len(monitors) > 1:
+                    virtual = monitors[0]
+                    left = int(virtual["left"])
+                    top = int(virtual["top"])
+                    layout: list[dict[str, int]] = []
+                    for index, monitor in enumerate(monitors[1:]):
+                        x = int(monitor["left"]) - left
+                        y = int(monitor["top"]) - top
+                        mw = int(monitor["width"])
+                        mh = int(monitor["height"])
+                        if mw <= 0 or mh <= 0:
+                            continue
+                        if x < 0 or y < 0 or x + mw > width or y + mh > height:
+                            self.logger.debug(
+                                "Ignoring monitor outside captured virtual desktop: "
+                                "id=%d x=%d y=%d w=%d h=%d framebuffer=%dx%d",
+                                index, x, y, mw, mh, width, height,
+                            )
+                            continue
+                        layout.append({
+                            "id": index,
+                            "x": x,
+                            "y": y,
+                            "width": mw,
+                            "height": mh,
+                            "flags": 0,
+                        })
+                    if layout:
+                        return layout
+            except Exception as exc:
+                self.logger.debug("Unable to enumerate MSS monitor layout: %s", exc)
+
+        if width <= 0 or height <= 0:
+            return []
+        return [{
+            "id": 0,
+            "x": 0,
+            "y": 0,
+            "width": width,
+            "height": height,
+            "flags": 0,
+        }]
 
     def benchmark_capture(self, pixel_format: dict, iterations: int = 10,
                           warmup: int = 2) -> dict[str, float | int | str]:

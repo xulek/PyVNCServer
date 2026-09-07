@@ -8,11 +8,11 @@ RFB 3.8 · UltraVNC interoperability · Tight / ZRLE / Hextile / Zlib · WebSock
 
 <p>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-3.2.1-6f42c1">
+  <img alt="Version" src="https://img.shields.io/badge/version-3.4.0-6f42c1">
   <img alt="RFB" src="https://img.shields.io/badge/RFB-3.8-1f6feb">
   <img alt="UltraVNC" src="https://img.shields.io/badge/UltraVNC-tested-2ea44f">
   <img alt="WebSocket" src="https://img.shields.io/badge/WebSocket-noVNC-ff9800">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-326%20passed-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-350%20passed-2ea44f">
   <a href="https://xulek.github.io/PyVNCServer/"><img alt="Documentation" src="https://img.shields.io/badge/docs-GitHub%20Pages-0ea5e9?logo=materialformkdocs&logoColor=white"></a>
 </p>
 
@@ -36,9 +36,10 @@ Highlights:
 - Optional **JPEG** and **H.264** extension paths.
 - **Adaptive encoding selection** based on client capabilities, changed regions and network profile.
 - One **shared capture producer** for multiple clients instead of independently capturing the desktop per connection.
-- Windows-oriented fast capture through **DXCam/DXGI** when available, with **MSS** and **Pillow** fallbacks.
+- Windows-oriented fast capture through **DXCam/DXGI** when available, with native dirty/move metadata and **MSS** / **Pillow** fallbacks.
 - **WebSocket transport** suitable for binary noVNC connections.
-- **DesktopSize** handling for framebuffer resize-capable clients.
+- Modern RFB extensions: **ContinuousUpdates**, **Fence**, **LastRect** and **ExtendedDesktopSize**.
+- Basic **multi-monitor virtual-desktop capture** through MSS with ExtendedDesktopSize screen reporting.
 - Keyboard, pointer and clipboard handling.
 - Read-only authentication mode.
 - Per-IP connection and authentication throttling.
@@ -54,7 +55,7 @@ For the complete guides, configuration reference, architecture and troubleshooti
 
 | Client / transport | Status | Notes |
 | --- | --- | --- |
-| **UltraVNC Viewer** | ✅ Tested | Tight, RRE, Hextile, Zlib, ZRLE and Raw negotiation paths tested during 3.2.1 work |
+| **UltraVNC Viewer** | ✅ Regression-covered | Tight/RRE fixes retained; Raw/RRE/Hextile/Zlib/ZRLE/Tight switching is covered by end-to-end tests |
 | **Standard RFB 3.8 clients** | ✅ Supported | Client must advertise at least one encoding implemented by the server |
 | **noVNC / browser clients** | ✅ Supported transport | noVNC is tracked as `web/noVNC`; enable WebSocket and configure an Origin allowlist |
 | **Raw TCP VNC** | ✅ Supported | Default transport |
@@ -149,7 +150,7 @@ For a local test:
 3. Connect to `127.0.0.1:5900`.
 4. Start with `Auto`, `Tight`, `ZRLE` or `Hextile` as the preferred encoding.
 
-PyVNCServer 3.2.1 contains specific UltraVNC interoperability fixes:
+PyVNCServer includes specific UltraVNC interoperability fixes:
 
 - RRE never emits Raw pixel bytes behind an RRE rectangle header.
 - Large RRE regions are tiled to keep the encoder bounded and allow safe fallback.
@@ -203,6 +204,24 @@ More details: [noVNC & WebSocket documentation](https://xulek.github.io/PyVNCSer
 
 ---
 
+## Modern RFB extensions (v3.4)
+
+PyVNCServer 3.4 adds protocol support aimed especially at modern viewers and noVNC:
+
+| Extension | ID / message | Status |
+| --- | ---: | --- |
+| ContinuousUpdates | `-313` / client `150` | ✅ Push-style framebuffer updates |
+| Fence | `-312` / `248` | ✅ Negotiation probe + request/response |
+| LastRect | `-224` | ✅ Implemented, opt-in by default |
+| ExtendedDesktopSize | `-308` | ✅ Layout reporting and resize status |
+| SetDesktopSize | client `251` | ✅ Parsed; host resize rejected safely by default |
+
+ContinuousUpdates runs inside the existing per-client session thread, so Tight/Zlib encoder state remains ordered. ExtendedDesktopSize now uses the correct **16-byte SCREEN record** and immediately advertises the current screen layout when negotiated.
+
+For details see `docs/MODERN_RFB.md` and `V3_4_RELEASE_NOTES.md`.
+
+---
+
 ## Encoding support
 
 | Encoding | ID | Implementation | Typical use |
@@ -242,7 +261,26 @@ python -m pip install -e ".[performance]"
 The server-wide `CaptureProducer` captures once and publishes generations of the framebuffer to client sessions. This avoids scaling capture work linearly with the number of connected clients.
 
 > [!IMPORTANT]
-> The current DXCam integration does not yet harvest native DXGI dirty/move rectangles. Region detection is performed above the capture backend when native metadata is unavailable.
+> On Windows with DXCam 0.3.0+, PyVNCServer can harvest native DXGI dirty/move rectangles. If metadata cannot be read safely, it falls back to the software change detector instead of assuming that the screen did not change.
+
+---
+
+## Multi-monitor mode (v3.4)
+
+Combined desktop capture is available through MSS:
+
+```toml
+[server]
+capture_backend = "auto"
+capture_all_monitors = true
+monitor_index = 0
+```
+
+When enabled with `capture_backend = "auto"`, PyVNCServer prefers MSS monitor `0`, which represents the virtual desktop spanning all displays. Physical monitor coordinates are normalized to the RFB framebuffer origin and reported through ExtendedDesktopSize.
+
+DXCam still captures one DXGI output per camera; use MSS/auto for a combined multi-monitor framebuffer.
+
+See `docs/MULTI_MONITOR.md`.
 
 ---
 
@@ -328,6 +366,8 @@ lan_frame_rate = 90
 network_profile_override = "auto"
 scale_factor = 1.0
 capture_backend = "auto"
+monitor_index = 0
+capture_all_monitors = false
 max_connections = 10
 input_control_policy = "single-controller"
 
@@ -344,6 +384,12 @@ enable_jpeg_encoding = true
 enable_h264_encoding = false
 enable_parallel_encoding = true
 enable_capture_producer = true
+enable_dxgi_metadata = true
+enable_continuous_updates = true
+enable_fence = true
+enable_last_rect = false
+enable_extended_desktop_size = true
+allow_client_resize = false
 
 [limits]
 encoding_threads = 0
@@ -441,10 +487,10 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-Current 3.2.1 verification result:
+Current 3.4.0 verification result:
 
 ```text
-326 passed, 12 skipped
+350 passed, 13 skipped
 ```
 
 The skipped cases in the recorded verification environment are legacy/auth compatibility cases and do not affect Tight/RRE tests.
@@ -472,23 +518,17 @@ python -m compileall -q src tests
 
 ---
 
-## Benchmarks
+## Verification
 
-Encoder microbenchmark:
-
-```bash
-PYTHONPATH=src python benchmarks/benchmark_encoders.py
-```
-
-Capture-oriented benchmarks:
+Run the full suite:
 
 ```bash
-PYTHONPATH=src python benchmarks/benchmark_screen_capture.py
-PYTHONPATH=src python benchmarks/benchmark_screen_capture_methods.py
-PYTHONPATH=src python benchmarks/benchmark_lan_latency.py
+python -m pip install -e ".[dev]"
+python -m pytest -q
+python -m compileall -q src tests
 ```
 
-Capture benchmarks depend on the host desktop environment and should be interpreted on the machine where the server will actually run.
+The v3.4 package includes end-to-end TCP tests for ContinuousUpdates/Fence and ExtendedDesktopSize in addition to the existing encoding and DXGI regressions.
 
 ---
 
@@ -549,7 +589,10 @@ python -m twine check dist/*
 
 ## Known limitations / roadmap
 
-- Native DXGI dirty/move rectangle harvesting is not implemented yet.
+- DXCam currently captures one DXGI output per camera; combined multi-monitor capture uses MSS virtual-desktop mode.
+- `allow_client_resize` does not change the host display mode; v3.4 only accepts layout-only changes matching the current framebuffer size.
+- Fence `SyncNext` is parsed but not implemented as a deferred barrier.
+- LastRect is implemented but disabled by default for conservative compatibility.
 - H.264 is an optional extension path and requires compatible client-side support.
 - Classic VNC authentication is legacy authentication, not encrypted transport.
 - Browser use requires a separately served noVNC frontend/static HTTP endpoint.
@@ -559,6 +602,6 @@ python -m twine check dist/*
 
 <div align="center">
 
-**PyVNCServer 3.2.1** · Python 3.11+ · RFB 3.8 · [Documentation](https://xulek.github.io/PyVNCServer/)
+**PyVNCServer 3.4.0** · Python 3.11+ · RFB 3.8 · [Documentation](https://xulek.github.io/PyVNCServer/)
 
 </div>

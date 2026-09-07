@@ -30,6 +30,28 @@ class TightCapability:
     name_signature: bytes
 
 
+@dataclass(slots=True, frozen=True)
+class FenceMessage:
+    flags: int
+    payload: bytes
+
+
+@dataclass(slots=True, frozen=True)
+class ContinuousUpdatesRequest:
+    enabled: bool
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+@dataclass(slots=True, frozen=True)
+class SetDesktopSizeRequest:
+    width: int
+    height: int
+    screens: tuple[tuple[int, int, int, int, int, int], ...]
+
+
 class RFBProtocol:
     """Handles RFB protocol operations according to RFC 6143"""
 
@@ -61,6 +83,10 @@ class RFBProtocol:
     ENCODING_CURSOR = -239
     ENCODING_POINTER_POS = -232
     ENCODING_DESKTOP_SIZE = -223
+    ENCODING_LAST_RECT = -224
+    ENCODING_EXTENDED_DESKTOP_SIZE = -308
+    ENCODING_FENCE = -312
+    ENCODING_CONTINUOUS_UPDATES = -313
     ENCODING_JPEG_QUALITY_LOW = -23   # JPEG quality level 0-9 (pseudo-encoding base -23 to -32)
     ENCODING_JPEG_QUALITY_HIGH = -32
 
@@ -71,12 +97,31 @@ class RFBProtocol:
     MSG_KEY_EVENT = 4
     MSG_POINTER_EVENT = 5
     MSG_CLIENT_CUT_TEXT = 6
+    MSG_ENABLE_CONTINUOUS_UPDATES = 150
+    MSG_CLIENT_FENCE = 248
+    MSG_SET_DESKTOP_SIZE = 251
 
     # Message types - Server to Client (RFC 6143 Section 7.6)
     MSG_FRAMEBUFFER_UPDATE = 0
     MSG_SET_COLOR_MAP_ENTRIES = 1
     MSG_BELL = 2
     MSG_SERVER_CUT_TEXT = 3
+    MSG_END_OF_CONTINUOUS_UPDATES = 150
+    MSG_SERVER_FENCE = 248
+
+    # Fence extension flags.
+    FENCE_FLAG_BLOCK_BEFORE = 1 << 0
+    FENCE_FLAG_BLOCK_AFTER = 1 << 1
+    FENCE_FLAG_SYNC_NEXT = 1 << 2
+    FENCE_FLAG_REQUEST = 1 << 31
+    FENCE_SUPPORTED_FLAGS = (
+        FENCE_FLAG_BLOCK_BEFORE
+        | FENCE_FLAG_BLOCK_AFTER
+        | FENCE_FLAG_SYNC_NEXT
+        | FENCE_FLAG_REQUEST
+    )
+    MAX_FENCE_PAYLOAD = 64
+    MAX_DESKTOP_SCREENS = 255
 
     DEFAULT_MAX_SET_ENCODINGS = 1024
     DEFAULT_MAX_CLIENT_CUT_TEXT = 16 * 1024 * 1024  # 16 MiB
@@ -95,6 +140,7 @@ class RFBProtocol:
             if max_client_cut_text is not None
             else self.DEFAULT_MAX_CLIENT_CUT_TEXT
         )
+        self.use_last_rect = False
 
     def negotiate_version(self, client_socket) -> Tuple[int, int]:
         """
@@ -423,6 +469,101 @@ class RFBProtocol:
             'height': height
         }
 
+    def parse_enable_continuous_updates(self, client_socket) -> ContinuousUpdatesRequest:
+        """Parse the ContinuousUpdates extension client message (type 150)."""
+        data = recv_exact(client_socket, 9)
+        if not data:
+            raise ConnectionError("Failed to receive EnableContinuousUpdates")
+
+        enable, x, y, width, height = struct.unpack(">BHHHH", data)
+        if enable not in (0, 1):
+            raise ProtocolError(f"Invalid ContinuousUpdates enable flag: {enable}")
+        if width == 0 or height == 0:
+            raise ProtocolError(
+                f"Invalid ContinuousUpdates region: {x},{y} {width}x{height}"
+            )
+
+        return ContinuousUpdatesRequest(
+            enabled=bool(enable),
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+        )
+
+    def parse_client_fence(self, client_socket) -> FenceMessage:
+        """Parse a ClientFence extension message (type 248)."""
+        header = recv_exact(client_socket, 8)
+        if not header:
+            raise ConnectionError("Failed to receive ClientFence header")
+        padding, flags, length = struct.unpack(">3sIB", header)
+        if padding != b"\x00\x00\x00":
+            self.logger.debug("ClientFence contained non-zero padding")
+        if length > self.MAX_FENCE_PAYLOAD:
+            raise ProtocolError(
+                f"Fence payload too large: {length} > {self.MAX_FENCE_PAYLOAD}"
+            )
+        payload = recv_exact(client_socket, length) if length else b""
+        if length and not payload:
+            raise ConnectionError("Failed to receive ClientFence payload")
+        return FenceMessage(flags=flags, payload=payload)
+
+    def parse_set_desktop_size(self, client_socket) -> SetDesktopSizeRequest:
+        """Parse the SetDesktopSize extension client message (type 251)."""
+        header = recv_exact(client_socket, 7)
+        if not header:
+            raise ConnectionError("Failed to receive SetDesktopSize header")
+
+        _padding, width, height, screen_count, _padding2 = struct.unpack(
+            ">BHHBB", header
+        )
+        if width == 0 or height == 0:
+            raise ProtocolError(f"Invalid desktop size request: {width}x{height}")
+        if screen_count == 0 or screen_count > self.MAX_DESKTOP_SCREENS:
+            raise ProtocolError(f"Invalid desktop screen count: {screen_count}")
+
+        raw = recv_exact(client_socket, screen_count * 16)
+        if not raw:
+            raise ConnectionError("Failed to receive SetDesktopSize screen layout")
+
+        screens = []
+        for offset in range(0, len(raw), 16):
+            screens.append(struct.unpack(">IHHHHI", raw[offset:offset + 16]))
+
+        return SetDesktopSizeRequest(
+            width=width,
+            height=height,
+            screens=tuple(screens),
+        )
+
+    def send_end_of_continuous_updates(self, client_socket) -> None:
+        """Advertise or terminate ContinuousUpdates support."""
+        client_socket.sendall(struct.pack("B", self.MSG_END_OF_CONTINUOUS_UPDATES))
+
+    def send_server_fence(self, client_socket, flags: int, payload: bytes = b"") -> None:
+        """Send a ServerFence extension message (type 248)."""
+        payload = bytes(payload)
+        if len(payload) > self.MAX_FENCE_PAYLOAD:
+            raise ValueError(
+                f"Fence payload too large: {len(payload)} > {self.MAX_FENCE_PAYLOAD}"
+            )
+        flags &= 0xFFFFFFFF
+        msg = struct.pack(">BxxxIB", self.MSG_SERVER_FENCE, flags, len(payload)) + payload
+        client_socket.sendall(msg)
+
+    def send_fence_probe(self, client_socket, payload: bytes = b"PyVNCServer") -> None:
+        """Send a lightweight fence request so clients can confirm support."""
+        self.send_server_fence(
+            client_socket,
+            self.FENCE_FLAG_REQUEST | self.FENCE_FLAG_BLOCK_BEFORE,
+            payload[: self.MAX_FENCE_PAYLOAD],
+        )
+
+    def configure_last_rect(self, encodings: Iterable[int]) -> bool:
+        """Enable LastRect framing only when the client explicitly advertised it."""
+        self.use_last_rect = self.ENCODING_LAST_RECT in set(encodings)
+        return self.use_last_rect
+
     def parse_key_event(self, client_socket) -> Dict:
         """Parse KeyEvent message (RFC 6143 Section 7.5.4)"""
         data = recv_exact(client_socket, 7)
@@ -475,30 +616,52 @@ class RFBProtocol:
 
     def send_framebuffer_update(self, client_socket, rectangles: list):
         """
-        Send FramebufferUpdate message (RFC 6143 Section 7.6.1)
+        Send FramebufferUpdate message.
 
-        rectangles: list of (x, y, width, height, encoding, data) tuples
+        When the client negotiated LastRect, the server uses the extension's
+        0xffff rectangle-count sentinel and appends a LastRect pseudo-rectangle.
+        This keeps framing valid even when future streaming paths build a
+        variable number of rectangles.
         """
-        # Message type + padding + number of rectangles
-        header = struct.pack(">BxH", self.MSG_FRAMEBUFFER_UPDATE, len(rectangles))
+        wire_rectangles = list(rectangles)
+        if self.use_last_rect:
+            rectangle_count = 0xFFFF
+            wire_rectangles.append(
+                (0, 0, 0, 0, self.ENCODING_LAST_RECT, b"")
+            )
+        else:
+            if len(wire_rectangles) > 0xFFFF:
+                raise ProtocolError(
+                    f"Too many framebuffer rectangles: {len(wire_rectangles)}"
+                )
+            rectangle_count = len(wire_rectangles)
 
-        # Calculate total size to decide whether to batch into single sendall
-        total_data_size = sum(len(data) for _, _, _, _, _, data in rectangles if data)
-        total_size = len(header) + len(rectangles) * 12 + total_data_size  # 12 = rect header size
+        header = struct.pack(">BxH", self.MSG_FRAMEBUFFER_UPDATE, rectangle_count)
 
-        if total_size <= 1_048_576:  # Under 1MB: batch into single send
+        total_data_size = sum(
+            len(data) for _, _, _, _, _, data in wire_rectangles if data
+        )
+        total_size = (
+            len(header)
+            + len(wire_rectangles) * 12
+            + total_data_size
+        )
+
+        if total_size <= 1_048_576:
             parts = [header]
-            for x, y, width, height, encoding, data in rectangles:
+            for x, y, width, height, encoding, data in wire_rectangles:
                 parts.append(struct.pack(">HHHHi", x, y, width, height, encoding))
                 if data:
-                    parts.append(data if isinstance(data, (bytes, bytearray)) else bytes(data))
+                    parts.append(
+                        data if isinstance(data, (bytes, bytearray)) else bytes(data)
+                    )
             client_socket.sendall(b"".join(parts))
         else:
-            # Large update: send header then stream rectangle data
             client_socket.sendall(header)
-            for x, y, width, height, encoding, data in rectangles:
-                rect_header = struct.pack(">HHHHi", x, y, width, height, encoding)
-                client_socket.sendall(rect_header)
+            for x, y, width, height, encoding, data in wire_rectangles:
+                client_socket.sendall(
+                    struct.pack(">HHHHi", x, y, width, height, encoding)
+                )
                 if data:
                     self._send_large_data(client_socket, data)
 

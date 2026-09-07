@@ -112,8 +112,9 @@ class TestDesktopResize:
         screen = Screen(id=1, x=100, y=200, width=800, height=600, flags=0)
 
         data = screen.to_bytes()
-        # Format: >IIHHHI = 4+4+2+2+2+4 = 18 bytes
-        assert len(data) == 18
+        # RFB ExtendedDesktopSize screen record is exactly 16 bytes:
+        # id(4), x(2), y(2), width(2), height(2), flags(4).
+        assert len(data) == 16
 
         screen2 = Screen.from_bytes(data)
         assert screen2.id == screen.id
@@ -188,9 +189,10 @@ class TestDesktopResize:
         """Test multi-screen configuration"""
         handler = DesktopSizeHandler()
         handler.supports_extended = True
-        handler.initialize(1920, 1080)
+        handler.initialize(3840, 1080)
 
-        # Add second screen
+        # Add second screen inside the declared virtual desktop.
+        handler.screens = [Screen(id=0, x=0, y=0, width=1920, height=1080)]
         screen2 = Screen(id=1, x=1920, y=0, width=1920, height=1080)
         success = handler.add_screen(screen2)
 

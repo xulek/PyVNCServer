@@ -86,6 +86,8 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         self.network_profile_override = self.settings.network_profile_override
         self.scale_factor = self.settings.scale_factor
         self.capture_backend = self.settings.capture_backend
+        self.monitor_index = self.settings.monitor_index
+        self.capture_all_monitors = self.settings.capture_all_monitors
         self.capture_probe_frames = max(0, int(self.config.get('capture_probe_frames', 0)))
         self.capture_probe_warn_ms = max(
             1.0, float(self.config.get('capture_probe_warn_ms', 40.0))
@@ -127,6 +129,18 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         self.enable_request_coalescing = self.config.get('enable_request_coalescing', True)
         self.enable_copyrect_encoding = self.config.get('enable_copyrect_encoding', True)
         self.enable_zrle_encoding = self.config.get('enable_zrle_encoding', True)
+        self.enable_dxgi_metadata = bool(
+            self.config.get('enable_dxgi_metadata', True)
+        )
+        self.enable_continuous_updates = bool(
+            self.config.get('enable_continuous_updates', True)
+        )
+        self.enable_fence = bool(self.config.get('enable_fence', True))
+        self.enable_last_rect = bool(self.config.get('enable_last_rect', False))
+        self.enable_extended_desktop_size = bool(
+            self.config.get('enable_extended_desktop_size', True)
+        )
+        self.allow_client_resize = bool(self.config.get('allow_client_resize', False))
         self.tight_stream_reset_for_ultravnc = bool(
             self.config.get('tight_stream_reset_for_ultravnc', False)
         )
@@ -235,10 +249,29 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
 
         # Shared OS-facing services. Capture is internally locked to avoid
         # racing its backend state across client threads.
-        self.screen_capture = ScreenCapture(
-            scale_factor=self.scale_factor,
-            backend_preference=self.capture_backend,
-        )
+        try:
+            self.screen_capture = ScreenCapture(
+                scale_factor=self.scale_factor,
+                monitor=self.monitor_index,
+                backend_preference=self.capture_backend,
+                capture_all_monitors=self.capture_all_monitors,
+            )
+        except TypeError:
+            # Preserve compatibility with embedders/tests providing a custom
+            # ScreenCapture implementation with the pre-3.4 constructor.
+            self.screen_capture = ScreenCapture(
+                scale_factor=self.scale_factor,
+                monitor=self.monitor_index,
+                backend_preference=self.capture_backend,
+            )
+            try:
+                self.screen_capture.capture_all_monitors = self.capture_all_monitors
+            except Exception:
+                pass
+        try:
+            self.screen_capture.enable_dxgi_metadata = self.enable_dxgi_metadata
+        except Exception:
+            pass
         self.input_handler = InputHandler(scale_factor=self.scale_factor)
 
         # Server components

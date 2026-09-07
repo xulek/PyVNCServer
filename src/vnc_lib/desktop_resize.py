@@ -1,26 +1,25 @@
-"""
-Desktop Resize Support - ExtendedDesktopSize Pseudo-encoding
-RFC 6143 Extension for dynamic screen size changes
-Python 3.13 compatible
-"""
+"""DesktopSize and ExtendedDesktopSize helpers for modern RFB clients."""
 
-import struct
-import logging
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Protocol, TypeAlias
+import logging
+import struct
+from typing import Iterable, TypeAlias
 
 
-# Type aliases (Python 3.12+ would use 'type' statement)
 ScreenID: TypeAlias = int
 ResizeReason: TypeAlias = int
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class Screen:
+    """One screen in an ExtendedDesktopSize layout.
+
+    RFB encodes every screen in exactly 16 bytes:
+    id(4), x(2), y(2), width(2), height(2), flags(4).
     """
-    Represents a single screen in multi-monitor setup
-    Python 3.13 dataclass
-    """
+
     id: ScreenID
     x: int
     y: int
@@ -28,333 +27,297 @@ class Screen:
     height: int
     flags: int = 0
 
+    WIRE_SIZE = 16
+
+    def validate(self) -> None:
+        if not 0 <= self.id <= 0xFFFFFFFF:
+            raise ValueError(f"Invalid screen id: {self.id}")
+        for name, value in (
+            ("x", self.x),
+            ("y", self.y),
+            ("width", self.width),
+            ("height", self.height),
+        ):
+            if not 0 <= int(value) <= 0xFFFF:
+                raise ValueError(f"Screen {name} out of range: {value}")
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(
+                f"Screen dimensions must be positive: {self.width}x{self.height}"
+            )
+        if self.x + self.width > 0x10000 or self.y + self.height > 0x10000:
+            raise ValueError("Screen extends beyond RFB 16-bit coordinate space")
+        if not 0 <= self.flags <= 0xFFFFFFFF:
+            raise ValueError(f"Invalid screen flags: {self.flags}")
+
     def to_bytes(self) -> bytes:
-        """Encode screen data for transmission"""
-        return struct.pack(">IIHHHI",
-                          self.id,
-                          self.x,
-                          self.y,
-                          self.width,
-                          self.height,
-                          self.flags)
+        self.validate()
+        return struct.pack(
+            ">IHHHHI",
+            self.id,
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            self.flags,
+        )
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'Screen':
-        """Decode screen data from bytes"""
-        if len(data) < 18:
+    def from_bytes(cls, data: bytes) -> "Screen":
+        if len(data) < cls.WIRE_SIZE:
             raise ValueError(f"Invalid screen data length: {len(data)}")
-
-        screen_id, x, y, width, height, flags = struct.unpack(">IIHHHI", data[:18])
-        return cls(
-            id=screen_id,
-            x=x,
-            y=y,
-            width=width,
-            height=height,
-            flags=flags
-        )
+        screen = cls(*struct.unpack(">IHHHHI", data[: cls.WIRE_SIZE]))
+        screen.validate()
+        return screen
 
 
 class DesktopSizeHandler:
-    """
-    Handles desktop size changes and ExtendedDesktopSize encoding
-    Python 3.13 compatible with pattern matching
-    """
+    """Track and encode the server desktop layout."""
 
-    # Pseudo-encoding types
-    ENCODING_DESKTOP_SIZE = -223  # Legacy
-    ENCODING_EXTENDED_DESKTOP_SIZE = -308  # Extended (preferred)
+    ENCODING_DESKTOP_SIZE = -223
+    ENCODING_EXTENDED_DESKTOP_SIZE = -308
 
-    # Resize status codes
     STATUS_NO_ERROR = 0
-    STATUS_OUT_OF_RESOURCES = 1
-    STATUS_INVALID_SCREEN_LAYOUT = 2
+    STATUS_ADMINISTRATIVELY_PROHIBITED = 1
+    STATUS_OUT_OF_RESOURCES = 2
+    STATUS_INVALID_SCREEN_LAYOUT = 3
 
-    # Resize reasons
-    REASON_SERVER = 0  # Server-initiated resize
-    REASON_CLIENT = 1  # Client-requested resize
-    REASON_OTHER = 2   # Other reason
+    REASON_SERVER = 0
+    REASON_CLIENT = 1
+    REASON_OTHER = 2
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.logger = logging.getLogger(__name__)
-        self.current_width: int = 0
-        self.current_height: int = 0
+        self.current_width = 0
+        self.current_height = 0
         self.screens: list[Screen] = []
-        self.supports_extended: bool = False
+        self.supports_extended = False
 
-    def initialize(self, width: int, height: int):
-        """Initialize with screen dimensions"""
-        self.current_width = width
-        self.current_height = height
-        self.screens = [Screen(id=0, x=0, y=0, width=width, height=height)]
-        self.logger.info(f"Desktop size initialized: {width}x{height}")
+    def initialize(
+        self,
+        width: int,
+        height: int,
+        screens: Iterable[Screen] | None = None,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid desktop dimensions: {width}x{height}")
+        self.current_width = int(width)
+        self.current_height = int(height)
+        self.screens = list(screens or create_single_screen_layout(width, height))
+        valid, message = self.validate_layout()
+        if not valid:
+            raise ValueError(message)
 
-    def resize(self, new_width: int, new_height: int,
-               reason: ResizeReason = REASON_SERVER) -> bool:
-        """
-        Resize desktop
+    def set_layout(
+        self,
+        width: int,
+        height: int,
+        screens: Iterable[Screen],
+    ) -> None:
+        old = (self.current_width, self.current_height, list(self.screens))
+        self.current_width = int(width)
+        self.current_height = int(height)
+        self.screens = list(screens)
+        valid, message = self.validate_layout()
+        if not valid:
+            self.current_width, self.current_height, self.screens = old
+            raise ValueError(message)
 
-        Args:
-            new_width: New width
-            new_height: New height
-            reason: Resize reason code
-
-        Returns:
-            True if resize successful
-        """
+    def resize(
+        self,
+        new_width: int,
+        new_height: int,
+        reason: ResizeReason = REASON_SERVER,
+    ) -> bool:
         if new_width <= 0 or new_height <= 0:
-            self.logger.error(f"Invalid dimensions: {new_width}x{new_height}")
             return False
-
-        old_size = (self.current_width, self.current_height)
-        self.current_width = new_width
-        self.current_height = new_height
-
-        # Update primary screen
-        self.screens[0] = Screen(
-            id=0,
-            x=0,
-            y=0,
-            width=new_width,
-            height=new_height
+        self.current_width = int(new_width)
+        self.current_height = int(new_height)
+        if len(self.screens) <= 1:
+            self.screens = create_single_screen_layout(new_width, new_height)
+        self.logger.info(
+            "Desktop resized to %dx%d, reason=%d",
+            new_width,
+            new_height,
+            reason,
         )
-
-        self.logger.info(f"Desktop resized: {old_size} -> ({new_width}x{new_height}), reason={reason}")
         return True
 
-    def encode_desktop_size_update(self, reason: ResizeReason = REASON_SERVER) -> tuple[int, bytes]:
-        """
-        Encode desktop size update for transmission
+    def encode_extended_payload(self) -> bytes:
+        if not self.screens:
+            raise ValueError("Cannot encode an empty screen layout")
+        if len(self.screens) > 255:
+            raise ValueError("ExtendedDesktopSize supports at most 255 screens")
+        valid, message = self.validate_layout()
+        if not valid:
+            raise ValueError(message)
 
-        Returns:
-            (encoding_type, encoded_data) tuple
+        return (
+            struct.pack(">Bxxx", len(self.screens))
+            + b"".join(screen.to_bytes() for screen in self.screens)
+        )
 
-        For ExtendedDesktopSize:
-            - number-of-screens (1 byte)
-            - padding (3 bytes)
-            - screen array (16 bytes per screen)
-        """
+    def encode_desktop_size_update(
+        self, reason: ResizeReason = REASON_SERVER
+    ) -> tuple[int, bytes]:
+        del reason  # reason lives in the rectangle x coordinate, not the payload.
         if self.supports_extended:
-            # ExtendedDesktopSize format
-            num_screens = len(self.screens)
-            data = bytearray()
+            return self.ENCODING_EXTENDED_DESKTOP_SIZE, self.encode_extended_payload()
+        return self.ENCODING_DESKTOP_SIZE, b""
 
-            # Header: number-of-screens + padding
-            data.extend(struct.pack(">Bxxx", num_screens))
-
-            # Screen array
-            for screen in self.screens:
-                data.extend(screen.to_bytes())
-
-            self.logger.debug(f"Encoded ExtendedDesktopSize: {num_screens} screen(s)")
-            return (self.ENCODING_EXTENDED_DESKTOP_SIZE, bytes(data))
-        else:
-            # Legacy DesktopSize - no data needed
-            return (self.ENCODING_DESKTOP_SIZE, b'')
+    def make_update_rectangle(
+        self,
+        *,
+        reason: ResizeReason = REASON_SERVER,
+        status: int = STATUS_NO_ERROR,
+    ) -> tuple[int, int, int, int, int, bytes]:
+        if self.supports_extended:
+            return (
+                int(reason),
+                int(status),
+                self.current_width,
+                self.current_height,
+                self.ENCODING_EXTENDED_DESKTOP_SIZE,
+                self.encode_extended_payload(),
+            )
+        return (
+            0,
+            0,
+            self.current_width,
+            self.current_height,
+            self.ENCODING_DESKTOP_SIZE,
+            b"",
+        )
 
     def parse_client_resize_request(self, data: bytes) -> tuple[int, int] | None:
-        """
-        Parse client's resize request
-
-        Args:
-            data: Request data from client
-
-        Returns:
-            (width, height) tuple if valid, None otherwise
-        """
         if len(data) < 4:
-            self.logger.warning("Invalid resize request: too short")
             return None
-
-        try:
-            width, height = struct.unpack(">HH", data[:4])
-
-            if width <= 0 or height <= 0:
-                self.logger.warning(f"Invalid resize request: {width}x{height}")
-                return None
-
-            return (width, height)
-
-        except struct.error as e:
-            self.logger.error(f"Failed to parse resize request: {e}")
+        width, height = struct.unpack(">HH", data[:4])
+        if width <= 0 or height <= 0:
             return None
+        return width, height
 
     def add_screen(self, screen: Screen) -> bool:
-        """
-        Add a screen to multi-monitor configuration
-
-        Args:
-            screen: Screen to add
-
-        Returns:
-            True if added successfully
-        """
         if not self.supports_extended:
-            self.logger.warning("ExtendedDesktopSize not supported")
             return False
-
-        # Check for duplicate ID
-        if any(s.id == screen.id for s in self.screens):
-            self.logger.warning(f"Screen ID {screen.id} already exists")
+        if any(existing.id == screen.id for existing in self.screens):
             return False
-
-        self.screens.append(screen)
-        self.logger.info(f"Added screen {screen.id}: {screen.width}x{screen.height} at ({screen.x}, {screen.y})")
+        candidate = self.screens + [screen]
+        old = self.screens
+        self.screens = candidate
+        valid, _ = self.validate_layout()
+        if not valid:
+            self.screens = old
+            return False
         return True
 
     def remove_screen(self, screen_id: ScreenID) -> bool:
-        """
-        Remove a screen from configuration
-
-        Args:
-            screen_id: ID of screen to remove
-
-        Returns:
-            True if removed successfully
-        """
         if screen_id == 0:
-            self.logger.error("Cannot remove primary screen (ID 0)")
             return False
-
-        initial_count = len(self.screens)
-        self.screens = [s for s in self.screens if s.id != screen_id]
-
-        if len(self.screens) < initial_count:
-            self.logger.info(f"Removed screen {screen_id}")
-            return True
-
-        self.logger.warning(f"Screen {screen_id} not found")
-        return False
+        new_screens = [screen for screen in self.screens if screen.id != screen_id]
+        if len(new_screens) == len(self.screens):
+            return False
+        self.screens = new_screens
+        return True
 
     def get_total_dimensions(self) -> tuple[int, int]:
-        """
-        Calculate total bounding box dimensions
-
-        Returns:
-            (width, height) of bounding box containing all screens
-        """
         if not self.screens:
-            return (0, 0)
-
-        max_x = max(s.x + s.width for s in self.screens)
-        max_y = max(s.y + s.height for s in self.screens)
-
-        return (max_x, max_y)
-
-    def validate_layout(self) -> tuple[bool, str]:
-        """
-        Validate current screen layout
-
-        Returns:
-            (is_valid, error_message) tuple
-        """
-        if not self.screens:
-            return (False, "No screens configured")
-
-        # Check for primary screen
-        if not any(s.id == 0 for s in self.screens):
-            return (False, "No primary screen (ID 0)")
-
-        # Check for overlapping screens (warning, not error)
-        for i, screen1 in enumerate(self.screens):
-            for screen2 in self.screens[i+1:]:
-                if self._screens_overlap(screen1, screen2):
-                    self.logger.warning(
-                        f"Screens {screen1.id} and {screen2.id} overlap"
-                    )
-
-        return (True, "Layout valid")
-
-    def _screens_overlap(self, s1: Screen, s2: Screen) -> bool:
-        """Check if two screens overlap"""
-        return not (
-            s1.x + s1.width <= s2.x or
-            s2.x + s2.width <= s1.x or
-            s1.y + s1.height <= s2.y or
-            s2.y + s2.height <= s1.y
+            return 0, 0
+        return (
+            max(screen.x + screen.width for screen in self.screens),
+            max(screen.y + screen.height for screen in self.screens),
         )
 
-    def handle_resize_event(self, new_width: int, new_height: int,
-                           reason: ResizeReason) -> tuple[int, bytes | None]:
-        """
-        Handle resize event using pattern matching (Python 3.13)
+    def validate_layout(self) -> tuple[bool, str]:
+        if self.current_width <= 0 or self.current_height <= 0:
+            return False, "Desktop dimensions must be positive"
+        if not self.screens:
+            return False, "No screens configured"
+        if len(self.screens) > 255:
+            return False, "Too many screens"
+        if len({screen.id for screen in self.screens}) != len(self.screens):
+            return False, "Duplicate screen id"
 
-        Args:
-            new_width: New width
-            new_height: New height
-            reason: Resize reason
+        for screen in self.screens:
+            try:
+                screen.validate()
+            except ValueError as exc:
+                return False, str(exc)
+            if (
+                screen.x + screen.width > self.current_width
+                or screen.y + screen.height > self.current_height
+            ):
+                return False, (
+                    f"Screen {screen.id} is outside desktop "
+                    f"{self.current_width}x{self.current_height}"
+                )
+        return True, "Layout valid"
 
-        Returns:
-            (status_code, encoded_data) tuple
-        """
-        match (new_width > 0, new_height > 0):
-            case (True, True):
-                # Valid dimensions
-                if self.resize(new_width, new_height, reason):
-                    encoding_type, data = self.encode_desktop_size_update(reason)
-                    return (self.STATUS_NO_ERROR, data)
-                else:
-                    return (self.STATUS_OUT_OF_RESOURCES, None)
-
-            case (False, _) | (_, False):
-                # Invalid dimensions
-                self.logger.error(f"Invalid dimensions: {new_width}x{new_height}")
-                return (self.STATUS_INVALID_SCREEN_LAYOUT, None)
+    def handle_resize_event(
+        self,
+        new_width: int,
+        new_height: int,
+        reason: ResizeReason,
+    ) -> tuple[int, bytes | None]:
+        if not self.resize(new_width, new_height, reason):
+            return self.STATUS_INVALID_SCREEN_LAYOUT, None
+        _encoding, data = self.encode_desktop_size_update(reason)
+        return self.STATUS_NO_ERROR, data
 
     def get_status_message(self, status_code: int) -> str:
-        """
-        Get human-readable status message using pattern matching
+        return {
+            self.STATUS_NO_ERROR: "Resize successful",
+            self.STATUS_ADMINISTRATIVELY_PROHIBITED: "Resize administratively prohibited",
+            self.STATUS_OUT_OF_RESOURCES: "Out of resources",
+            self.STATUS_INVALID_SCREEN_LAYOUT: "Invalid screen layout",
+        }.get(status_code, f"Unknown status: {status_code}")
 
-        Args:
-            status_code: Status code
-
-        Returns:
-            Status message string
-        """
-        match status_code:
-            case self.STATUS_NO_ERROR:
-                return "Resize successful"
-            case self.STATUS_OUT_OF_RESOURCES:
-                return "Out of resources"
-            case self.STATUS_INVALID_SCREEN_LAYOUT:
-                return "Invalid screen layout"
-            case _:
-                return f"Unknown status: {status_code}"
+    @staticmethod
+    def _screens_overlap(first: Screen, second: Screen) -> bool:
+        return not (
+            first.x + first.width <= second.x
+            or second.x + second.width <= first.x
+            or first.y + first.height <= second.y
+            or second.y + second.height <= first.y
+        )
 
 
-# Helper functions
 def create_single_screen_layout(width: int, height: int) -> list[Screen]:
-    """
-    Create a single-screen layout
-
-    Args:
-        width: Screen width
-        height: Screen height
-
-    Returns:
-        List containing single screen
-    """
     return [Screen(id=0, x=0, y=0, width=width, height=height)]
 
 
-def create_dual_screen_layout(w1: int, h1: int, w2: int, h2: int,
-                              horizontal: bool = True) -> list[Screen]:
-    """
-    Create a dual-screen layout
-
-    Args:
-        w1, h1: Primary screen dimensions
-        w2, h2: Secondary screen dimensions
-        horizontal: If True, screens are side-by-side; if False, stacked
-
-    Returns:
-        List containing two screens
-    """
+def create_dual_screen_layout(
+    w1: int,
+    h1: int,
+    w2: int,
+    h2: int,
+    horizontal: bool = True,
+) -> list[Screen]:
     primary = Screen(id=0, x=0, y=0, width=w1, height=h1)
-
-    if horizontal:
-        secondary = Screen(id=1, x=w1, y=0, width=w2, height=h2)
-    else:
-        secondary = Screen(id=1, x=0, y=h1, width=w2, height=h2)
-
+    secondary = (
+        Screen(id=1, x=w1, y=0, width=w2, height=h2)
+        if horizontal
+        else Screen(id=1, x=0, y=h1, width=w2, height=h2)
+    )
     return [primary, secondary]
+
+
+def screens_from_monitor_rects(
+    monitors: Iterable[dict],
+    *,
+    virtual_left: int = 0,
+    virtual_top: int = 0,
+) -> list[Screen]:
+    """Convert MSS-style monitor dictionaries to normalized RFB screens."""
+    screens: list[Screen] = []
+    for index, monitor in enumerate(monitors):
+        screens.append(
+            Screen(
+                id=index,
+                x=int(monitor["left"]) - int(virtual_left),
+                y=int(monitor["top"]) - int(virtual_top),
+                width=int(monitor["width"]),
+                height=int(monitor["height"]),
+                flags=0,
+            )
+        )
+    return screens

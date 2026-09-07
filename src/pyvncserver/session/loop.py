@@ -4,6 +4,7 @@ import socket
 import time
 
 from vnc_lib.encodings import format_encoding_list
+from vnc_lib.desktop_resize import DesktopSizeHandler, Screen
 from vnc_lib.exceptions import (
     VNCError, ProtocolError, AuthenticationError, ConnectionError as VNCConnectionError,
 )
@@ -76,14 +77,77 @@ class SessionLoopMixin:
         parallel_enabled_for_client = parallel_encoder is not None
         last_pointer_pos = session.last_pointer_pos
 
+        continuous_enabled = False
+        continuous_request: dict | None = None
+        continuous_advertised = False
+        fence_probe_sent = False
+        extended_desktop_advertised = False
+        continuous_poll_timeout = max(0.001, 1.0 / max(1, max_frame_rate))
+        next_continuous_update = 0.0
+
+        def _current_screen_layout(width: int, height: int) -> list[Screen]:
+            getter = getattr(screen_capture, "get_monitor_layout", None)
+            if callable(getter):
+                try:
+                    layout = [Screen(**screen) for screen in getter(width, height)]
+                    if layout:
+                        return layout
+                except Exception as exc:
+                    self.logger.debug("Unable to read capture monitor layout: %s", exc)
+            return [Screen(id=0, x=0, y=0, width=width, height=height)]
+
+        desktop_size = DesktopSizeHandler()
+        desktop_size.initialize(
+            fb_width,
+            fb_height,
+            _current_screen_layout(fb_width, fb_height),
+        )
+
         while not self.shutdown_handler.is_shutting_down():
             try:
-                # Receive message type
-                msg_type_data = recv_exact(client_socket, 1)
-                if not msg_type_data:
-                    break
+                # In ContinuousUpdates mode the socket is polled at the target
+                # frame cadence. A timeout is a streaming tick, not a disconnect.
+                continuous_tick = False
+                if continuous_enabled and continuous_request is not None:
+                    now = time.monotonic()
+                    if now >= next_continuous_update:
+                        # Do not let a continuous stream of pointer/key events
+                        # starve framebuffer delivery.
+                        msg_type_data = None
+                        continuous_tick = True
+                    else:
+                        original_timeout = client_socket.gettimeout()
+                        try:
+                            poll_timeout = max(
+                                0.001, next_continuous_update - now
+                            )
+                            if (
+                                original_timeout is not None
+                                and float(original_timeout) > 0
+                            ):
+                                poll_timeout = min(
+                                    float(original_timeout), poll_timeout
+                                )
+                            client_socket.settimeout(poll_timeout)
+                            try:
+                                msg_type_data = recv_exact(client_socket, 1)
+                            except socket.timeout:
+                                msg_type_data = None
+                                continuous_tick = True
+                        finally:
+                            client_socket.settimeout(original_timeout)
+                else:
+                    msg_type_data = recv_exact(client_socket, 1)
 
-                msg_type = msg_type_data[0]
+                if continuous_tick:
+                    next_continuous_update = (
+                        time.monotonic() + continuous_poll_timeout
+                    )
+                    msg_type = protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST
+                else:
+                    if not msg_type_data:
+                        break
+                    msg_type = msg_type_data[0]
 
                 # Handle different message types using Python 3.13 pattern matching
                 match msg_type:
@@ -118,6 +182,56 @@ class SessionLoopMixin:
                         self._configure_tight_compatibility(
                             encoder_manager, client_encodings
                         )
+                        if self.enable_last_rect:
+                            protocol.configure_last_rect(client_encodings)
+                        else:
+                            protocol.use_last_rect = False
+
+                        supports_continuous = (
+                            self.enable_continuous_updates
+                            and protocol.ENCODING_CONTINUOUS_UPDATES in client_encodings
+                        )
+                        if supports_continuous and not continuous_advertised:
+                            # EndOfContinuousUpdates doubles as capability
+                            # advertisement. noVNC responds by enabling streaming.
+                            protocol.send_end_of_continuous_updates(client_socket)
+                            continuous_advertised = True
+                        elif not supports_continuous:
+                            continuous_advertised = False
+                            continuous_enabled = False
+                            continuous_request = None
+                            next_continuous_update = 0.0
+
+                        if (
+                            self.enable_fence
+                            and protocol.ENCODING_FENCE in client_encodings
+                            and not fence_probe_sent
+                        ):
+                            protocol.send_fence_probe(client_socket)
+                            fence_probe_sent = True
+
+                        desktop_size.supports_extended = (
+                            self.enable_extended_desktop_size
+                            and protocol.ENCODING_EXTENDED_DESKTOP_SIZE in client_encodings
+                        )
+                        if (
+                            desktop_size.supports_extended
+                            and not extended_desktop_advertised
+                        ):
+                            # Advertise the current layout immediately. Clients
+                            # such as noVNC only enable SetDesktopSize after
+                            # receiving an ExtendedDesktopSize rectangle.
+                            protocol.send_framebuffer_update(
+                                client_socket,
+                                [desktop_size.make_update_rectangle(
+                                    reason=DesktopSizeHandler.REASON_SERVER,
+                                    status=DesktopSizeHandler.STATUS_NO_ERROR,
+                                )],
+                            )
+                            extended_desktop_advertised = True
+                        elif not desktop_size.supports_extended:
+                            extended_desktop_advertised = False
+
                         self.logger.info(
                             f"Client encoding preference order: {format_encoding_list(client_encodings)}"
                         )
@@ -137,11 +251,14 @@ class SessionLoopMixin:
                             )
 
                     case protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
-                        request = protocol.parse_framebuffer_update_request(client_socket)
-                        if self.enable_request_coalescing:
-                            request = self._coalesce_framebuffer_update_requests(
-                                client_socket, protocol, request
-                            )
+                        if continuous_tick:
+                            request = dict(continuous_request or {})
+                        else:
+                            request = protocol.parse_framebuffer_update_request(client_socket)
+                            if self.enable_request_coalescing:
+                                request = self._coalesce_framebuffer_update_requests(
+                                    client_socket, protocol, request
+                                )
                         selection_encodings, _ = self._filter_encodings_for_pixel_format(
                             client_encodings, encoder_manager, current_pixel_format
                         )
@@ -168,10 +285,15 @@ class SessionLoopMixin:
                                 fb_width, fb_height, new_width, new_height,
                             )
 
-                            if protocol.ENCODING_DESKTOP_SIZE not in client_encodings:
+                            can_extended = (
+                                desktop_size.supports_extended
+                                and protocol.ENCODING_EXTENDED_DESKTOP_SIZE in client_encodings
+                            )
+                            can_legacy = protocol.ENCODING_DESKTOP_SIZE in client_encodings
+                            if not can_extended and not can_legacy:
                                 raise VNCConnectionError(
                                     "Framebuffer size changed but the client did not negotiate "
-                                    "DesktopSize; reconnect is required"
+                                    "DesktopSize or ExtendedDesktopSize; reconnect is required"
                                 )
 
                             fb_width, fb_height = new_width, new_height
@@ -181,9 +303,29 @@ class SessionLoopMixin:
                             if change_detector:
                                 change_detector.resize(fb_width, fb_height)
                             self._reset_stateful_encoders(encoder_manager)
-                            protocol.send_framebuffer_update(client_socket, [
-                                (0, 0, fb_width, fb_height, protocol.ENCODING_DESKTOP_SIZE, None)
-                            ])
+
+                            desktop_size.initialize(
+                                fb_width,
+                                fb_height,
+                                _current_screen_layout(fb_width, fb_height),
+                            )
+                            desktop_size.supports_extended = can_extended
+                            if continuous_enabled:
+                                continuous_request = {
+                                    'incremental': 1,
+                                    'x': 0,
+                                    'y': 0,
+                                    'width': fb_width,
+                                    'height': fb_height,
+                                }
+
+                            protocol.send_framebuffer_update(
+                                client_socket,
+                                [desktop_size.make_update_rectangle(
+                                    reason=DesktopSizeHandler.REASON_SERVER,
+                                    status=DesktopSizeHandler.STATUS_NO_ERROR,
+                                )],
+                            )
                             continue
 
                         cursor_rectangles, last_pointer_pos = self._build_cursor_pseudo_rectangles(
@@ -210,7 +352,13 @@ class SessionLoopMixin:
                             request['incremental']
                             and snapshot.generation == session.last_frame_generation
                         ):
-                            protocol.send_framebuffer_update(client_socket, cursor_rectangles)
+                            # Streaming clients do not need empty FBUs at the
+                            # polling rate. Cursor pseudo-rectangles are still
+                            # delivered when they changed.
+                            if cursor_rectangles or not continuous_tick:
+                                protocol.send_framebuffer_update(
+                                    client_socket, cursor_rectangles
+                                )
                             session.last_pointer_pos = last_pointer_pos
                             continue
 
@@ -233,10 +381,14 @@ class SessionLoopMixin:
                                     changed_regions = self._intersect_regions(changed_regions, request_region)
 
                             if changed_regions is not None and len(changed_regions) == 0:
-                                protocol.send_framebuffer_update(
-                                    client_socket,
-                                    cursor_rectangles + backend_copyrect_rectangles,
+                                empty_rectangles = (
+                                    cursor_rectangles + backend_copyrect_rectangles
                                 )
+                                if empty_rectangles or not continuous_tick:
+                                    protocol.send_framebuffer_update(
+                                        client_socket,
+                                        empty_rectangles,
+                                    )
                                 session.last_frame_generation = snapshot.generation
                                 session.last_pointer_pos = last_pointer_pos
                                 continue
@@ -620,6 +772,130 @@ class SessionLoopMixin:
                                     len(frame_pixels),
                                     target_frame_time,
                                 )
+
+                    case protocol.MSG_ENABLE_CONTINUOUS_UPDATES:
+                        update = protocol.parse_enable_continuous_updates(client_socket)
+                        if (
+                            not self.enable_continuous_updates
+                            or protocol.ENCODING_CONTINUOUS_UPDATES not in client_encodings
+                        ):
+                            raise ProtocolError(
+                                "Client enabled ContinuousUpdates without negotiating support"
+                            )
+
+                        if update.enabled:
+                            normalized = self._normalize_request_region(
+                                {
+                                    'x': update.x,
+                                    'y': update.y,
+                                    'width': update.width,
+                                    'height': update.height,
+                                },
+                                fb_width,
+                                fb_height,
+                            )
+                            if normalized is None:
+                                raise ProtocolError(
+                                    "ContinuousUpdates region is outside the framebuffer"
+                                )
+                            x, y, width, height = normalized
+                            continuous_request = {
+                                'incremental': 1,
+                                'x': x,
+                                'y': y,
+                                'width': width,
+                                'height': height,
+                            }
+                            continuous_enabled = True
+                            next_continuous_update = 0.0
+                            # Force one immediate update; subsequent frames use
+                            # the producer generation as the change trigger.
+                            session.last_frame_generation = -1
+                            self.logger.info(
+                                "ContinuousUpdates enabled for %d,%d %dx%d",
+                                x, y, width, height,
+                            )
+                        else:
+                            continuous_enabled = False
+                            continuous_request = None
+                            next_continuous_update = 0.0
+                            protocol.send_end_of_continuous_updates(client_socket)
+                            self.logger.info("ContinuousUpdates disabled")
+
+                    case protocol.MSG_CLIENT_FENCE:
+                        fence = protocol.parse_client_fence(client_socket)
+                        if (
+                            not self.enable_fence
+                            or protocol.ENCODING_FENCE not in client_encodings
+                        ):
+                            raise ProtocolError(
+                                "ClientFence received without negotiated Fence support"
+                            )
+
+                        if fence.flags & protocol.FENCE_FLAG_REQUEST:
+                            response_flags = (
+                                fence.flags
+                                & protocol.FENCE_SUPPORTED_FLAGS
+                                & ~protocol.FENCE_FLAG_REQUEST
+                                & ~protocol.FENCE_FLAG_SYNC_NEXT
+                            )
+                            protocol.send_server_fence(
+                                client_socket,
+                                response_flags,
+                                fence.payload,
+                            )
+                        else:
+                            self.logger.debug(
+                                "Fence response received: flags=0x%08x payload_bytes=%d",
+                                fence.flags,
+                                len(fence.payload),
+                            )
+
+                    case protocol.MSG_SET_DESKTOP_SIZE:
+                        resize_request = protocol.parse_set_desktop_size(client_socket)
+                        if (
+                            not self.enable_extended_desktop_size
+                            or protocol.ENCODING_EXTENDED_DESKTOP_SIZE not in client_encodings
+                        ):
+                            raise ProtocolError(
+                                "SetDesktopSize received without ExtendedDesktopSize support"
+                            )
+
+                        status = DesktopSizeHandler.STATUS_ADMINISTRATIVELY_PROHIBITED
+                        if self.allow_client_resize:
+                            requested_screens = [
+                                Screen(*screen)
+                                for screen in resize_request.screens
+                            ]
+                            try:
+                                if (
+                                    resize_request.width != fb_width
+                                    or resize_request.height != fb_height
+                                ):
+                                    raise ValueError(
+                                        "Host framebuffer resizing is not implemented; "
+                                        "only layout changes matching the current size are allowed"
+                                    )
+                                desktop_size.set_layout(
+                                    fb_width,
+                                    fb_height,
+                                    requested_screens,
+                                )
+                                status = DesktopSizeHandler.STATUS_NO_ERROR
+                            except ValueError as exc:
+                                self.logger.warning(
+                                    "Rejected SetDesktopSize request: %s", exc
+                                )
+                                status = DesktopSizeHandler.STATUS_INVALID_SCREEN_LAYOUT
+
+                        desktop_size.supports_extended = True
+                        protocol.send_framebuffer_update(
+                            client_socket,
+                            [desktop_size.make_update_rectangle(
+                                reason=DesktopSizeHandler.REASON_CLIENT,
+                                status=status,
+                            )],
+                        )
 
                     case protocol.MSG_KEY_EVENT:
                         key_event = protocol.parse_key_event(client_socket)

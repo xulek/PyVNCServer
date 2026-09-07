@@ -1,15 +1,17 @@
 """
 Capture backend abstractions and metadata hints.
 
-This module does not implement full DXGI dirty/move rect harvesting yet.
-It provides a stable interface so the server runtime can consume backend-
-supplied metadata as soon as a Windows backend starts exposing it.
+The DXCam adapter can harvest native DXGI Desktop Duplication dirty/move
+rectangles through the optional metadata hook while MSS/Pillow retain the
+portable software-diff fallback.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+
+from .dxgi_metadata import DXGIMetadataHook
 
 
 Rectangle = tuple[int, int, int, int]
@@ -179,22 +181,120 @@ class DXCamCaptureBackend(BaseCaptureBackend):
         supports_bgra=True,
         supports_rgb=True,
         supports_pil_image=False,
-        # The runtime is now ready for these metadata hints, but dxcam does not
-        # provide them in this implementation yet.
-        supports_dirty_regions=False,
-        supports_move_rects=False,
+        supports_dirty_regions=True,
+        supports_move_rects=True,
     )
+
+    def __init__(self, owner: Any):
+        super().__init__(owner)
+        self._metadata_hook = DXGIMetadataHook(logger=getattr(owner, "logger", None))
 
     def is_available(self) -> bool:
         return bool(getattr(self.owner, "_dxcam_available", False))
 
-    def healthcheck(self) -> bool:
-        try:
-            return self.is_available() and self.owner._get_dxcam_session() is not None
-        except Exception:
+    def _get_camera(self) -> Any:
+        camera = self.owner._get_dxcam_session()
+        if camera is not None:
+            self._metadata_hook.ensure_attached(camera)
+        return camera
+
+    def _metadata_is_usable(self, camera: Any) -> bool:
+        if not bool(getattr(self.owner, "enable_dxgi_metadata", True)):
+            return False
+        if camera is None or not self._metadata_hook.is_available:
+            return False
+        if float(getattr(self.owner, "scale_factor", 1.0)) != 1.0:
+            return False
+        if int(getattr(camera, "rotation_angle", 0) or 0) != 0:
             return False
 
+        region = getattr(camera, "region", None)
+        camera_width = int(getattr(camera, "width", 0) or 0)
+        camera_height = int(getattr(camera, "height", 0) or 0)
+        if region is not None and camera_width > 0 and camera_height > 0:
+            if tuple(region) != (0, 0, camera_width, camera_height):
+                return False
+        return True
+
+    def healthcheck(self) -> bool:
+        # Do not create a DXCamera during backend probing. DXCam keeps one
+        # singleton camera per (device, output, backend), while PyVNCServer's
+        # capture producer runs on a dedicated thread. Creating the camera here
+        # on the server thread makes the producer call dxcam.create() again and
+        # triggers an "instance already exists" warning before first capture.
+        # The first real grab initializes the camera on the capture thread; any
+        # initialization failure is handled by the normal backend failover path.
+        return self.is_available()
+
+    def build_metadata(self, width: int, height: int) -> CaptureMetadata:
+        # Capability probes use a 0x0 size and must be side-effect free. In
+        # particular, do not call dxcam.create() here: the real camera belongs
+        # to the capture-producer thread. Creating it during server startup
+        # would make the producer request the same DXCam singleton again.
+        if width <= 0 or height <= 0:
+            supported = (
+                bool(getattr(self.owner, "enable_dxgi_metadata", True))
+                and float(getattr(self.owner, "scale_factor", 1.0)) == 1.0
+                and self.is_available()
+            )
+            return CaptureMetadata(
+                backend_name=(
+                    "dxcam+dxgi-metadata" if supported else self.name
+                ),
+                dirty_regions=None,
+                move_rects=[],
+                supports_dirty_regions=supported,
+                supports_move_rects=supported,
+            )
+
+        try:
+            camera = self._get_camera()
+        except Exception:
+            camera = None
+
+        supported = self._metadata_is_usable(camera)
+        if not supported:
+            return CaptureMetadata(
+                backend_name=self.name,
+                dirty_regions=None,
+                move_rects=[],
+                supports_dirty_regions=False,
+                supports_move_rects=False,
+            )
+
+        hints = self._metadata_hook.consume(width, height)
+        if hints is None:
+            return CaptureMetadata(
+                backend_name="dxcam+dxgi-fallback",
+                dirty_regions=None,
+                move_rects=[],
+                supports_dirty_regions=True,
+                supports_move_rects=True,
+            )
+
+        # Conservative v3.3 safety rule: move destinations are included in the
+        # pixel-dirty list as well as exposed as CopyRect hints. This guarantees
+        # correctness for clients without CopyRect and for clients that skip
+        # producer generations. A later optimization may suppress the redundant
+        # pixel rectangle for clients that are exactly one generation behind
+        # and advertise CopyRect.
+        dirty_regions = list(hints.dirty_regions)
+        dirty_regions.extend(
+            (move.dst_x, move.dst_y, move.width, move.height)
+            for move in hints.move_rects
+        )
+        dirty_regions = list(dict.fromkeys(dirty_regions))
+
+        return CaptureMetadata(
+            backend_name="dxcam+dxgi-metadata",
+            dirty_regions=dirty_regions,
+            move_rects=list(hints.move_rects),
+            supports_dirty_regions=True,
+            supports_move_rects=True,
+        )
+
     def grab_bgra(self) -> tuple[bytes | None, int, int]:
+        self._get_camera()
         frame_bytes, width, height, channels, color_hint = self.owner._grab_dxcam_frame()
         if frame_bytes is None:
             return None, 0, 0
@@ -206,6 +306,7 @@ class DXCamCaptureBackend(BaseCaptureBackend):
         return bgra, width, height
 
     def grab_rgb(self) -> tuple[bytes | None, int, int]:
+        self._get_camera()
         frame_bytes, width, height, channels, color_hint = self.owner._grab_dxcam_frame()
         if frame_bytes is None:
             return None, 0, 0

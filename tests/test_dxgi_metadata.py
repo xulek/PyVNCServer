@@ -224,3 +224,39 @@ def test_dxcam_healthcheck_does_not_create_camera():
     backend = DXCamCaptureBackend(FakeOwner())
 
     assert backend.healthcheck() is True
+
+
+def test_dxcam_capability_probe_does_not_create_camera():
+    class ProbeOwner:
+        logger = logging.getLogger("test.dxgi.capability-probe")
+        scale_factor = 1.0
+        enable_dxgi_metadata = True
+        _dxcam_available = True
+
+        def _get_dxcam_session(self):
+            raise AssertionError("capability probe must not create a DXCamera")
+
+    backend = DXCamCaptureBackend(ProbeOwner())
+    metadata = backend.build_metadata(0, 0)
+
+    assert metadata.backend_name == "dxcam+dxgi-metadata"
+    assert metadata.supports_dirty_regions is True
+    assert metadata.supports_move_rects is True
+
+
+def test_dxcam_capability_probe_respects_metadata_disable_flag():
+    class ProbeOwner:
+        logger = logging.getLogger("test.dxgi.capability-probe-disabled")
+        scale_factor = 1.0
+        enable_dxgi_metadata = False
+        _dxcam_available = True
+
+        def _get_dxcam_session(self):
+            raise AssertionError("capability probe must not create a DXCamera")
+
+    backend = DXCamCaptureBackend(ProbeOwner())
+    metadata = backend.build_metadata(0, 0)
+
+    assert metadata.backend_name == "dxcam"
+    assert metadata.supports_dirty_regions is False
+    assert metadata.supports_move_rects is False

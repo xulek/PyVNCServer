@@ -55,6 +55,31 @@ jobs:
       - name: Run test suite
         run: python -m pytest -q
 
+  dxgi-contract:
+    name: DXGI contract · Windows · Python 3.13
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Upgrade packaging tools
+        run: python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install performance and test dependencies
+        run: python -m pip install -e ".[dev,performance]"
+
+      - name: Verify DXCam private integration contract
+        run: python -m pytest -q tests/test_dxgi_dxcam_contract.py tests/test_dxgi_metadata.py
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -91,7 +116,7 @@ jobs:
 
   build:
     name: Build package
-    needs: test
+    needs: [test, dxgi-contract]
     runs-on: ubuntu-latest
     timeout-minutes: 15
 

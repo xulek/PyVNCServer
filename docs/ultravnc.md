@@ -51,6 +51,20 @@ These are useful control encodings when isolating a compatibility problem:
 - **Zlib**: compressed full rectangles;
 - **ZRLE**: tiled zlib/RLE, usually a good general-purpose option.
 
+## v3.3 interoperability regression suite
+
+Version 3.3 adds a real TCP/RFB regression test that keeps one connection open while changing the advertised encoding set. The test parses the actual rectangle payload rather than only checking that the socket remained connected.
+
+The automated sequence is:
+
+```text
+Raw → RRE → Hextile → Zlib → ZRLE → Tight → Raw
+```
+
+For each step it verifies the rectangle header encoding ID and the corresponding wire format. This specifically guards against failures such as advertising RRE while sending Raw bytes, stale zlib state after an encoding switch, or a connection reset caused by stream desynchronization.
+
+This test is not a substitute for running the UltraVNC binary itself: client-specific decoder behavior still needs manual validation before a release. It does, however, make the protocol-level failure modes reproducible in Linux and Windows CI.
+
 ## What to log
 
 Run:
@@ -68,9 +82,9 @@ Useful lines include:
 - selected encoding per update/region;
 - socket reset/timeout messages.
 
-## Suggested compatibility matrix
+## Suggested manual compatibility matrix
 
-After a code change to an encoder, test a single connection while switching in this order:
+After a code change to an encoder, test a single UltraVNC connection while switching in this order:
 
 ```text
 Raw → Hextile → Zlib → ZRLE → Tight → RRE → Auto

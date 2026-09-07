@@ -7,6 +7,7 @@ DXCam private-API change before it silently disables native metadata capture.
 
 from __future__ import annotations
 
+import inspect
 import os
 
 import pytest
@@ -21,12 +22,7 @@ def test_dxcam_private_metadata_contract():
     from dxcam._libs.dxgi import IDXGIOutputDuplication
 
     assert hasattr(DXGIDuplicator, "update_frame")
-
-    # DXCamera stores the active duplicator on this private attribute. The v3.3
-    # hook intentionally checks it dynamically and falls back to software diff
-    # if it disappears, but CI should still make such an upstream change loud.
-    annotations = getattr(DXCamera, "__annotations__", {})
-    assert "_duplicator" in annotations or "_duplicator" in vars(DXCamera)
+    assert "_duplicator" in inspect.getsource(DXCamera.__init__)
 
     method_names = {
         getattr(method, "name", None)

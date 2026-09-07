@@ -227,6 +227,26 @@ class DXCamCaptureBackend(BaseCaptureBackend):
         return self.is_available()
 
     def build_metadata(self, width: int, height: int) -> CaptureMetadata:
+        # Capability probes use a 0x0 size and must be side-effect free. In
+        # particular, do not call dxcam.create() here: the real camera belongs
+        # to the capture-producer thread. Creating it during server startup
+        # would make the producer request the same DXCam singleton again.
+        if width <= 0 or height <= 0:
+            supported = (
+                bool(getattr(self.owner, "enable_dxgi_metadata", True))
+                and float(getattr(self.owner, "scale_factor", 1.0)) == 1.0
+                and self.is_available()
+            )
+            return CaptureMetadata(
+                backend_name=(
+                    "dxcam+dxgi-metadata" if supported else self.name
+                ),
+                dirty_regions=None,
+                move_rects=[],
+                supports_dirty_regions=supported,
+                supports_move_rects=supported,
+            )
+
         try:
             camera = self._get_camera()
         except Exception:
@@ -240,15 +260,6 @@ class DXCamCaptureBackend(BaseCaptureBackend):
                 move_rects=[],
                 supports_dirty_regions=False,
                 supports_move_rects=False,
-            )
-
-        if width <= 0 or height <= 0:
-            return CaptureMetadata(
-                backend_name="dxcam+dxgi-metadata",
-                dirty_regions=None,
-                move_rects=[],
-                supports_dirty_regions=True,
-                supports_move_rects=True,
             )
 
         hints = self._metadata_hook.consume(width, height)

@@ -63,7 +63,43 @@ Raw → RRE → Hextile → Zlib → ZRLE → Tight → Raw
 
 For each step it verifies the rectangle header encoding ID and the corresponding wire format. This specifically guards against failures such as advertising RRE while sending Raw bytes, stale zlib state after an encoding switch, or a connection reset caused by stream desynchronization.
 
-This test is not a substitute for running the UltraVNC binary itself: client-specific decoder behavior still needs manual validation before a release. It does, however, make the protocol-level failure modes reproducible in Linux and Windows CI.
+This test is not a substitute for running the UltraVNC binary itself: client-specific decoder behavior still needs validation before a release. It does, however, make the protocol-level failure modes reproducible in Linux and Windows CI.
+
+## Real UltraVNC Viewer smoke test
+
+UltraVNC Viewer exposes a command-line `-encoding` option, so v3.3 also ships a PowerShell smoke-test for the actual `vncviewer.exe` binary.
+
+Start PyVNCServer in one terminal:
+
+```powershell
+pyvncserver serve --log-level DEBUG
+```
+
+Then run in another PowerShell window:
+
+```powershell
+.\scripts\ultravnc_smoke.ps1 `
+  -ViewerPath 'C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe'
+```
+
+The default sequence is:
+
+```text
+raw → rre → hextile → zlib → tight
+```
+
+For every encoding the script launches a fresh view-only UltraVNC process, keeps it connected for a short observation period and treats an early viewer exit as failure. Viewer logs are written under `%TEMP%\pyvncserver-ultravnc`.
+
+A longer run is useful when validating a release candidate:
+
+```powershell
+.\scripts\ultravnc_smoke.ps1 `
+  -SecondsPerEncoding 10 `
+  -Encodings raw,rre,hextile,zlib,tight
+```
+
+!!! note
+    The script proves that the real UltraVNC process can negotiate and keep the session alive. Visual correctness should still be checked while moving windows, scrolling and changing screen content, especially for Tight and RRE.
 
 ## What to log
 

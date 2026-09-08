@@ -175,3 +175,40 @@ class TestUtilityFunctions(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_connection_metrics_records_adaptive_snapshot():
+    from pyvncserver.runtime.adaptive import AdaptiveStreamSnapshot
+
+    metrics = ConnectionMetrics(client_id="adaptive")
+    snapshot = AdaptiveStreamSnapshot(
+        target_fps=24.0,
+        pressure=1.3,
+        network_pressure=0.8,
+        cpu_pressure=0.5,
+        frame_time_ewma=0.04,
+        send_time_ewma=0.025,
+        processing_time_ewma=0.015,
+        throughput_bps_ewma=2_000_000.0,
+        compression_ratio_ewma=0.25,
+        overloaded=True,
+    )
+    metrics.record_adaptive(snapshot)
+
+    assert metrics.adaptive_target_fps == 24.0
+    assert metrics.adaptive_pressure == 1.3
+    assert metrics.adaptive_overloaded is True
+
+
+def test_server_metrics_summary_includes_adaptive_telemetry():
+    ServerMetrics._instance = None
+    metrics = ServerMetrics.get_instance()
+    conn = metrics.register_connection("adaptive-summary")
+    conn.adaptive_target_fps = 20.0
+    conn.adaptive_pressure = 1.2
+    conn.adaptive_overloaded = True
+
+    summary = metrics.get_summary()
+    assert summary["avg_adaptive_target_fps"] == 20.0
+    assert summary["avg_adaptive_pressure"] == 1.2
+    assert summary["overloaded_connections"] == 1

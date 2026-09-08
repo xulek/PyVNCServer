@@ -12,6 +12,7 @@ from vnc_lib.io_utils import recv_exact
 from vnc_lib.protocol import RFBProtocol
 from vnc_lib.server_utils import NetworkProfile, PerformanceThrottler
 from pyvncserver.session_state import ClientSessionState
+from pyvncserver.runtime.adaptive import AdaptiveStreamController
 
 
 class SessionLoopMixin:
@@ -74,6 +75,57 @@ class SessionLoopMixin:
         lan_jpeg_quality = self.lan_jpeg_quality_initial
         if lan_adaptive:
             self._configure_lan_encoders(encoder_manager, lan_jpeg_quality)
+        adaptive_controller = (
+            AdaptiveStreamController(max_frame_rate, self.adaptive_stream_config)
+            if getattr(self, 'enable_adaptive_streaming', False)
+            else None
+        )
+
+        def _apply_adaptive_observation(
+            frame_time: float,
+            send_time: float,
+            encoded_bytes: int,
+            original_bytes: int,
+            used_jpeg: bool,
+        ):
+            nonlocal lan_jpeg_quality, continuous_poll_timeout, target_frame_time
+            if adaptive_controller is None:
+                return None
+            adaptive_snapshot = adaptive_controller.observe(
+                frame_time,
+                encoded_bytes,
+                original_bytes,
+                send_time=send_time,
+            )
+            throttler.set_max_rate(adaptive_snapshot.target_fps)
+            continuous_poll_timeout = adaptive_controller.target_interval
+            target_frame_time = adaptive_controller.target_interval
+            if conn_metrics:
+                conn_metrics.record_adaptive(adaptive_snapshot)
+            if used_jpeg:
+                lan_jpeg_quality = adaptive_controller.recommended_jpeg_quality(
+                    lan_jpeg_quality,
+                    self.lan_jpeg_quality_min,
+                    self.lan_jpeg_quality_max,
+                )
+
+            # Tight is the one persistent compressed encoding whose wire format
+            # can explicitly signal a stream reset. This makes changing its
+            # compression level safe between rectangles. Zlib/ZRLE levels are
+            # intentionally left fixed for the lifetime of a client stream.
+            tight_encoder = encoder_manager.encoders.get(7)
+            if (
+                tight_encoder is not None
+                and hasattr(tight_encoder, 'set_compression_level')
+                and hasattr(tight_encoder, 'compression_level')
+            ):
+                next_level = adaptive_controller.recommended_tight_compression_level(
+                    int(tight_encoder.compression_level)
+                )
+                if next_level != int(tight_encoder.compression_level):
+                    tight_encoder.set_compression_level(next_level)
+            return adaptive_snapshot
+
         parallel_enabled_for_client = parallel_encoder is not None
         last_pointer_pos = session.last_pointer_pos
 
@@ -262,8 +314,18 @@ class SessionLoopMixin:
                         selection_encodings, _ = self._filter_encodings_for_pixel_format(
                             client_encodings, encoder_manager, current_pixel_format
                         )
+                        if adaptive_controller is not None:
+                            selection_encodings = adaptive_controller.recommended_encoding_order(
+                                selection_encodings
+                            )
 
-                        # Throttle before expensive capture/encoding work.
+                        # Throttle before expensive capture/encoding work. The
+                        # v3.6 controller changes this rate per client based on
+                        # measured encode + blocking send time.
+                        if adaptive_controller is not None:
+                            throttler.set_max_rate(adaptive_controller.target_fps)
+                            target_frame_time = adaptive_controller.target_interval
+                            continuous_poll_timeout = target_frame_time
                         throttler.throttle()
                         start_time = time.perf_counter()
                         snapshot = self._capture_frame_with_generation(
@@ -380,6 +442,15 @@ class SessionLoopMixin:
                                 if changed_regions is not None:
                                     changed_regions = self._intersect_regions(changed_regions, request_region)
 
+                            if (
+                                adaptive_controller is not None
+                                and changed_regions
+                                and not backend_copyrect_rectangles
+                            ):
+                                changed_regions = adaptive_controller.merge_changed_regions(
+                                    changed_regions, fb_width, fb_height
+                                )
+
                             if changed_regions is not None and len(changed_regions) == 0:
                                 empty_rectangles = (
                                     cursor_rectangles + backend_copyrect_rectangles
@@ -452,7 +523,9 @@ class SessionLoopMixin:
                                         "Sending framebuffer update with %d rectangle(s)",
                                         len(rectangles),
                                     )
+                                    send_started = time.perf_counter()
                                     protocol.send_framebuffer_update(client_socket, rectangles)
+                                    send_time = time.perf_counter() - send_started
                                     self._commit_frame_state(
                                         encoder_manager,
                                         result.pixel_data,
@@ -464,27 +537,36 @@ class SessionLoopMixin:
                                     session.last_pointer_pos = last_pointer_pos
                                     self.logger.debug("Framebuffer update sent successfully")
 
-                                    # Record metrics
+                                    # Record metrics and adapt pacing/quality.
+                                    encoding_time = time.perf_counter() - start_time
+                                    total_bytes = sum(r.original_size for r in encoded_results)
+                                    compressed_bytes = sum(r.compressed_size for r in encoded_results)
+                                    jpeg_original_bytes = sum(
+                                        r.original_size for r in encoded_results if r.encoding_type == 21
+                                    )
+                                    jpeg_encoded_bytes = sum(
+                                        r.compressed_size for r in encoded_results if r.encoding_type == 21
+                                    )
                                     if conn_metrics:
-                                        encoding_time = time.perf_counter() - start_time
-                                        total_bytes = sum(r.original_size for r in encoded_results)
-                                        compressed_bytes = sum(r.compressed_size for r in encoded_results)
                                         conn_metrics.record_frame(
                                             compressed_bytes, encoding_time, total_bytes
                                         )
-                                        if lan_adaptive:
-                                            for r in encoded_results:
-                                                if r.encoding_type == 21:
-                                                    jpeg_original_bytes += r.original_size
-                                                    jpeg_encoded_bytes += r.compressed_size
-                                            if jpeg_original_bytes > 0:
-                                                lan_jpeg_quality = self._adjust_lan_jpeg_quality(
-                                                    lan_jpeg_quality,
-                                                    encoding_time,
-                                                    jpeg_encoded_bytes,
-                                                    jpeg_original_bytes,
-                                                    target_frame_time,
-                                                )
+                                    if adaptive_controller is not None:
+                                        _apply_adaptive_observation(
+                                            encoding_time,
+                                            send_time,
+                                            compressed_bytes,
+                                            total_bytes,
+                                            jpeg_original_bytes > 0,
+                                        )
+                                    elif lan_adaptive and jpeg_original_bytes > 0:
+                                        lan_jpeg_quality = self._adjust_lan_jpeg_quality(
+                                            lan_jpeg_quality,
+                                            encoding_time,
+                                            jpeg_encoded_bytes,
+                                            jpeg_original_bytes,
+                                            target_frame_time,
+                                        )
                                     continue
 
                             # Non-parallel region encoding fallback
@@ -600,7 +682,9 @@ class SessionLoopMixin:
                                     "Sending framebuffer update with %d rectangle(s)",
                                     len(rectangles),
                                 )
+                                send_started = time.perf_counter()
                                 protocol.send_framebuffer_update(client_socket, rectangles)
+                                send_time = time.perf_counter() - send_started
                                 self._commit_frame_state(
                                     encoder_manager,
                                     result.pixel_data,
@@ -612,21 +696,29 @@ class SessionLoopMixin:
                                 session.last_pointer_pos = last_pointer_pos
                                 self.logger.debug("Framebuffer update sent successfully")
 
+                                encoding_time = time.perf_counter() - start_time
                                 if conn_metrics:
-                                    encoding_time = time.perf_counter() - start_time
                                     conn_metrics.record_frame(
                                         compressed_total_bytes,
                                         encoding_time,
                                         original_total_bytes,
                                     )
-                                    if lan_adaptive and jpeg_original_bytes > 0:
-                                        lan_jpeg_quality = self._adjust_lan_jpeg_quality(
-                                            lan_jpeg_quality,
-                                            encoding_time,
-                                            jpeg_encoded_bytes,
-                                            jpeg_original_bytes,
-                                            target_frame_time,
-                                        )
+                                if adaptive_controller is not None:
+                                    _apply_adaptive_observation(
+                                        encoding_time,
+                                        send_time,
+                                        compressed_total_bytes,
+                                        original_total_bytes,
+                                        jpeg_original_bytes > 0,
+                                    )
+                                elif lan_adaptive and jpeg_original_bytes > 0:
+                                    lan_jpeg_quality = self._adjust_lan_jpeg_quality(
+                                        lan_jpeg_quality,
+                                        encoding_time,
+                                        jpeg_encoded_bytes,
+                                        jpeg_original_bytes,
+                                        target_frame_time,
+                                    )
                                 continue
 
                         # Select best encoding based on network profile
@@ -746,7 +838,9 @@ class SessionLoopMixin:
                             selected_encoded_bytes = len(encoded_data)
                             encoded_bytes_total = len(encoded_data)
                         self.logger.debug(f"Sending framebuffer update with {len(rectangles)} rectangle(s)")
+                        send_started = time.perf_counter()
                         protocol.send_framebuffer_update(client_socket, rectangles)
+                        send_time = time.perf_counter() - send_started
                         self._commit_frame_state(
                             encoder_manager,
                             result.pixel_data,
@@ -758,20 +852,28 @@ class SessionLoopMixin:
                         session.last_pointer_pos = last_pointer_pos
                         self.logger.debug("Framebuffer update sent successfully")
 
-                        # Record metrics
+                        # Record metrics and apply per-client backpressure.
+                        encoding_time = time.perf_counter() - start_time
                         if conn_metrics:
-                            encoding_time = time.perf_counter() - start_time
                             conn_metrics.record_frame(
                                 encoded_bytes_total, encoding_time, len(frame_pixels)
                             )
-                            if lan_adaptive and selected_encoding_type == 21:
-                                lan_jpeg_quality = self._adjust_lan_jpeg_quality(
-                                    lan_jpeg_quality,
-                                    encoding_time,
-                                    selected_encoded_bytes,
-                                    len(frame_pixels),
-                                    target_frame_time,
-                                )
+                        if adaptive_controller is not None:
+                            _apply_adaptive_observation(
+                                encoding_time,
+                                send_time,
+                                encoded_bytes_total,
+                                len(frame_pixels),
+                                selected_encoding_type == 21,
+                            )
+                        elif lan_adaptive and selected_encoding_type == 21:
+                            lan_jpeg_quality = self._adjust_lan_jpeg_quality(
+                                lan_jpeg_quality,
+                                encoding_time,
+                                selected_encoded_bytes,
+                                len(frame_pixels),
+                                target_frame_time,
+                            )
 
                     case protocol.MSG_ENABLE_CONTINUOUS_UPDATES:
                         update = protocol.parse_enable_continuous_updates(client_socket)

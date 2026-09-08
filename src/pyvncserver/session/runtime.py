@@ -615,6 +615,22 @@ class SessionRuntimeMixin:
                 continue
 
             encoder = encoders[enc_type]
+            cache = getattr(self, 'encoded_region_cache', None)
+            cache_key = None
+            if cache is not None:
+                cache_key = cache.make_key(
+                    enc_type,
+                    pixel_data,
+                    width,
+                    height,
+                    bytes_per_pixel,
+                    pixel_format,
+                    encoder_variant=(lan_jpeg_quality if enc_type == 21 else 0),
+                )
+                cached_payload = cache.get(cache_key)
+                if cached_payload is not None:
+                    return enc_type, encoder, cached_payload
+
             self._prepare_encoder_for_send(enc_type, encoder, lan_jpeg_quality)
             try:
                 if enc_type == 16:
@@ -635,10 +651,24 @@ class SessionRuntimeMixin:
                     exc,
                 )
                 continue
+            if cache is not None:
+                cache.put(cache_key, encoded_data)
             return enc_type, encoder, encoded_data
 
         raw_encoder = encoders[0]
-        return 0, raw_encoder, raw_encoder.encode(pixel_data, width, height, bytes_per_pixel)
+        cache = getattr(self, 'encoded_region_cache', None)
+        cache_key = None
+        if cache is not None:
+            cache_key = cache.make_key(
+                0, pixel_data, width, height, bytes_per_pixel, pixel_format
+            )
+            cached_payload = cache.get(cache_key)
+            if cached_payload is not None:
+                return 0, raw_encoder, cached_payload
+        raw_payload = raw_encoder.encode(pixel_data, width, height, bytes_per_pixel)
+        if cache is not None:
+            cache.put(cache_key, raw_payload)
+        return 0, raw_encoder, raw_payload
 
     def _adjust_lan_jpeg_quality(self, current_quality: int,
                                  frame_time: float,

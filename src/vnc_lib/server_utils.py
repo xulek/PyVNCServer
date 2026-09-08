@@ -387,15 +387,20 @@ class PerformanceThrottler:
         self.last_operation_time: float = 0.0
         self._lock = threading.Lock()
 
+    def set_max_rate(self, max_rate: float) -> None:
+        """Update the rate limit without replacing the throttler instance."""
+        with self._lock:
+            self.max_rate = max(0.0, float(max_rate))
+            self.min_interval = 1.0 / self.max_rate if self.max_rate > 0 else 0.0
+
     def throttle(self):
         """
         Throttle operation to maintain max rate
         Sleeps if necessary to maintain rate limit
         """
-        if self.max_rate <= 0:
-            return
-
         with self._lock:
+            if self.max_rate <= 0:
+                return
             current_time = time.perf_counter()
             time_since_last = current_time - self.last_operation_time
 

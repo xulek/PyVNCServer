@@ -40,6 +40,7 @@ from pyvncserver.config import DEFAULT_CONFIG_PATH, ServerSettings, load_config_
 from pyvncserver._version import __version__, SERVER_NAME
 from pyvncserver.platform.producer import CaptureProducer, FrameSnapshot
 from pyvncserver.runtime.security import AuthRateLimiter, PerIPConnectionLimiter
+from pyvncserver.runtime.adaptive import AdaptiveStreamConfig, EncodedRegionCache
 from pyvncserver.session_state import ClientSessionState
 from pyvncserver.session.loop import SessionLoopMixin
 from pyvncserver.session.runtime import SessionRuntimeMixin
@@ -171,6 +172,32 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         self.allow_client_resize = bool(self.config.get('allow_client_resize', False))
         self.tight_stream_reset_for_ultravnc = bool(
             self.config.get('tight_stream_reset_for_ultravnc', False)
+        )
+        self.enable_adaptive_streaming = bool(
+            self.config.get('adaptive_enabled', True)
+        )
+        self.adaptive_stream_config = AdaptiveStreamConfig(
+            enabled=self.enable_adaptive_streaming,
+            min_fps=max(1.0, float(self.config.get('adaptive_min_fps', 12.0))),
+            target_utilization=max(0.25, min(0.98, float(self.config.get('adaptive_target_utilization', 0.80)))),
+            decrease_factor=max(0.20, min(0.95, float(self.config.get('adaptive_decrease_factor', 0.80)))),
+            increase_step_fps=max(0.1, float(self.config.get('adaptive_increase_step_fps', 2.0))),
+            overload_ratio=max(1.0, float(self.config.get('adaptive_overload_ratio', 1.10))),
+            recovery_ratio=max(0.10, min(0.95, float(self.config.get('adaptive_recovery_ratio', 0.72)))),
+            overload_samples=max(1, int(self.config.get('adaptive_overload_samples', 2))),
+            recovery_samples=max(1, int(self.config.get('adaptive_recovery_samples', 8))),
+            ewma_alpha=max(0.01, min(1.0, float(self.config.get('adaptive_ewma_alpha', 0.20)))),
+            merge_regions=bool(self.config.get('adaptive_merge_regions', True)),
+            merge_gap_px=max(0, int(self.config.get('adaptive_merge_gap_px', 12))),
+            merge_max_expansion=max(1.0, float(self.config.get('adaptive_merge_max_expansion', 1.35))),
+            merge_force_count=max(2, int(self.config.get('adaptive_merge_force_count', 12))),
+            cache_enabled=bool(self.config.get('adaptive_cache_enabled', True)),
+            cache_max_entries=max(1, int(self.config.get('adaptive_cache_max_entries', 512))),
+            cache_max_bytes=max(1024, int(self.config.get('adaptive_cache_max_bytes', 32 * 1024 * 1024))),
+            cache_max_item_bytes=max(1, int(self.config.get('adaptive_cache_max_item_bytes', 1024 * 1024))),
+            cache_ttl_seconds=max(0.05, float(self.config.get('adaptive_cache_ttl_seconds', 2.0))),
+            reorder_encodings=bool(self.config.get('adaptive_reorder_encodings', True)),
+            adapt_tight_compression=bool(self.config.get('adaptive_adapt_tight_compression', True)),
         )
         if requested_cursor_encoding and not self.enable_cursor_encoding:
             self.logger.warning(
@@ -318,6 +345,16 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         )
         self.metrics = ServerMetrics.get_instance() if self.enable_metrics else None
         self.health_checker = HealthChecker(check_interval=30.0)
+        self.encoded_region_cache = (
+            EncodedRegionCache(
+                max_entries=self.adaptive_stream_config.cache_max_entries,
+                max_bytes=self.adaptive_stream_config.cache_max_bytes,
+                max_item_bytes=self.adaptive_stream_config.cache_max_item_bytes,
+                ttl_seconds=self.adaptive_stream_config.cache_ttl_seconds,
+            )
+            if self.enable_adaptive_streaming and self.adaptive_stream_config.cache_enabled
+            else None
+        )
 
         # One executor is shared across clients to avoid N-clients × N-workers
         # thread explosions. ParallelEncoder instances become lightweight views.
@@ -376,6 +413,13 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         self.logger.info(f"Features: region_detection={self.enable_region_detection}, "
                         f"cursor={self.enable_cursor_encoding}, metrics={self.enable_metrics}, "
                         f"websocket={self.enable_websocket}")
+        self.logger.info(
+            "Adaptive streaming: enabled=%s, min_fps=%.1f, region_merge=%s, cache=%s",
+            self.enable_adaptive_streaming,
+            self.adaptive_stream_config.min_fps,
+            self.adaptive_stream_config.merge_regions,
+            self.encoded_region_cache is not None,
+        )
         if not (self.password or self.read_only_password):
             self.logger.warning(
                 "Server is running without VNC authentication on loopback only. "
@@ -841,6 +885,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                     parallel_encoder = ParallelEncoder(
                         max_workers=self.encoding_workers,
                         executor=self.encoding_executor,
+                        encoded_region_cache=self.encoded_region_cache,
                     )
                     self.logger.info(
                         "Parallel encoding enabled with shared %d-worker executor",
@@ -960,6 +1005,9 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
             self.encoding_executor.shutdown(wait=False)
         self.screen_capture.close_current_thread_sessions()
 
+        if self.encoded_region_cache is not None:
+            self.encoded_region_cache.clear()
+
         if self.metrics:
             summary = self.metrics.format_summary()
             self.logger.info(f"Final metrics:\n{summary}")
@@ -969,6 +1017,9 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         active = self.connection_limiter.get_active_count()
         status = self.metrics.get_summary() if self.metrics else {}
         health = self.health_checker.last_status
+        if self.encoded_region_cache is not None:
+            status['encoded_region_cache'] = self.encoded_region_cache.stats
+        status['adaptive_streaming_enabled'] = self.enable_adaptive_streaming
         status.update({
             'version': __version__,
             'active_connections': active,

@@ -7,7 +7,7 @@ Provides 2-4x performance improvement on multi-core systems
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
-from typing import TypeAlias, Protocol
+from typing import Any, TypeAlias, Protocol
 from dataclasses import dataclass
 from queue import Queue, Empty
 import threading
@@ -75,7 +75,8 @@ class ParallelEncoder:
     """
 
     def __init__(self, max_workers: int = None, tile_size: int = 256,
-                 executor: ThreadPoolExecutor | None = None):
+                 executor: ThreadPoolExecutor | None = None,
+                 encoded_region_cache: Any = None):
         """
         Initialize parallel encoder
 
@@ -94,6 +95,7 @@ class ParallelEncoder:
 
         self.max_workers = max_workers
         self.tile_size = tile_size
+        self.encoded_region_cache = encoded_region_cache
 
         # Prefer a server-wide executor to avoid creating up to N workers per
         # connected client. Standalone callers still get an owned pool.
@@ -189,6 +191,30 @@ class ParallelEncoder:
         start_time = time.perf_counter()
 
         try:
+            cache = self.encoded_region_cache
+            cache_key = None
+            if cache is not None:
+                cache_key = cache.make_key(
+                    task.encoding_type,
+                    task.pixel_data,
+                    task.width,
+                    task.height,
+                    task.bytes_per_pixel,
+                    None,
+                )
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    return EncodingResult(
+                        region_id=task.region_id,
+                        x=task.x, y=task.y,
+                        width=task.width, height=task.height,
+                        encoding_type=task.encoding_type,
+                        encoded_data=cached,
+                        encoding_time=time.perf_counter() - start_time,
+                        original_size=len(task.pixel_data),
+                        compressed_size=len(cached),
+                    )
+
             # Encode the region
             encoded_data = task.encoder.encode(
                 task.pixel_data,
@@ -196,6 +222,8 @@ class ParallelEncoder:
                 task.height,
                 task.bytes_per_pixel
             )
+            if cache is not None:
+                cache.put(cache_key, encoded_data)
 
             encoding_time = time.perf_counter() - start_time
 
@@ -361,7 +389,8 @@ class AdaptiveParallelEncoder(ParallelEncoder):
     """
 
     def __init__(self, max_workers: int = None, tile_size: int = 256,
-                 executor: ThreadPoolExecutor | None = None):
+                 executor: ThreadPoolExecutor | None = None,
+                 encoded_region_cache: Any = None):
         super().__init__(max_workers, tile_size, executor=executor)
 
         # Adaptive parameters

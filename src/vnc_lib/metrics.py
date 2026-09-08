@@ -119,6 +119,18 @@ class ConnectionMetrics:
     key_events: int = 0
     pointer_events: int = 0
 
+    # Adaptive streaming telemetry
+    adaptive_target_fps: float = 0.0
+    adaptive_pressure: float = 0.0
+    adaptive_network_pressure: float = 0.0
+    adaptive_cpu_pressure: float = 0.0
+    adaptive_frame_time_ewma: float = 0.0
+    adaptive_send_time_ewma: float = 0.0
+    adaptive_processing_time_ewma: float = 0.0
+    adaptive_throughput_bps: float = 0.0
+    adaptive_compression_ratio: float = 1.0
+    adaptive_overloaded: bool = False
+
     # Errors
     error_count: int = 0
 
@@ -150,6 +162,19 @@ class ConnectionMetrics:
     def record_error(self):
         """Record error"""
         self.error_count += 1
+
+    def record_adaptive(self, snapshot) -> None:
+        """Record the latest per-client adaptive streaming decision."""
+        self.adaptive_target_fps = float(getattr(snapshot, 'target_fps', 0.0))
+        self.adaptive_pressure = float(getattr(snapshot, 'pressure', 0.0))
+        self.adaptive_network_pressure = float(getattr(snapshot, 'network_pressure', 0.0))
+        self.adaptive_cpu_pressure = float(getattr(snapshot, 'cpu_pressure', 0.0))
+        self.adaptive_frame_time_ewma = float(getattr(snapshot, 'frame_time_ewma', 0.0))
+        self.adaptive_send_time_ewma = float(getattr(snapshot, 'send_time_ewma', 0.0))
+        self.adaptive_processing_time_ewma = float(getattr(snapshot, 'processing_time_ewma', 0.0))
+        self.adaptive_throughput_bps = float(getattr(snapshot, 'throughput_bps_ewma', 0.0))
+        self.adaptive_compression_ratio = float(getattr(snapshot, 'compression_ratio_ewma', 1.0))
+        self.adaptive_overloaded = bool(getattr(snapshot, 'overloaded', False))
 
     @property
     def avg_encoding_time(self) -> float:
@@ -263,8 +288,24 @@ class ServerMetrics:
                 if time.time() - m.last_activity < 60  # Active in last minute
             ]
 
+            avg_adaptive_target_fps = 0.0
+            avg_adaptive_pressure = 0.0
+            overloaded_connections = 0
             if active_connections:
                 avg_fps = sum(m.fps for m in active_connections) / len(active_connections)
+                adaptive_connections = [
+                    m for m in active_connections if m.adaptive_target_fps > 0
+                ]
+                if adaptive_connections:
+                    avg_adaptive_target_fps = sum(
+                        m.adaptive_target_fps for m in adaptive_connections
+                    ) / len(adaptive_connections)
+                    avg_adaptive_pressure = sum(
+                        m.adaptive_pressure for m in adaptive_connections
+                    ) / len(adaptive_connections)
+                    overloaded_connections = sum(
+                        1 for m in adaptive_connections if m.adaptive_overloaded
+                    )
 
             return {
                 'uptime_seconds': self.uptime_seconds,
@@ -274,6 +315,9 @@ class ServerMetrics:
                 'total_frames_sent': total_frames,
                 'total_bytes_sent': total_bytes_sent,
                 'avg_fps': avg_fps,
+                'avg_adaptive_target_fps': avg_adaptive_target_fps,
+                'avg_adaptive_pressure': avg_adaptive_pressure,
+                'overloaded_connections': overloaded_connections,
             }
 
     def format_summary(self) -> str:
@@ -291,6 +335,9 @@ Server Metrics:
   Data sent: {mb_sent:.2f} MB
   Frames sent: {summary['total_frames_sent']}
   Avg FPS: {summary['avg_fps']:.1f}
+  Adaptive target FPS: {summary['avg_adaptive_target_fps']:.1f}
+  Adaptive pressure: {summary['avg_adaptive_pressure']:.2f}
+  Overloaded connections: {summary['overloaded_connections']}
         """.strip()
 
 

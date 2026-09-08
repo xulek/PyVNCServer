@@ -417,7 +417,7 @@ def _flatten_toml_settings(data: dict[str, Any]) -> dict[str, Any]:
         if isinstance(section, dict):
             flat.update(section)
 
-    for section_name in ("lan", "websocket"):
+    for section_name in ("lan", "websocket", "adaptive"):
         section = data.get(section_name, {})
         if not isinstance(section, dict):
             continue

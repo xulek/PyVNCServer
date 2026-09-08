@@ -53,3 +53,27 @@ def test_primary_and_read_only_passwords_must_differ():
 def test_auto_network_profile_is_normalized_to_none():
     settings = ServerSettings.from_mapping({"network_profile_override": "auto"})
     assert settings.network_profile_override is None
+
+
+def test_adaptive_section_is_flattened_into_runtime_keys(tmp_path: Path):
+    path = tmp_path / "adaptive.toml"
+    path.write_text(
+        """
+[server]
+host = "127.0.0.1"
+port = 5900
+
+[adaptive]
+enabled = true
+min_fps = 17
+cache_enabled = false
+merge_gap_px = 20
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config_file(path)
+    assert config["adaptive_enabled"] is True
+    assert config["adaptive_min_fps"] == 17
+    assert config["adaptive_cache_enabled"] is False
+    assert config["adaptive_merge_gap_px"] == 20

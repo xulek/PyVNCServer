@@ -80,6 +80,29 @@ jpeg_quality_min = 70
 jpeg_quality_max = 95
 zrle_compression_level = 3
 
+[adaptive]
+enabled = true
+min_fps = 12
+target_utilization = 0.80
+decrease_factor = 0.80
+increase_step_fps = 2.0
+overload_ratio = 1.10
+recovery_ratio = 0.72
+overload_samples = 2
+recovery_samples = 8
+ewma_alpha = 0.20
+merge_regions = true
+merge_gap_px = 12
+merge_max_expansion = 1.35
+merge_force_count = 12
+cache_enabled = true
+cache_max_entries = 512
+cache_max_bytes = 33554432
+cache_max_item_bytes = 1048576
+cache_ttl_seconds = 2.0
+reorder_encodings = true
+adapt_tight_compression = true
+
 [websocket]
 allowed_origins = []
 detect_timeout = 0.5

@@ -8,11 +8,11 @@ RFB 3.8 · UltraVNC interoperability · Tight / ZRLE / Hextile / Zlib · WebSock
 
 <p>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-3.5.0-6f42c1">
+  <img alt="Version" src="https://img.shields.io/badge/version-3.6.0-6f42c1">
   <img alt="RFB" src="https://img.shields.io/badge/RFB-3.8-1f6feb">
   <img alt="UltraVNC" src="https://img.shields.io/badge/UltraVNC-tested-2ea44f">
   <img alt="WebSocket" src="https://img.shields.io/badge/WebSocket-noVNC-ff9800">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-370%20passed-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-389%20passed-2ea44f">
   <a href="https://xulek.github.io/PyVNCServer/"><img alt="Documentation" src="https://img.shields.io/badge/docs-GitHub%20Pages-0ea5e9?logo=materialformkdocs&logoColor=white"></a>
 </p>
 
@@ -35,6 +35,7 @@ Highlights:
 - Multiple framebuffer encoding paths: **Raw, CopyRect, RRE, Hextile, Zlib, Tight and ZRLE**.
 - Optional **JPEG** and **H.264** extension paths.
 - **Adaptive encoding selection** based on client capabilities, changed regions and network profile.
+- **Per-client adaptive streaming** with dynamic FPS, CPU/network pressure detection, bottleneck-aware encoding order and safe Tight/JPEG tuning.
 - One **shared capture producer** for multiple clients instead of independently capturing the desktop per connection.
 - Windows-oriented fast capture through **DXCam/DXGI** when available, with native dirty/move metadata and **MSS** / **Pillow** fallbacks.
 - **WebSocket transport** suitable for binary noVNC connections.
@@ -429,6 +430,15 @@ enable_last_rect = false
 enable_extended_desktop_size = true
 allow_client_resize = false
 
+[adaptive]
+enabled = true
+min_fps = 12
+target_utilization = 0.80
+merge_regions = true
+cache_enabled = true
+reorder_encodings = true
+adapt_tight_compression = true
+
 [limits]
 encoding_threads = 0
 max_set_encodings = 1024
@@ -479,6 +489,7 @@ src/pyvncserver/
 ├── platform/
 │   └── producer.py            shared framebuffer producer
 ├── runtime/
+│   ├── adaptive.py            per-client congestion control + encoded-region cache
 │   ├── security.py            per-IP limits and auth throttling
 │   ├── connection_limiter.py
 │   └── connection_registry.py
@@ -505,10 +516,15 @@ The server contains several latency and throughput optimizations:
 - dirty-region detection,
 - request coalescing,
 - network-profile-aware encoding selection,
+- per-client adaptive FPS/backpressure,
+- CPU-vs-network bottleneck detection,
+- pressure-aware dirty-region merging,
+- bottleneck-aware encoding reordering,
+- shared TTL/LRU encoded-region cache for stateless encodings,
 - parallel region encoding,
 - bounded RRE tiling,
 - configurable Zlib/ZRLE compression levels,
-- adaptive JPEG thresholds and quality,
+- adaptive JPEG quality and safe Tight compression tuning,
 - capture backend probing/fallback,
 - LAN-specific frame-rate tuning.
 
@@ -525,10 +541,10 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-Current 3.5.0 verification result:
+Current 3.6.0 verification result:
 
 ```text
-370 passed, 13 skipped
+389 passed, 13 skipped
 ```
 
 The skipped cases in the recorded verification environment are legacy/auth compatibility cases and do not affect Tight/RRE tests.
@@ -566,7 +582,7 @@ python -m pytest -q
 python -m compileall -q src tests
 ```
 
-The v3.5 package additionally includes real TLS socket tests for VeNCrypt X509/TLS subtypes and an end-to-end `VNCServerV3 → VeNCrypt → TLS → SecurityResult → ServerInit → framebuffer` test.
+The v3.6 package retains the real VeNCrypt/TLS end-to-end coverage and additionally tests adaptive pacing, CPU/network pressure classification, encoding reordering, Tight/JPEG tuning, region merging, shared cache safety and cache reuse across sequential and parallel encoder paths.
 
 ---
 
@@ -641,6 +657,6 @@ python -m twine check dist/*
 
 <div align="center">
 
-**PyVNCServer 3.5.0** · Python 3.11+ · RFB 3.8 · [Documentation](https://xulek.github.io/PyVNCServer/)
+**PyVNCServer 3.6.0** · Python 3.11+ · RFB 3.8 · [Documentation](https://xulek.github.io/PyVNCServer/)
 
 </div>

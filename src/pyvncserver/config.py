@@ -207,6 +207,25 @@ class ServerSettings:
             raise ConfigurationError(
                 "server.input_control_policy must be 'single-controller' or 'shared'"
             )
+
+        performance_profile = str(
+            self.extra.get("performance_profile", "low-latency")
+        ).strip().lower()
+        if performance_profile not in {"low-latency", "balanced", "throughput"}:
+            raise ConfigurationError(
+                "performance.profile must be low-latency, balanced, or throughput"
+            )
+        for key, minimum in (
+            ("performance_capture_producer_fps", 1),
+            ("performance_socket_send_buffer_bytes", 16384),
+            ("performance_socket_receive_buffer_bytes", 16384),
+            ("performance_framebuffer_send_coalesce_bytes", 4096),
+            ("performance_producer_conversion_cache_entries", 1),
+            ("performance_producer_conversion_cache_max_bytes", 1024 * 1024),
+        ):
+            value = self.extra.get(key)
+            if value is not None and int(value) < minimum:
+                raise ConfigurationError(f"{key.replace('_', '.')} must be >= {minimum}")
         if self.network_profile_override not in {None, "localhost", "lan", "wan"}:
             raise ConfigurationError(
                 "server.network_profile_override must be auto, localhost, lan, or wan"
@@ -457,7 +476,7 @@ def _flatten_toml_settings(data: dict[str, Any]) -> dict[str, Any]:
         if isinstance(section, dict):
             flat.update(section)
 
-    for section_name in ("lan", "websocket", "adaptive", "clipboard", "observability"):
+    for section_name in ("lan", "websocket", "adaptive", "clipboard", "observability", "performance"):
         section = data.get(section_name, {})
         if not isinstance(section, dict):
             continue

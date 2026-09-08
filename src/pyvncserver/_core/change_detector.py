@@ -265,6 +265,12 @@ class AdaptiveChangeDetector:
         self.change_history: list[float] = []  # % of screen changed
         self.max_history = 10
 
+        # Keep one exact previous framebuffer reference. bytes equality is a
+        # C-level memcmp and is dramatically cheaper than walking every tile
+        # when the desktop did not change. This is correctness-preserving: it
+        # is an exact full-frame comparison, not sparse sampling.
+        self._previous_frame: bytes | None = None
+
         self.logger = logging.getLogger(__name__)
 
     def detect_changes(self, pixel_data: bytes,
@@ -279,12 +285,21 @@ class AdaptiveChangeDetector:
         Returns:
             List of changed regions, or None if full update needed
         """
-        # Always evaluate tile checksums. A previous implementation sampled
-        # every 4096th byte and returned early when the sample matched; that
-        # could permanently miss small screen changes.
+        # Exact idle-frame fast path. Retaining a reference to the previous
+        # immutable bytes object costs one framebuffer of memory but avoids the
+        # Python-level tile walk for the common unchanged-frame case.
+        previous = self._previous_frame
+        if previous is not None and len(previous) == len(pixel_data) and previous == pixel_data:
+            self.change_history.append(0.0)
+            if len(self.change_history) > self.max_history:
+                self.change_history.pop(0)
+            return []
+
+        # Always evaluate tile checksums for changed frames.
         changed_regions = self.tile_grid.update_and_get_changed(
             pixel_data, bytes_per_pixel
         )
+        self._previous_frame = pixel_data if isinstance(pixel_data, bytes) else bytes(pixel_data)
 
         # Calculate change percentage
         changed_area = sum(r.area() for r in changed_regions)
@@ -309,13 +324,11 @@ class AdaptiveChangeDetector:
         self.width = width
         self.height = height
         self.tile_grid.resize(width, height)
-        self._prev_sample = None
-        self._prev_length = 0
+        self._previous_frame = None
         self.change_history.clear()
 
     def reset(self):
         """Reset change detection state"""
         self.tile_grid.reset()
-        self._prev_sample = None
-        self._prev_length = 0
+        self._previous_frame = None
         self.change_history.clear()

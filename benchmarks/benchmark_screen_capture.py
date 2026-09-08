@@ -118,20 +118,20 @@ def main():
         return
 
     if dxcam_available:
-        from vnc_lib.screen_capture import ScreenCapture
+        from pyvncserver.capture import ScreenCapture
         capture = ScreenCapture(backend_preference="dxcam")
         benchmark_capture("dxcam backend", capture, "BGR0/native", bgr0_format, iterations=20)
         benchmark_capture("dxcam backend", capture, "RGB0", rgb0_format, iterations=20)
 
     # Run benchmark with mss (if available)
     if mss_available:
-        from vnc_lib.screen_capture import ScreenCapture
+        from pyvncserver.capture import ScreenCapture
         capture = ScreenCapture(backend_preference="mss")
         benchmark_capture("mss backend", capture, "BGR0/native", bgr0_format, iterations=20)
         benchmark_capture("mss backend", capture, "RGB0", rgb0_format, iterations=20)
 
     if pil_available:
-        from vnc_lib.screen_capture import ScreenCapture
+        from pyvncserver.capture import ScreenCapture
         capture = ScreenCapture(backend_preference="pil")
         benchmark_capture("PIL backend", capture, "RGB0", rgb0_format, iterations=20)
 
@@ -148,3 +148,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

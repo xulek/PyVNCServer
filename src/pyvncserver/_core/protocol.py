@@ -133,7 +133,8 @@ class RFBProtocol:
 
     def __init__(self, max_set_encodings: int | None = None,
                  max_client_cut_text: int | None = None,
-                 clipboard_encoding: str = "latin-1"):
+                 clipboard_encoding: str = "latin-1",
+                 framebuffer_send_coalesce_bytes: int = 1_048_576):
         self.version = (3, 8)  # Default to highest supported version
         self.logger = logging.getLogger(__name__)
         self.max_set_encodings = (
@@ -147,6 +148,7 @@ class RFBProtocol:
             else self.DEFAULT_MAX_CLIENT_CUT_TEXT
         )
         self.clipboard_encoding = clipboard_encoding
+        self.framebuffer_send_coalesce_bytes = max(4096, int(framebuffer_send_coalesce_bytes))
         self.use_last_rect = False
 
     def negotiate_version(self, client_socket) -> Tuple[int, int]:
@@ -712,7 +714,7 @@ class RFBProtocol:
         This keeps framing valid even when future streaming paths build a
         variable number of rectangles.
         """
-        wire_rectangles = list(rectangles)
+        wire_rectangles = list(rectangles) if self.use_last_rect else rectangles
         if self.use_last_rect:
             rectangle_count = 0xFFFF
             wire_rectangles.append(
@@ -736,7 +738,7 @@ class RFBProtocol:
             + total_data_size
         )
 
-        if total_size <= 1_048_576:
+        if total_size <= self.framebuffer_send_coalesce_bytes:
             parts = [header]
             for x, y, width, height, encoding, data in wire_rectangles:
                 parts.append(struct.pack(">HHHHi", x, y, width, height, encoding))
@@ -765,14 +767,7 @@ class RFBProtocol:
         client_socket.sendall(msg)
 
     def _send_large_data(self, sock, data: bytes, chunk_size: int = 1048576):
-        """Send large data in chunks using memoryview to avoid copies"""
-        view = memoryview(data)
-        total_sent = 0
-        data_len = len(data)
-
-        while total_sent < data_len:
-            end = min(total_sent + chunk_size, data_len)
-            sent = sock.send(view[total_sent:end])
-            if sent == 0:
-                raise ConnectionError("Socket connection broken during send")
-            total_sent += sent
+        """Send a large buffer without a Python-level chunk loop or payload copy."""
+        if not data:
+            return
+        sock.sendall(memoryview(data))

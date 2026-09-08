@@ -110,7 +110,7 @@ def test_cache_key_separates_jpeg_quality_variants():
 
 def test_cache_ttl_expires_entries():
     cache = EncodedRegionCache(ttl_seconds=0.05)
-    key = cache.make_key(0, b"1234", 1, 1, 4, None)
+    key = cache.make_key(5, b"1234", 1, 1, 4, None)
     cache.put(key, b"1234")
     assert cache.get(key) == b"1234"
     time.sleep(0.06)

@@ -131,6 +131,12 @@ class ConnectionMetrics:
     adaptive_compression_ratio: float = 1.0
     adaptive_overloaded: bool = False
 
+    # v4.1 low-latency telemetry. producer_to_wire_ms measures from the
+    # producer publishing a complete captured frame until sendall returns.
+    producer_to_wire_ms: deque[float] = field(default_factory=lambda: deque(maxlen=256))
+    socket_send_ms: deque[float] = field(default_factory=lambda: deque(maxlen=256))
+    stale_frames_dropped: int = 0
+
     # Errors
     error_count: int = 0
 
@@ -175,6 +181,35 @@ class ConnectionMetrics:
         self.adaptive_throughput_bps = float(getattr(snapshot, 'throughput_bps_ewma', 0.0))
         self.adaptive_compression_ratio = float(getattr(snapshot, 'compression_ratio_ewma', 1.0))
         self.adaptive_overloaded = bool(getattr(snapshot, 'overloaded', False))
+
+    def record_latency(self, producer_to_wire_seconds: float, send_seconds: float) -> None:
+        if producer_to_wire_seconds >= 0:
+            self.producer_to_wire_ms.append(float(producer_to_wire_seconds) * 1000.0)
+        if send_seconds >= 0:
+            self.socket_send_ms.append(float(send_seconds) * 1000.0)
+
+    def record_stale_frame_drop(self) -> None:
+        self.stale_frames_dropped += 1
+
+    @staticmethod
+    def _percentile(values: deque[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = int(round((len(ordered) - 1) * max(0.0, min(1.0, percentile))))
+        return float(ordered[index])
+
+    @property
+    def producer_to_wire_p50_ms(self) -> float:
+        return self._percentile(self.producer_to_wire_ms, 0.50)
+
+    @property
+    def producer_to_wire_p95_ms(self) -> float:
+        return self._percentile(self.producer_to_wire_ms, 0.95)
+
+    @property
+    def producer_to_wire_p99_ms(self) -> float:
+        return self._percentile(self.producer_to_wire_ms, 0.99)
 
     @property
     def avg_encoding_time(self) -> float:
@@ -318,6 +353,21 @@ class ServerMetrics:
                 'avg_adaptive_target_fps': avg_adaptive_target_fps,
                 'avg_adaptive_pressure': avg_adaptive_pressure,
                 'overloaded_connections': overloaded_connections,
+                'producer_to_wire_p50_ms': (
+                    sum(m.producer_to_wire_p50_ms for m in active_connections) / len(active_connections)
+                    if active_connections else 0.0
+                ),
+                'producer_to_wire_p95_ms': (
+                    sum(m.producer_to_wire_p95_ms for m in active_connections) / len(active_connections)
+                    if active_connections else 0.0
+                ),
+                'producer_to_wire_p99_ms': (
+                    sum(m.producer_to_wire_p99_ms for m in active_connections) / len(active_connections)
+                    if active_connections else 0.0
+                ),
+                'stale_frames_dropped': sum(
+                    m.stale_frames_dropped for m in self.connections.values()
+                ),
             }
 
     def format_summary(self) -> str:

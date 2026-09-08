@@ -290,3 +290,4 @@ if __name__ == "__main__":
     iterations = int(sys.argv[3]) if len(sys.argv) > 3 else 50
 
     run_benchmark(host, port, iterations)
+

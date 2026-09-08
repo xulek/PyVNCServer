@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 import logging
 import threading
@@ -31,6 +31,7 @@ NATIVE_BGR0 = {
 class FrameSnapshot:
     generation: int
     frame: CaptureFrame
+    published_at: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +55,8 @@ class CaptureProducer:
     """
 
     def __init__(self, capture: ScreenCapture, fps: float = 90.0,
-                 history_size: int = 256) -> None:
+                 history_size: int = 256, conversion_cache_entries: int = 4,
+                 conversion_cache_max_bytes: int = 64 * 1024 * 1024) -> None:
         self.capture = capture
         self.fps = max(1.0, float(fps))
         self.logger = logging.getLogger(__name__)
@@ -67,6 +69,13 @@ class CaptureProducer:
         self._history: deque[_HistoryEntry] = deque(maxlen=max(8, int(history_size)))
         self._change_detector: AdaptiveChangeDetector | None = None
         self._detector_size: tuple[int, int] | None = None
+        self._conversion_lock = threading.Lock()
+        self._conversion_cache: OrderedDict[tuple[int, tuple[int, ...]], CaptureResult] = OrderedDict()
+        self._conversion_cache_bytes = 0
+        self._conversion_cache_entries = max(1, int(conversion_cache_entries))
+        self._conversion_cache_max_bytes = max(1024, int(conversion_cache_max_bytes))
+        self._conversion_cache_hits = 0
+        self._conversion_cache_misses = 0
         self.capture.set_cache_frame_rate(self.fps)
 
     def start(self) -> None:
@@ -97,7 +106,9 @@ class CaptureProducer:
                     with self._lock:
                         self._generation += 1
                         frame = self._with_shared_dirty_metadata(frame)
-                        self._snapshot = FrameSnapshot(self._generation, frame)
+                        self._snapshot = FrameSnapshot(
+                            self._generation, frame, time.perf_counter()
+                        )
                         self._append_history(self._generation, frame)
                         self._lock.notify_all()
 
@@ -172,6 +183,7 @@ class CaptureProducer:
                 snapshot = FrameSnapshot(
                     snapshot.generation,
                     CaptureFrame(result=snapshot.frame.result, metadata=metadata),
+                    snapshot.published_at,
                 )
 
         if snapshot is None:
@@ -193,30 +205,81 @@ class CaptureProducer:
                             supports_move_rects=False,
                         ),
                     )
-            snapshot = FrameSnapshot(generation, frame)
+            snapshot = FrameSnapshot(generation, frame, time.perf_counter())
 
         native_result = snapshot.frame.result
         if native_result.pixel_data is None or _is_native_bgr0(pixel_format):
             return snapshot
 
-        started = time.perf_counter()
-        converted = self.capture.convert_native_bgr0(
-            native_result.pixel_data,
-            native_result.width,
-            native_result.height,
-            pixel_format,
-        )
-        result = CaptureResult(
-            converted,
-            None,
-            native_result.width,
-            native_result.height,
-            native_result.capture_time + (time.perf_counter() - started),
-        )
+        cache_key = (snapshot.generation, _pixel_format_cache_key(pixel_format))
+        with self._conversion_lock:
+            cached = self._conversion_cache.get(cache_key)
+            if cached is not None:
+                self._conversion_cache_hits += 1
+                self._conversion_cache.move_to_end(cache_key)
+                result = cached
+            else:
+                self._conversion_cache_misses += 1
+                started = time.perf_counter()
+                converted = self.capture.convert_native_bgr0(
+                    native_result.pixel_data,
+                    native_result.width,
+                    native_result.height,
+                    pixel_format,
+                )
+                result = CaptureResult(
+                    converted,
+                    None,
+                    native_result.width,
+                    native_result.height,
+                    native_result.capture_time + (time.perf_counter() - started),
+                )
+                self._conversion_cache[cache_key] = result
+                self._conversion_cache_bytes += len(converted)
+                self._prune_conversion_cache_locked(snapshot.generation)
+
         return FrameSnapshot(
             snapshot.generation,
             CaptureFrame(result=result, metadata=snapshot.frame.metadata),
+            snapshot.published_at,
         )
+
+    @property
+    def latest_generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    @property
+    def stats(self) -> dict[str, int | float]:
+        with self._conversion_lock:
+            total = self._conversion_cache_hits + self._conversion_cache_misses
+            return {
+                "fps": self.fps,
+                "generation": self._generation,
+                "conversion_cache_entries": len(self._conversion_cache),
+                "conversion_cache_bytes": self._conversion_cache_bytes,
+                "conversion_cache_hits": self._conversion_cache_hits,
+                "conversion_cache_misses": self._conversion_cache_misses,
+                "conversion_cache_hit_rate": (
+                    self._conversion_cache_hits / total if total else 0.0
+                ),
+            }
+
+    def _prune_conversion_cache_locked(self, current_generation: int) -> None:
+        # Converted full frames are only useful for the currently published
+        # generation. Remove old generations first, then enforce memory caps.
+        stale = [key for key in self._conversion_cache if key[0] != current_generation]
+        for key in stale:
+            result = self._conversion_cache.pop(key)
+            if result.pixel_data is not None:
+                self._conversion_cache_bytes -= len(result.pixel_data)
+        while (
+            len(self._conversion_cache) > self._conversion_cache_entries
+            or self._conversion_cache_bytes > self._conversion_cache_max_bytes
+        ):
+            _, result = self._conversion_cache.popitem(last=False)
+            if result.pixel_data is not None:
+                self._conversion_cache_bytes -= len(result.pixel_data)
 
     def _metadata_since(self, snapshot: FrameSnapshot,
                         since_generation: int | None) -> CaptureMetadata:
@@ -297,6 +360,14 @@ def _coalesce_dirty_regions(regions: list[tuple[int, int, int, int]],
     right = max(x + w for x, _, w, _ in unique)
     bottom = max(y + h for _, y, _, h in unique)
     return [(left, top, min(width, right) - max(0, left), min(height, bottom) - max(0, top))]
+
+
+def _pixel_format_cache_key(pixel_format: dict) -> tuple[int, ...]:
+    fields = (
+        "bits_per_pixel", "depth", "big_endian_flag", "true_colour_flag",
+        "red_max", "green_max", "blue_max", "red_shift", "green_shift", "blue_shift",
+    )
+    return tuple(int(pixel_format.get(field, 0) or 0) for field in fields)
 
 
 def _is_native_bgr0(pixel_format: dict) -> bool:

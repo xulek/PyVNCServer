@@ -393,9 +393,16 @@ class PerformanceThrottler:
         self._lock = threading.Lock()
 
     def set_max_rate(self, max_rate: float) -> None:
-        """Update the rate limit without replacing the throttler instance."""
+        """Update the rate limit only when the adaptive controller changed it."""
+        normalized = max(0.0, float(max_rate))
+        # Hot path: adaptive streaming calls this every frame while the target
+        # FPS changes only occasionally. Avoid a lock/recompute on stable frames.
+        if normalized == self.max_rate:
+            return
         with self._lock:
-            self.max_rate = max(0.0, float(max_rate))
+            if normalized == self.max_rate:
+                return
+            self.max_rate = normalized
             self.min_interval = 1.0 / self.max_rate if self.max_rate > 0 else 0.0
 
     def throttle(self):

@@ -11,8 +11,8 @@ from __future__ import annotations
 import statistics
 import time
 
-from vnc_lib.encodings import RawEncoder, ZRLEEncoder, ZlibEncoder
-from vnc_lib.tight_encoding import TightEncoder
+from pyvncserver.encodings import RawEncoder, ZRLEEncoder, ZlibEncoder
+from pyvncserver.rfb.encodings.tight import TightEncoder
 
 
 NATIVE_BGR0 = {
@@ -125,3 +125,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

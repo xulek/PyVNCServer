@@ -239,8 +239,12 @@ class AdaptiveStreamController:
         ):
             return normalized
 
-        # Under pressure we tolerate a larger merged bounding box to reduce
-        # encoder scheduling and per-rectangle protocol overhead.
+        # v4.1 latency path: the old implementation repeatedly searched every
+        # possible pair for the globally cheapest merge, making the worst case
+        # roughly O(n^3). DXGI/software damage can easily contain dozens of
+        # rectangles, turning region preparation itself into a multi-ms stall.
+        # A bounded greedy compaction gives effectively O(n^2) behavior while
+        # preserving the same expansion/gap safety constraints.
         pressure = max(0.0, self.pressure)
         expansion_limit = float(self.config.merge_max_expansion)
         if pressure >= 1.5:
@@ -252,37 +256,40 @@ class AdaptiveStreamController:
         if pressure >= 1.25:
             gap = max(gap, int(gap * 1.75))
 
-        regions_out = list(normalized)
-        changed = True
-        while changed and len(regions_out) > 1:
-            changed = False
-            best_pair: tuple[int, int, Rectangle] | None = None
-            best_cost = float("inf")
-            force = len(regions_out) >= max(2, int(self.config.merge_force_count))
-            for i in range(len(regions_out)):
-                for j in range(i + 1, len(regions_out)):
-                    a = regions_out[i]
-                    b = regions_out[j]
-                    nearby = _near_or_overlapping(a, b, gap)
-                    if not nearby and not force:
-                        continue
-                    union = _union_rect(a, b)
-                    area_sum = _rect_area(a) + _rect_area(b)
-                    expansion = _rect_area(union) / max(1, area_sum)
-                    allowed_expansion = expansion_limit * (1.75 if force else 1.0)
-                    if expansion > allowed_expansion:
-                        continue
-                    # Prefer the cheapest expansion; when forced, this also
-                    # picks the least harmful pair to reduce rectangle count.
-                    if expansion < best_cost:
-                        best_cost = expansion
-                        best_pair = (i, j, union)
-            if best_pair is not None:
-                i, j, union = best_pair
-                regions_out[i] = union
-                del regions_out[j]
-                changed = True
+        force = len(normalized) >= max(2, int(self.config.merge_force_count))
+        allowed_expansion = expansion_limit * (1.75 if force else 1.0)
 
+        def compact(items: list[Rectangle]) -> tuple[list[Rectangle], bool]:
+            out: list[Rectangle] = []
+            merged_any = False
+            for current in items:
+                best_index: int | None = None
+                best_union: Rectangle | None = None
+                best_cost = float("inf")
+                for index, existing in enumerate(out):
+                    if not _near_or_overlapping(current, existing, gap) and not force:
+                        continue
+                    union = _union_rect(current, existing)
+                    area_sum = _rect_area(current) + _rect_area(existing)
+                    expansion = _rect_area(union) / max(1, area_sum)
+                    if expansion <= allowed_expansion and expansion < best_cost:
+                        best_index = index
+                        best_union = union
+                        best_cost = expansion
+                if best_index is None or best_union is None:
+                    out.append(current)
+                else:
+                    out[best_index] = best_union
+                    merged_any = True
+            return out, merged_any
+
+        # Sorting keeps nearby desktop damage near each other in the greedy pass.
+        regions_out = sorted(normalized, key=lambda rect: (rect[1], rect[0], rect[2], rect[3]))
+        regions_out, changed = compact(regions_out)
+        # One extra pass captures simple transitive merges without reintroducing
+        # the unbounded cubic loop.
+        if changed and len(regions_out) > 1:
+            regions_out, _ = compact(regions_out)
         return regions_out
 
     def _retune_rate(self) -> None:
@@ -340,9 +347,11 @@ class EncodedRegionCache:
 
     Stateful wire formats (CopyRect, Zlib, Tight, ZRLE, H.264) must never use
     this cache because their payload can depend on per-client stream history.
+    Raw is deliberately excluded in v4.1: RawEncoder is essentially zero-cost,
+    while hashing a large pixel buffer for a cache key adds measurable latency.
     """
 
-    CACHEABLE_ENCODINGS = frozenset({0, 2, 5, 21})
+    CACHEABLE_ENCODINGS = frozenset({2, 5, 21})
 
     def __init__(
         self,

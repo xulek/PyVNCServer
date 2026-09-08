@@ -1,5 +1,6 @@
 """Session/runtime helpers separated from server lifecycle orchestration."""
 
+import select
 import socket
 import struct
 import time
@@ -90,6 +91,32 @@ class SessionRuntimeMixin:
     def _is_parallel_safe_encoding(self, encoding_type: int) -> bool:
         """Allow parallel encoding only for stateless encoder implementations."""
         return encoding_type in {0, 2, 5}
+
+    def _effective_encoded_region_cache(self):
+        """Return the shared encoded cache only when it can reduce real work.
+
+        In the v4.1 low-latency profile a single authenticated viewer has almost
+        no opportunity to reuse encoded rectangles: unchanged frames are already
+        filtered before encoding, while hashing a large dirty rectangle can cost
+        milliseconds.  Enable the shared cache again automatically as soon as a
+        second authenticated client appears.
+        """
+        cache = getattr(self, 'encoded_region_cache', None)
+        if cache is None:
+            return None
+        if getattr(self, 'performance_profile', 'balanced') != 'low-latency':
+            return cache
+
+        registry = getattr(self, '_authenticated_client_sockets', None)
+        if registry is None:
+            return cache
+        lock = getattr(self, '_client_registry_lock', None)
+        if lock is None:
+            client_count = len(registry)
+        else:
+            with lock:
+                client_count = len(registry)
+        return cache if client_count > 1 else None
 
     def _reset_stateful_encoders(self, encoder_manager: EncoderManager) -> None:
         """Reset encoder state that depends on the client's framebuffer contents."""
@@ -204,12 +231,27 @@ class SessionRuntimeMixin:
             return b''
 
         row_size = width * bytes_per_pixel
+        source = memoryview(pixel_data)
+
+        # Full-width crops are contiguous in framebuffer memory: one C-level
+        # copy is substantially cheaper than one Python slice per row.
+        if x == 0 and width == fb_width:
+            start = y * fb_width * bytes_per_pixel
+            end = start + height * row_size
+            return source[start:end].tobytes()
+
+        if height == 1:
+            start = (y * fb_width + x) * bytes_per_pixel
+            return source[start:start + row_size].tobytes()
+
         result = bytearray(height * row_size)
+        destination = memoryview(result)
         dst_offset = 0
+        stride = fb_width * bytes_per_pixel
 
         for row in range(height):
-            src_offset = ((y + row) * fb_width + x) * bytes_per_pixel
-            result[dst_offset:dst_offset + row_size] = pixel_data[src_offset:src_offset + row_size]
+            src_offset = (y + row) * stride + x * bytes_per_pixel
+            destination[dst_offset:dst_offset + row_size] = source[src_offset:src_offset + row_size]
             dst_offset += row_size
 
         return bytes(result)
@@ -615,7 +657,7 @@ class SessionRuntimeMixin:
                 continue
 
             encoder = encoders[enc_type]
-            cache = getattr(self, 'encoded_region_cache', None)
+            cache = self._effective_encoded_region_cache()
             cache_key = None
             if cache is not None:
                 cache_key = cache.make_key(
@@ -656,7 +698,7 @@ class SessionRuntimeMixin:
             return enc_type, encoder, encoded_data
 
         raw_encoder = encoders[0]
-        cache = getattr(self, 'encoded_region_cache', None)
+        cache = self._effective_encoded_region_cache()
         cache_key = None
         if cache is not None:
             cache_key = cache.make_key(
@@ -693,101 +735,108 @@ class SessionRuntimeMixin:
 
         return max(self.lan_jpeg_quality_min, min(self.lan_jpeg_quality_max, next_quality))
 
+    def _socket_readable_now(self, client_socket) -> bool:
+        """Best-effort zero-time socket readiness check without timeout mutation."""
+        if not isinstance(client_socket, socket.socket):
+            return False
+        try:
+            if hasattr(client_socket, "pending") and client_socket.pending() > 0:
+                return True
+            readable, _, _ = select.select([client_socket], [], [], 0.0)
+            return bool(readable)
+        except (OSError, ValueError):
+            return False
+
     def _coalesce_framebuffer_update_requests(self, client_socket,
                                               protocol: RFBProtocol,
                                               first_request: dict) -> dict:
-        """
-        Coalesce queued FramebufferUpdateRequest messages and keep only newest.
-        """
+        """Coalesce queued FramebufferUpdateRequest messages without settimeout syscalls."""
         latest = first_request
-        if not hasattr(client_socket, 'recv'):
+        if not isinstance(client_socket, socket.socket):
+            original_timeout = None
+            try:
+                original_timeout = client_socket.gettimeout()
+                client_socket.settimeout(0.0)
+                while True:
+                    try:
+                        peek = client_socket.recv(10, socket.MSG_PEEK)
+                    except (BlockingIOError, InterruptedError, socket.timeout, OSError):
+                        break
+                    if len(peek) < 10 or peek[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
+                        break
+                    msg_type_data = recv_exact(client_socket, 1)
+                    if not msg_type_data or msg_type_data[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
+                        break
+                    latest = protocol.parse_framebuffer_update_request(client_socket)
+            except Exception:
+                pass
+            finally:
+                if original_timeout is not None:
+                    try:
+                        client_socket.settimeout(original_timeout)
+                    except Exception:
+                        pass
             return latest
 
-        original_timeout = None
-        try:
-            original_timeout = client_socket.gettimeout()
-            client_socket.settimeout(0.0)
-
-            while True:
-                try:
-                    # FramebufferUpdateRequest is 1-byte type + 9-byte payload.
-                    peek = client_socket.recv(10, socket.MSG_PEEK)
-                except (BlockingIOError, InterruptedError, socket.timeout):
-                    break
-                except OSError:
-                    break
-
-                if len(peek) < 10 or peek[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
-                    break
-
-                msg_type_data = recv_exact(client_socket, 1)
-                if (
-                    not msg_type_data
-                    or msg_type_data[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST
-                ):
-                    break
-
-                latest = protocol.parse_framebuffer_update_request(client_socket)
-        except Exception:
-            # Best-effort optimization; fall back to first request.
-            pass
-        finally:
-            if original_timeout is not None:
-                try:
-                    client_socket.settimeout(original_timeout)
-                except Exception:
-                    pass
-
+        while self._socket_readable_now(client_socket):
+            try:
+                peek = client_socket.recv(10, socket.MSG_PEEK)
+            except (BlockingIOError, InterruptedError, socket.timeout, OSError):
+                break
+            if len(peek) < 10 or peek[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
+                break
+            msg_type_data = recv_exact(client_socket, 1)
+            if not msg_type_data or msg_type_data[0] != protocol.MSG_FRAMEBUFFER_UPDATE_REQUEST:
+                break
+            latest = protocol.parse_framebuffer_update_request(client_socket)
         return latest
 
     def _coalesce_pointer_events(self, client_socket,
                                  protocol: RFBProtocol,
                                  first_event: dict) -> dict:
-        """
-        Coalesce a burst of PointerEvent messages and keep only the newest one.
-
-        This prevents cursor "catch-up" behavior when the socket queue contains
-        many stale pointer positions.
-        """
+        """Coalesce pointer bursts while preserving button transitions."""
         latest = first_event
-        if not hasattr(client_socket, 'recv'):
+        if not isinstance(client_socket, socket.socket):
+            original_timeout = None
+            try:
+                original_timeout = client_socket.gettimeout()
+                client_socket.settimeout(0.0)
+                while True:
+                    try:
+                        peek = client_socket.recv(6, socket.MSG_PEEK)
+                    except (BlockingIOError, InterruptedError, socket.timeout, OSError):
+                        break
+                    if len(peek) < 6 or peek[0] != protocol.MSG_POINTER_EVENT:
+                        break
+                    if peek[1] != latest.get('button_mask', peek[1]):
+                        break
+                    msg_type_data = recv_exact(client_socket, 1)
+                    if not msg_type_data or msg_type_data[0] != protocol.MSG_POINTER_EVENT:
+                        break
+                    latest = protocol.parse_pointer_event(client_socket)
+            except Exception:
+                pass
+            finally:
+                if original_timeout is not None:
+                    try:
+                        client_socket.settimeout(original_timeout)
+                    except Exception:
+                        pass
             return latest
 
-        original_timeout = None
-        try:
-            original_timeout = client_socket.gettimeout()
-            client_socket.settimeout(0.0)
-
-            while True:
-                try:
-                    # PointerEvent message is 1-byte type + 5-byte payload.
-                    peek = client_socket.recv(6, socket.MSG_PEEK)
-                except (BlockingIOError, InterruptedError, socket.timeout):
-                    break
-                except OSError:
-                    break
-
-                if len(peek) < 6 or peek[0] != protocol.MSG_POINTER_EVENT:
-                    break
-                if peek[1] != latest.get('button_mask', peek[1]):
-                    # Preserve button transitions (press/release) as separate events.
-                    break
-
-                msg_type_data = recv_exact(client_socket, 1)
-                if not msg_type_data or msg_type_data[0] != protocol.MSG_POINTER_EVENT:
-                    break
-
-                latest = protocol.parse_pointer_event(client_socket)
-        except Exception:
-            # Best-effort optimization; fall back to single-event handling.
-            pass
-        finally:
-            if original_timeout is not None:
-                try:
-                    client_socket.settimeout(original_timeout)
-                except Exception:
-                    pass
-
+        while self._socket_readable_now(client_socket):
+            try:
+                peek = client_socket.recv(6, socket.MSG_PEEK)
+            except (BlockingIOError, InterruptedError, socket.timeout, OSError):
+                break
+            if len(peek) < 6 or peek[0] != protocol.MSG_POINTER_EVENT:
+                break
+            if peek[1] != latest.get('button_mask', peek[1]):
+                break
+            msg_type_data = recv_exact(client_socket, 1)
+            if not msg_type_data or msg_type_data[0] != protocol.MSG_POINTER_EVENT:
+                break
+            latest = protocol.parse_pointer_event(client_socket)
         return latest
 
     def _normalize_request_region(self, request: dict, fb_width: int,

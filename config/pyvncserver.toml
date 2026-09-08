@@ -103,6 +103,17 @@ cache_ttl_seconds = 2.0
 reorder_encodings = true
 adapt_tight_compression = true
 
+[performance]
+# v4.1 default: prioritize current frames and low queueing latency.
+profile = "low-latency"
+capture_producer_fps = 120
+socket_send_buffer_bytes = 262144
+socket_receive_buffer_bytes = 131072
+framebuffer_send_coalesce_bytes = 131072
+producer_conversion_cache_entries = 4
+producer_conversion_cache_max_bytes = 67108864
+drop_stale_continuous_frames = true
+
 [websocket]
 allowed_origins = []
 detect_timeout = 0.5

@@ -16,7 +16,7 @@ import argparse
 import statistics
 import time
 
-from vnc_lib.screen_capture import ScreenCapture
+from pyvncserver.capture import ScreenCapture
 
 
 NATIVE_BGR0 = {
@@ -105,3 +105,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

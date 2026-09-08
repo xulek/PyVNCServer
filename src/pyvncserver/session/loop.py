@@ -1,5 +1,6 @@
 """Client session message loop separated from server lifecycle orchestration."""
 
+import select
 import socket
 import time
 
@@ -155,39 +156,69 @@ class SessionLoopMixin:
             _current_screen_layout(fb_width, fb_height),
         )
 
+        def _continuous_frame_is_stale(generation: int) -> bool:
+            if not continuous_tick:
+                return False
+            if not getattr(self, 'performance_drop_stale_continuous_frames', False):
+                return False
+            producer = getattr(self, 'capture_producer', None)
+            if producer is None:
+                return False
+            try:
+                return int(producer.latest_generation) > int(generation)
+            except Exception:
+                return False
+
         while not self.shutdown_handler.is_shutting_down():
             try:
-                # In ContinuousUpdates mode the socket is polled at the target
-                # frame cadence. A timeout is a streaming tick, not a disconnect.
+                # ContinuousUpdates uses select() on real sockets instead of
+                # mutating socket timeouts twice per frame. This removes hot-path
+                # syscalls and preserves SSL socket timeout state. WebSocket-like
+                # adapters fall back to the compatibility timeout path.
                 continuous_tick = False
                 if continuous_enabled and continuous_request is not None:
                     now = time.monotonic()
                     if now >= next_continuous_update:
-                        # Do not let a continuous stream of pointer/key events
-                        # starve framebuffer delivery.
                         msg_type_data = None
                         continuous_tick = True
                     else:
+                        poll_timeout = max(0.001, next_continuous_update - now)
                         original_timeout = client_socket.gettimeout()
-                        try:
-                            poll_timeout = max(
-                                0.001, next_continuous_update - now
-                            )
-                            if (
-                                original_timeout is not None
-                                and float(original_timeout) > 0
-                            ):
-                                poll_timeout = min(
-                                    float(original_timeout), poll_timeout
-                                )
-                            client_socket.settimeout(poll_timeout)
+                        if (
+                            original_timeout is not None
+                            and float(original_timeout) > 0
+                        ):
+                            poll_timeout = min(float(original_timeout), poll_timeout)
+
+                        if isinstance(client_socket, socket.socket):
+                            pending = 0
                             try:
+                                pending_fn = getattr(client_socket, "pending", None)
+                                pending = int(pending_fn()) if callable(pending_fn) else 0
+                            except Exception:
+                                pending = 0
+                            if pending > 0:
+                                readable = True
+                            else:
+                                ready, _, _ = select.select(
+                                    [client_socket], [], [], poll_timeout
+                                )
+                                readable = bool(ready)
+                            if readable:
                                 msg_type_data = recv_exact(client_socket, 1)
-                            except socket.timeout:
+                            else:
                                 msg_type_data = None
                                 continuous_tick = True
-                        finally:
-                            client_socket.settimeout(original_timeout)
+                        else:
+                            try:
+                                client_socket.settimeout(poll_timeout)
+                                try:
+                                    msg_type_data = recv_exact(client_socket, 1)
+                                except socket.timeout:
+                                    msg_type_data = None
+                                    continuous_tick = True
+                            finally:
+                                client_socket.settimeout(original_timeout)
                 else:
                     msg_type_data = recv_exact(client_socket, 1)
 
@@ -523,9 +554,19 @@ class SessionLoopMixin:
                                         "Sending framebuffer update with %d rectangle(s)",
                                         len(rectangles),
                                     )
+                                    if _continuous_frame_is_stale(snapshot.generation):
+                                        if conn_metrics:
+                                            conn_metrics.record_stale_frame_drop()
+                                        next_continuous_update = 0.0
+                                        continue
                                     send_started = time.perf_counter()
                                     protocol.send_framebuffer_update(client_socket, rectangles)
                                     send_time = time.perf_counter() - send_started
+                                    if conn_metrics and snapshot.published_at > 0:
+                                        conn_metrics.record_latency(
+                                            time.perf_counter() - snapshot.published_at,
+                                            send_time,
+                                        )
                                     self._commit_frame_state(
                                         encoder_manager,
                                         result.pixel_data,
@@ -682,9 +723,19 @@ class SessionLoopMixin:
                                     "Sending framebuffer update with %d rectangle(s)",
                                     len(rectangles),
                                 )
+                                if _continuous_frame_is_stale(snapshot.generation):
+                                    if conn_metrics:
+                                        conn_metrics.record_stale_frame_drop()
+                                    next_continuous_update = 0.0
+                                    continue
                                 send_started = time.perf_counter()
                                 protocol.send_framebuffer_update(client_socket, rectangles)
                                 send_time = time.perf_counter() - send_started
+                                if conn_metrics and snapshot.published_at > 0:
+                                    conn_metrics.record_latency(
+                                        time.perf_counter() - snapshot.published_at,
+                                        send_time,
+                                    )
                                 self._commit_frame_state(
                                     encoder_manager,
                                     result.pixel_data,
@@ -838,9 +889,19 @@ class SessionLoopMixin:
                             selected_encoded_bytes = len(encoded_data)
                             encoded_bytes_total = len(encoded_data)
                         self.logger.debug(f"Sending framebuffer update with {len(rectangles)} rectangle(s)")
+                        if _continuous_frame_is_stale(snapshot.generation):
+                            if conn_metrics:
+                                conn_metrics.record_stale_frame_drop()
+                            next_continuous_update = 0.0
+                            continue
                         send_started = time.perf_counter()
                         protocol.send_framebuffer_update(client_socket, rectangles)
                         send_time = time.perf_counter() - send_started
+                        if conn_metrics and snapshot.published_at > 0:
+                            conn_metrics.record_latency(
+                                time.perf_counter() - snapshot.published_at,
+                                send_time,
+                            )
                         self._commit_frame_state(
                             encoder_manager,
                             result.pixel_data,

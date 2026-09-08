@@ -8,11 +8,11 @@ RFB 3.8 · UltraVNC interoperability · Tight / ZRLE / Hextile / Zlib · WebSock
 
 <p>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-4.0.0-6f42c1">
+  <img alt="Version" src="https://img.shields.io/badge/version-4.1.0-6f42c1">
   <img alt="RFB" src="https://img.shields.io/badge/RFB-3.8-1f6feb">
   <img alt="UltraVNC" src="https://img.shields.io/badge/UltraVNC-tested-2ea44f">
   <img alt="WebSocket" src="https://img.shields.io/badge/WebSocket-noVNC-ff9800">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-417%20passed-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-425%20passed-2ea44f">
   <a href="https://xulek.github.io/PyVNCServer/"><img alt="Documentation" src="https://img.shields.io/badge/docs-GitHub%20Pages-0ea5e9?logo=materialformkdocs&logoColor=white"></a>
 </p>
 
@@ -36,6 +36,7 @@ Highlights:
 - Optional **JPEG** and **H.264** extension paths.
 - **Adaptive encoding selection** based on client capabilities, changed regions and network profile.
 - **Per-client adaptive streaming** with dynamic FPS, CPU/network pressure detection, bottleneck-aware encoding order and safe Tight/JPEG tuning.
+- **v4.1 low-latency pipeline** with exact unchanged-frame fast path, bounded dirty-region compaction, stale-frame dropping, smaller socket queues, producer conversion reuse and producer→wire latency telemetry.
 - One **shared capture producer** for multiple clients instead of independently capturing the desktop per connection.
 - Windows-oriented fast capture through **DXCam/DXGI** when available, with native dirty/move metadata and **MSS** / **Pillow** fallbacks.
 - **WebSocket transport** suitable for binary noVNC connections.
@@ -284,6 +285,8 @@ When enabled with `capture_backend = "auto"`, PyVNCServer prefers MSS monitor `0
 
 DXCam still captures one DXGI output per camera; use MSS/auto for a combined multi-monitor framebuffer.
 
+See `docs/MULTI_MONITOR.md`.
+
 ---
 
 ## Security model
@@ -378,6 +381,30 @@ Additional protections include connection admission limits, handshake timeouts a
 See the full [security guide](https://xulek.github.io/PyVNCServer/security/).
 
 ---
+
+## Low-latency profile (v4.1)
+
+The default v4.1 performance policy favors **fresh frames over queued frames**. On LAN/localhost this means smaller TCP send queues, a faster shared capture producer, stale ContinuousUpdates frame dropping and fewer unnecessary copies.
+
+```toml
+[performance]
+profile = "low-latency"
+capture_producer_fps = 120
+socket_send_buffer_bytes = 262144
+socket_receive_buffer_bytes = 131072
+framebuffer_send_coalesce_bytes = 131072
+producer_conversion_cache_entries = 4
+producer_conversion_cache_max_bytes = 67108864
+drop_stale_continuous_frames = true
+```
+
+Measure CPU-side hot paths locally:
+
+```bash
+PYTHONPATH=src python benchmarks/benchmark_latency_pipeline.py --iterations 100
+```
+
+For meaningful end-to-end numbers, run `benchmark_lan_latency.py` against the actual Windows/DXGI host and viewer/network path.
 
 ## Configuration
 
@@ -507,6 +534,40 @@ src/pyvncserver/
 
 ---
 
+## 4.0 package and plugin API
+
+Version 4.0 removes the old top-level `vnc_lib` package. Stable embedding imports are now grouped under:
+
+```python
+from pyvncserver.capture import ScreenCapture
+from pyvncserver.encodings import EncoderManager
+from pyvncserver.protocol import RFBProtocol
+from pyvncserver.security import VNCAuth, VeNCryptServer
+from pyvncserver.errors import ProtocolError
+from pyvncserver import PluginManager, VNCServerV3
+```
+
+Validate the architectural boundary with:
+
+```bash
+python scripts/check_architecture.py
+```
+
+---
+
+## Operations CLI
+
+PyVNCServer 3.7 adds deployment-oriented commands that do not require starting the RFB listener:
+
+```bash
+pyvncserver info
+pyvncserver doctor --config config/pyvncserver.toml
+pyvncserver config init pyvncserver.toml
+pyvncserver config validate pyvncserver.toml
+pyvncserver benchmark --config pyvncserver.toml
+pyvncserver release check --root .
+```
+
 ### Observability
 
 ```toml
@@ -552,8 +613,6 @@ The server contains several latency and throughput optimizations:
 - adaptive JPEG quality and safe Tight compression tuning,
 - capture backend probing/fallback,
 - LAN-specific frame-rate tuning.
-
-The goal is to avoid spending CPU on full-frame work when only a small part of the desktop changed.
 
 ---
 
@@ -609,6 +668,8 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 python -m compileall -q src tests
 ```
+
+The v4.0 package retains the adaptive/TLS/RFB/operations coverage from 3.7 and adds architecture-boundary checks, public facade imports and real capture/encoding/security plugin integration tests.
 
 ---
 

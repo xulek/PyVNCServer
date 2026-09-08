@@ -1,106 +1,117 @@
-# Performance
+# Performance and latency
 
-PyVNCServer optimizes the path from desktop capture to encoded rectangle rather than relying on one codec alone.
+PyVNCServer 4.1 focuses on **frame freshness and end-to-end latency**, not only theoretical throughput. The low-latency path is designed to avoid spending CPU or socket queue space on a frame that has already been superseded.
 
-## Capture backends
+## v4.1 low-latency pipeline
 
-`capture_backend = "auto"` chooses from available backends.
-
-| Backend | Platform | Role |
-| --- | --- | --- |
-| DXCam / DXGI | Windows | optional fast Desktop Duplication capture path with native dirty/move metadata in v3.3 |
-| MSS | cross-platform | portable primary fallback |
-| Pillow ImageGrab | platform dependent | fallback capture path |
-
-Install the performance extras:
-
-```bash
-python -m pip install -e ".[performance]"
-```
-
-PyVNCServer 3.3 requires DXCam `0.3.0+` for the native metadata integration.
-
-## Shared capture producer
-
-A server-wide producer captures once and distributes framebuffer generations to sessions. This avoids N clients causing N independent desktop captures.
-
-## Native DXGI changed regions
-
-On an unscaled, unrotated full-output DXCam capture, v3.3 reads Desktop Duplication metadata directly from the active `IDXGIOutputDuplication` object:
-
-- `GetFrameDirtyRects` identifies framebuffer regions whose pixel contents changed;
-- `GetFrameMoveRects` identifies regions copied from another framebuffer location and exposes them as CopyRect hints;
-- a DXGI timeout/no-new-frame is treated as an authoritative empty update;
-- any metadata read/validation failure returns to the existing software change detector instead of assuming the screen is unchanged.
-
-Native metadata is deliberately disabled for scaled, rotated or cropped DXCam captures until coordinate translation is implemented. MSS and Pillow also continue to use software change detection.
-
-!!! important
-    Native metadata is an optimization, never a correctness requirement. An ambiguous native result becomes `dirty_regions = None`, which explicitly activates the software differ.
-
-### Move-rectangle safety in v3.3
-
-Move destinations are currently included in the dirty pixel list even when a CopyRect hint is emitted. This is intentionally conservative: clients without CopyRect support and clients that skip capture generations still converge to the correct framebuffer. Once the real-client interoperability matrix has broader coverage, the redundant pixel update can be removed for clients that are exactly one generation behind and advertise CopyRect.
-
-## Request coalescing
-
-Viewers can generate update/input messages faster than the server should perform expensive work. Request coalescing reduces redundant framebuffer computations while preserving the most recent requested state.
-
-## Encoding workers
+The default profile is:
 
 ```toml
-[limits]
-encoding_threads = 0
+[performance]
+profile = "low-latency"
+capture_producer_fps = 120
+socket_send_buffer_bytes = 262144
+socket_receive_buffer_bytes = 131072
+framebuffer_send_coalesce_bytes = 131072
+producer_conversion_cache_entries = 4
+producer_conversion_cache_max_bytes = 67108864
+drop_stale_continuous_frames = true
 ```
 
-`0` enables automatic worker selection. More workers are not always faster: compression, memory bandwidth and Python/native-code behavior matter, and many tiny rectangles can lose to scheduling overhead.
+Three profiles are accepted:
 
-## Network profiles
+| Profile | Goal | TCP/send behavior | Cache behavior |
+| --- | --- | --- | --- |
+| `low-latency` | freshest possible frame | smaller send queue, earlier backpressure | encoded-region cache skipped for a single client |
+| `balanced` | latency/throughput compromise | larger coalescing and socket queue | cache remains available |
+| `throughput` | bulk transfer efficiency | largest queue/coalescing defaults | favors reuse and fewer syscalls |
 
-```toml
-[server]
-network_profile_override = "auto"
-frame_rate = 30
-lan_frame_rate = 90
-```
+### Exact unchanged-frame fast path
 
-Automatic profiling allows localhost/LAN/WAN tuning to diverge. Forcing `lan` everywhere can waste bandwidth or CPU on slower links.
+The software change detector first performs an exact whole-frame equality comparison against the previous framebuffer. If the frame is byte-for-byte identical, tile CRC scanning is skipped entirely. This is exact, not sampled, so it cannot miss a changed pixel. On the development microbenchmark, a static 1920×1080×4 frame dropped from roughly 10 ms of tile scanning to well below 1 ms. Treat this as a CPU microbenchmark, not a Windows/DXGI glass-to-glass result.
 
-## Compression tuning
+### Bounded dirty-region compaction
 
-Relevant LAN settings include zlib/ZRLE compression levels, raw thresholds and JPEG thresholds/quality. Lower zlib levels often reduce latency on fast LANs at the cost of additional bytes.
+Adaptive region merging no longer allows a large pathological rectangle set to turn into an expensive quadratic hot path. The v4.1 merge path uses bounded greedy compaction and retains the configured expansion guard, so nearby rectangles can be combined without accidentally encoding a huge mostly-unchanged area.
+
+### Fewer copies and allocations
+
+- contiguous full-width framebuffer regions are sliced in one operation;
+- partial regions use `memoryview`-backed row copies;
+- `recv_exact()` prefers `recv_into()` so input messages do not allocate a new bytes object for every receive chunk;
+- large framebuffer payloads are sent separately instead of always building one giant joined `bytes`;
+- shared producer pixel-format conversions are cached per framebuffer generation and pixel format.
+
+### Freshness over queue depth
+
+ContinuousUpdates checks whether the generation being encoded has already been superseded. With `drop_stale_continuous_frames = true`, an obsolete frame is discarded before wire send and the session proceeds toward the newest generation.
+
+The low-latency socket send buffer defaults to 256 KiB. A smaller queue causes slow clients to exert backpressure earlier instead of allowing multiple old framebuffer updates to sit in the kernel queue.
+
+### Single-client cache policy
+
+Hashing a large rectangle just to look it up in the shared encoded-region cache can cost more than it saves when there is only one low-latency client. For `profile = "low-latency"`, that cache is bypassed for one authenticated session and becomes active when multiple sessions can actually reuse the encoded result. Raw encoding is excluded from encoded-region cache reuse.
+
+## Latency telemetry
+
+Per-connection metrics include producer-to-wire latency samples and stale-frame drops. Status/metrics expose P50/P95/P99 values so regressions are visible even when average FPS still looks healthy.
+
+Key measurements to watch:
+
+- capture duration;
+- producer generation age;
+- encode duration;
+- socket send duration;
+- producer→wire P50/P95/P99;
+- stale frames dropped;
+- transmitted bytes and compression ratio.
 
 ## Benchmarks
 
-Encoder/capture benchmarks:
+### CPU hot-path benchmark
+
+```bash
+PYTHONPATH=src python benchmarks/benchmark_latency_pipeline.py --width 1920 --height 1080 --iterations 100
+```
+
+It reports min/avg/P50/P95/P99/max for:
+
+- exact unchanged-frame detection;
+- 8/16/32/64 dirty-rectangle compaction;
+- full-width and inner framebuffer extraction.
+
+### End-to-end LAN request/response
+
+```bash
+PYTHONPATH=src python benchmarks/benchmark_lan_latency.py 192.168.1.10 5900 100
+```
+
+This measures TCP connect time, RFB handshake and framebuffer request-to-response latency. Run it from the actual client machine against the Windows server to obtain useful LAN latency figures.
+
+### Other benchmarks
 
 ```bash
 PYTHONPATH=src python benchmarks/benchmark_encoders.py
 PYTHONPATH=src python benchmarks/benchmark_screen_capture.py
 PYTHONPATH=src python benchmarks/benchmark_screen_capture_methods.py
-PYTHONPATH=src python benchmarks/benchmark_lan_latency.py
+python benchmarks/benchmark_dxgi_metadata.py --frames 300 --fps 120
 ```
 
-### DXGI metadata benchmark
+## Capture backends
 
-On a real Windows desktop with the performance extra installed:
+`capture_backend = "auto"` chooses from available backends. DXCam/DXGI remains the preferred Windows low-latency path when available; MSS and Pillow are fallbacks. Native DXGI dirty/move metadata avoids software diff work when the capture is an unscaled, unrotated full output. If metadata is invalid or unavailable, correctness takes priority and the software detector is used.
 
-```powershell
-python benchmarks/benchmark_dxgi_metadata.py --frames 300 --fps 60
-```
+## Shared capture producer
 
-The diagnostic reports:
+A server-wide producer captures once and publishes framebuffer generations to all sessions. In 4.1 its low-latency default target is 120 FPS. Clients can still stream at a lower adaptive/session FPS; the higher producer rate mainly reduces the age of the newest available frame.
 
-- native metadata hit rate vs software-diff fallback rate;
-- average and p95 capture time;
-- average dirty/move rectangle count;
-- approximate changed framebuffer area.
+## Measuring correctly
 
-For meaningful numbers:
+For meaningful results:
 
-- benchmark on the target OS/GPU/display setup;
-- test idle desktop, text editing, window movement, scrolling and video separately;
-- separate capture time from encode time;
-- test full-screen and small-region updates;
-- include the actual viewer over the intended network path;
-- record CPU usage and transmitted bytes, not only FPS.
+- measure on the target Windows GPU/display configuration;
+- test idle desktop, text editing, dragging windows, scrolling and video separately;
+- distinguish capture, diff, encode, send and network/display latency;
+- report P50/P95/P99, not only averages;
+- test the actual viewer (UltraVNC/noVNC) and intended LAN/WAN path;
+- compare CPU usage and transmitted bytes as well as latency.

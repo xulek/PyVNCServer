@@ -107,6 +107,47 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         self.max_unauthenticated_connections = self.settings.max_unauthenticated_connections
         self.handshake_timeout = self.settings.handshake_timeout
         self.client_socket_timeout = self.settings.client_socket_timeout
+
+        # v4.1 latency/performance policy. The low-latency profile intentionally
+        # keeps TCP queues smaller so blocking send() reflects client backpressure
+        # earlier instead of accumulating stale framebuffer data in the kernel.
+        self.performance_profile = str(
+            self.config.get('performance_profile', 'low-latency')
+        ).strip().lower() or 'low-latency'
+        if self.performance_profile not in {'low-latency', 'balanced', 'throughput'}:
+            raise ConfigurationError(
+                "performance.profile must be low-latency, balanced, or throughput"
+            )
+        default_sndbuf = {
+            'low-latency': 262144,
+            'balanced': 1048576,
+            'throughput': 2097152,
+        }[self.performance_profile]
+        default_rcvbuf = 131072
+        default_coalesce = {
+            'low-latency': 131072,
+            'balanced': 524288,
+            'throughput': 1048576,
+        }[self.performance_profile]
+        self.performance_socket_send_buffer_bytes = max(16384, int(
+            self.config.get('performance_socket_send_buffer_bytes', default_sndbuf)
+        ))
+        self.performance_socket_receive_buffer_bytes = max(16384, int(
+            self.config.get('performance_socket_receive_buffer_bytes', default_rcvbuf)
+        ))
+        self.performance_framebuffer_send_coalesce_bytes = max(4096, int(
+            self.config.get('performance_framebuffer_send_coalesce_bytes', default_coalesce)
+        ))
+        self.performance_drop_stale_continuous_frames = bool(
+            self.config.get('performance_drop_stale_continuous_frames', True)
+        )
+        self.performance_conversion_cache_entries = max(1, int(
+            self.config.get('performance_producer_conversion_cache_entries', 4)
+        ))
+        self.performance_conversion_cache_max_bytes = max(1024 * 1024, int(
+            self.config.get('performance_producer_conversion_cache_max_bytes', 64 * 1024 * 1024)
+        ))
+
         self.clipboard_enabled = self.settings.clipboard.enabled
         self.clipboard_direction = self.settings.clipboard.direction
         self.clipboard_max_bytes = self.settings.clipboard.max_bytes
@@ -394,11 +435,24 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
             thread_name_prefix="VNC-Encoder",
         )
 
+        default_producer_fps = max(
+            self.frame_rate,
+            self.lan_frame_rate,
+            120 if self.performance_profile == 'low-latency' else 60,
+        )
         producer_fps = float(
-            self.config.get('capture_producer_fps', max(self.frame_rate, self.lan_frame_rate, 60))
+            self.config.get(
+                'performance_capture_producer_fps',
+                self.config.get('capture_producer_fps', default_producer_fps),
+            )
         )
         self.capture_producer = (
-            CaptureProducer(self.screen_capture, fps=producer_fps)
+            CaptureProducer(
+                self.screen_capture,
+                fps=producer_fps,
+                conversion_cache_entries=self.performance_conversion_cache_entries,
+                conversion_cache_max_bytes=self.performance_conversion_cache_max_bytes,
+            )
             if self.enable_capture_producer
             else None
         )
@@ -713,13 +767,20 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
             except Exception as e:
                 self.logger.warning(f"Could not set TCP_NODELAY: {e}")
 
-            # Set socket send buffer size based on network profile
-            if not is_localhost:
-                try:
-                    sndbuf = 2097152 if is_lan else 262144  # 2MB LAN, 256KB WAN
-                    client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
-                except Exception as e:
-                    self.logger.warning(f"Could not set SO_SNDBUF: {e}")
+            # Bound kernel queues according to the v4.1 performance profile.
+            # A multi-megabyte LAN send buffer can hide backpressure long enough
+            # to make several already-stale frames sit in the kernel queue.
+            try:
+                client_socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_SNDBUF,
+                    self.performance_socket_send_buffer_bytes,
+                )
+                client_socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_RCVBUF,
+                    self.performance_socket_receive_buffer_bytes,
+                )
+            except Exception as e:
+                self.logger.warning(f"Could not tune socket buffers: {e}")
 
             # Register connection metrics
             if self.metrics:
@@ -758,6 +819,9 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                 max_set_encodings=self.max_set_encodings,
                 max_client_cut_text=self.max_client_cut_text,
                 clipboard_encoding=self.clipboard_encoding,
+                framebuffer_send_coalesce_bytes=(
+                    self.performance_framebuffer_send_coalesce_bytes
+                ),
             )
 
             # Step 1: Protocol Version Handshake
@@ -920,7 +984,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                     parallel_encoder = ParallelEncoder(
                         max_workers=self.encoding_workers,
                         executor=self.encoding_executor,
-                        encoded_region_cache=self.encoded_region_cache,
+                        encoded_region_cache=self._effective_encoded_region_cache(),
                     )
                     self.logger.info(
                         "Parallel encoding enabled with shared %d-worker executor",
@@ -1057,6 +1121,15 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         healthy = all(health_results.values()) if health_results else True
         if self.encoded_region_cache is not None:
             status['encoded_region_cache'] = self.encoded_region_cache.stats
+        if self.capture_producer is not None:
+            status['capture_producer'] = self.capture_producer.stats
+        status['performance'] = {
+            'profile': self.performance_profile,
+            'socket_send_buffer_bytes': self.performance_socket_send_buffer_bytes,
+            'socket_receive_buffer_bytes': self.performance_socket_receive_buffer_bytes,
+            'framebuffer_send_coalesce_bytes': self.performance_framebuffer_send_coalesce_bytes,
+            'drop_stale_continuous_frames': self.performance_drop_stale_continuous_frames,
+        }
         status['adaptive_streaming_enabled'] = self.enable_adaptive_streaming
         status['capture_backend'] = getattr(self.screen_capture, 'get_backend_name', lambda: 'unknown')()
         status['health_checks'] = health_results

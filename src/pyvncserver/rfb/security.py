@@ -1,6 +1,6 @@
 """Public VeNCrypt security facade."""
 
-from vnc_lib.vencrypt import (
+from pyvncserver._core.vencrypt import (
     VeNCryptServer,
     VeNCryptResult,
     VENCRYPT_SUBTYPE_TLS_NONE,

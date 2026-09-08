@@ -1,4 +1,4 @@
-from vnc_lib.exceptions import (
+from pyvncserver._core.exceptions import (
     AuthenticationError,
     ConfigurationError,
     ConnectionError as VNCConnectionError,

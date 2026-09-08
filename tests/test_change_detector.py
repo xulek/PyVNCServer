@@ -4,7 +4,7 @@ Python 3.13 compatible
 """
 
 import unittest
-from vnc_lib.change_detector import Region, TileGrid, AdaptiveChangeDetector
+from pyvncserver._core.change_detector import Region, TileGrid, AdaptiveChangeDetector
 
 
 class TestRegion(unittest.TestCase):

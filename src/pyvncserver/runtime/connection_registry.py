@@ -4,7 +4,7 @@ This module intentionally does not export a generic ``ConnectionPool`` name.
 Server-side admission control is ``ConnectionLimiter``.
 """
 
-from vnc_lib.connection_pool import (
+from pyvncserver._core.connection_pool import (
     ReusableConnectionPool,
     ConnectionPoolManager,
     PooledConnection,

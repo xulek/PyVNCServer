@@ -12,6 +12,7 @@ Uses Python 3.13 features:
 
 import struct
 import time
+import logging
 from dataclasses import dataclass, field
 from typing import Protocol
 import sys
@@ -113,12 +114,13 @@ class ClipboardManager:
 
     __slots__ = ('_server_content', '_client_content', '_max_size',
                  '_encoding', '_on_client_update', '_on_server_update',
-                 '_last_sent_hash', '_enabled')
+                 '_last_sent_hash', '_enabled', '_direction', '_logger')
 
     def __init__(
         self,
         max_size: int = 1024 * 1024,  # 1MB default
-        encoding: str = 'latin-1'
+        encoding: str = 'latin-1',
+        direction: str = 'both',
     ):
         self._server_content: ClipboardData | None = None
         self._client_content: ClipboardData | None = None
@@ -128,6 +130,12 @@ class ClipboardManager:
         self._on_server_update: list[Callable[[ClipboardData], None]] = []
         self._last_sent_hash: int = 0
         self._enabled = True
+        self._direction = str(direction).strip().lower()
+        if self._direction not in {'both', 'client-to-server', 'server-to-client', 'disabled'}:
+            raise ValueError('Invalid clipboard direction')
+        if encoding not in {'latin-1', 'utf-8'}:
+            raise ValueError('Clipboard encoding must be latin-1 or utf-8')
+        self._logger = logging.getLogger(__name__)
 
     def enable(self) -> None:
         """Enable clipboard synchronization."""
@@ -148,7 +156,7 @@ class ClipboardManager:
 
         This is called when the client sends clipboard content to the server.
         """
-        if not self._enabled:
+        if not self._enabled or self._direction not in {'both', 'client-to-server'}:
             return
 
         try:
@@ -173,10 +181,10 @@ class ClipboardManager:
                     callback(clipboard_data)
                 except Exception as e:
                     # Don't let callback errors break clipboard handling
-                    print(f"Clipboard callback error: {e}")
+                    self._logger.warning('Clipboard callback error: %s', e)
 
         except Exception as e:
-            print(f"Error handling client clipboard: {e}")
+            self._logger.warning('Error handling client clipboard: %s', e)
 
     def set_server_clipboard(self, text: str) -> bytes | None:
         """
@@ -185,7 +193,7 @@ class ClipboardManager:
         Returns:
             VNC ServerCutText message bytes, or None if unchanged
         """
-        if not self._enabled:
+        if not self._enabled or self._direction not in {'both', 'server-to-client'}:
             return None
 
         try:
@@ -210,12 +218,12 @@ class ClipboardManager:
                 try:
                     callback(clipboard_data)
                 except Exception as e:
-                    print(f"Clipboard callback error: {e}")
+                    self._logger.warning('Clipboard callback error: %s', e)
 
             return clipboard_data.to_vnc_message()
 
         except Exception as e:
-            print(f"Error setting server clipboard: {e}")
+            self._logger.warning('Error setting server clipboard: %s', e)
             return None
 
     def get_client_clipboard_text(self) -> str | None:
@@ -263,6 +271,7 @@ class ClipboardManager:
             'enabled': self._enabled,
             'max_size': self._max_size,
             'encoding': self._encoding,
+            'direction': self._direction,
             'client_content_size': len(self._client_content.content) if self._client_content else 0,
             'server_content_size': len(self._server_content.content) if self._server_content else 0,
             'client_timestamp': self._client_content.timestamp if self._client_content else None,

@@ -4,6 +4,8 @@ Modern video codec for efficient video streaming
 Provides superior compression for video and animations
 """
 
+from __future__ import annotations
+
 import struct
 import logging
 import time
@@ -15,8 +17,9 @@ try:
     AV_AVAILABLE = True
 except ImportError:
     AV_AVAILABLE = False
-    logging.warning("PyAV not available - H.264 encoding disabled. "
-                   "Install with: pip install av")
+    logging.getLogger(__name__).debug(
+        "PyAV not available - H.264 encoding disabled; install the h264 extra to enable it"
+    )
 
 # Type aliases
 PixelData: TypeAlias = bytes

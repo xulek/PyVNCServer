@@ -15,24 +15,25 @@ import ssl
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from vnc_lib.protocol import RFBProtocol
-from vnc_lib.vencrypt import VeNCryptServer, parse_minimum_tls_version
-from vnc_lib.io_utils import recv_exact
-from vnc_lib.auth import VNCAuth, CRYPTO_AVAILABLE
-from vnc_lib.input_handler import InputHandler
-from vnc_lib.screen_capture import ScreenCapture
-from vnc_lib.capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
-from vnc_lib.encodings import EncoderManager, encoding_name, format_encoding_list
-from vnc_lib.change_detector import AdaptiveChangeDetector
-from vnc_lib.cursor import CursorEncoder, SystemCursorCapture
-from vnc_lib.metrics import ServerMetrics, ConnectionMetrics, PerformanceMonitor
-from vnc_lib.types import is_valid_pixel_format
-from vnc_lib.clipboard import sanitize_clipboard_text
-from vnc_lib.server_utils import (
+from pyvncserver._core.protocol import RFBProtocol
+from pyvncserver._core.vencrypt import VeNCryptServer, parse_minimum_tls_version
+from pyvncserver._core.io_utils import recv_exact
+from pyvncserver._core.auth import VNCAuth, CRYPTO_AVAILABLE
+from pyvncserver._core.input_handler import InputHandler
+from pyvncserver._core.screen_capture import ScreenCapture
+from pyvncserver._core.capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
+from pyvncserver._core.encodings import EncoderManager, encoding_name, format_encoding_list
+from pyvncserver._core.change_detector import AdaptiveChangeDetector
+from pyvncserver._core.cursor import CursorEncoder, SystemCursorCapture
+from pyvncserver._core.metrics import ServerMetrics, ConnectionMetrics, PerformanceMonitor
+from pyvncserver._core.prometheus_exporter import PrometheusExporter
+from pyvncserver._core.types import is_valid_pixel_format
+from pyvncserver._core.clipboard import sanitize_clipboard_text
+from pyvncserver._core.server_utils import (
     GracefulShutdown, HealthChecker, ConnectionLimiter, PerformanceThrottler,
     NetworkProfile, detect_network_profile
 )
-from vnc_lib.exceptions import (
+from pyvncserver._core.exceptions import (
     VNCError, ProtocolError, AuthenticationError, ConnectionError as VNCConnectionError,
     ConfigurationError,
 )
@@ -40,6 +41,7 @@ from pyvncserver.config import DEFAULT_CONFIG_PATH, ServerSettings, load_config_
 from pyvncserver._version import __version__, SERVER_NAME
 from pyvncserver.platform.producer import CaptureProducer, FrameSnapshot
 from pyvncserver.runtime.security import AuthRateLimiter, PerIPConnectionLimiter
+from pyvncserver.plugins import PluginManager
 from pyvncserver.runtime.adaptive import AdaptiveStreamConfig, EncodedRegionCache
 from pyvncserver.session_state import ClientSessionState
 from pyvncserver.session.loop import SessionLoopMixin
@@ -66,9 +68,15 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
     DEFAULT_SCALE_FACTOR = 1.0
     MAX_CONNECTIONS = 10
 
-    def __init__(self, config_file: str | Path | None = None):
-        """Initialize enhanced VNC Server with configuration"""
+    def __init__(self, config_file: str | Path | None = None, *,
+                 plugins: PluginManager | None = None):
+        """Initialize the server.
+
+        ``plugins`` is an explicit per-server registry for optional capture,
+        encoding and security extensions. No global plugin state is used.
+        """
         self.logger = logging.getLogger(__name__)
+        self.plugins = plugins or PluginManager()
 
         # Load and validate configuration. Configuration errors are fatal: a
         # VNC server must never silently fall back to insecure defaults.
@@ -99,6 +107,10 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         self.max_unauthenticated_connections = self.settings.max_unauthenticated_connections
         self.handshake_timeout = self.settings.handshake_timeout
         self.client_socket_timeout = self.settings.client_socket_timeout
+        self.clipboard_enabled = self.settings.clipboard.enabled
+        self.clipboard_direction = self.settings.clipboard.direction
+        self.clipboard_max_bytes = self.settings.clipboard.max_bytes
+        self.clipboard_encoding = self.settings.clipboard.encoding
         if (self.password or self.read_only_password) and not CRYPTO_AVAILABLE:
             raise ConfigurationError(
                 "VNC authentication is configured but pycryptodome is not installed"
@@ -252,8 +264,9 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         self.max_set_encodings = max(
             1, int(self.config.get('max_set_encodings', RFBProtocol.DEFAULT_MAX_SET_ENCODINGS))
         )
-        self.max_client_cut_text = max(
-            1, int(self.config.get('max_client_cut_text', RFBProtocol.DEFAULT_MAX_CLIENT_CUT_TEXT))
+        self.max_client_cut_text = min(
+            self.clipboard_max_bytes,
+            max(1, int(self.config.get('max_client_cut_text', RFBProtocol.DEFAULT_MAX_CLIENT_CUT_TEXT))),
         )
         self.websocket_detect_timeout = max(
             0.05, float(self.config.get('websocket_detect_timeout', 0.5))
@@ -310,6 +323,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                 monitor=self.monitor_index,
                 backend_preference=self.capture_backend,
                 capture_all_monitors=self.capture_all_monitors,
+                backend_factories=self.plugins.capture_factories(),
             )
         except TypeError:
             # Preserve compatibility with embedders/tests providing a custom
@@ -345,6 +359,18 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         )
         self.metrics = ServerMetrics.get_instance() if self.enable_metrics else None
         self.health_checker = HealthChecker(check_interval=30.0)
+        self.prometheus_enabled = bool(self.config.get('observability_prometheus_enabled', False))
+        self.prometheus_host = str(self.config.get('observability_prometheus_host', '127.0.0.1'))
+        self.prometheus_port = int(self.config.get('observability_prometheus_port', 9100))
+        self.prometheus_exporter = (
+            PrometheusExporter(
+                host=self.prometheus_host,
+                port=self.prometheus_port,
+                status_provider=self.get_status,
+            )
+            if self.prometheus_enabled
+            else None
+        )
         self.encoded_region_cache = (
             EncodedRegionCache(
                 max_entries=self.adaptive_stream_config.cache_max_entries,
@@ -564,6 +590,12 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
             self.health_checker.start()
         if self.capture_producer is not None:
             self.capture_producer.start()
+        if self.prometheus_exporter is not None:
+            self.prometheus_exporter.start()
+            self.logger.info(
+                "Observability endpoint listening on http://%s:%d",
+                self.prometheus_host, self.prometheus_exporter.bound_port,
+            )
 
         try:
             while not self.shutdown_handler.is_shutting_down():
@@ -697,7 +729,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
             is_websocket_transport = False
             if self.enable_websocket:
                 try:
-                    from vnc_lib.websocket_wrapper import (
+                    from pyvncserver._core.websocket_wrapper import (
                         is_websocket_request,
                         WebSocketVNCAdapter,
                     )
@@ -725,6 +757,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
             protocol = RFBProtocol(
                 max_set_encodings=self.max_set_encodings,
                 max_client_cut_text=self.max_client_cut_text,
+                clipboard_encoding=self.clipboard_encoding,
             )
 
             # Step 1: Protocol Version Handshake
@@ -745,6 +778,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                         self.settings.security.require_encrypted_transport
                         and self.tls_context is None
                     ),
+                    extra_security_plugins=self.plugins.security_plugins(),
                 )
 
             if security.transport_socket is not None:
@@ -864,6 +898,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                 disable_tight_for_ultravnc=disable_tight_for_ultravnc,
                 enable_copyrect=self.enable_copyrect_encoding,
                 enable_zrle=self.enable_zrle_encoding,
+                extra_encoders=self.plugins.create_encoders(),
             )
             client_encodings: list[int] = [0]  # Default: Raw encoding
             self.logger.info(
@@ -881,7 +916,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
             use_parallel = self.config.get('enable_parallel_encoding', True)
             if use_parallel:
                 try:
-                    from vnc_lib.parallel_encoder import ParallelEncoder
+                    from pyvncserver._core.parallel_encoder import ParallelEncoder
                     parallel_encoder = ParallelEncoder(
                         max_workers=self.encoding_workers,
                         executor=self.encoding_executor,
@@ -997,7 +1032,9 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                 break
             thread.join(timeout=remaining)
 
-        # 5. Stop background health checks and shared encoding workers.
+        # 5. Stop observability, health checks and shared encoding workers.
+        if self.prometheus_exporter is not None:
+            self.prometheus_exporter.stop()
         self.health_checker.stop()
         try:
             self.encoding_executor.shutdown(wait=False, cancel_futures=True)
@@ -1016,17 +1053,31 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         """Return liveness metrics separately from readiness/capacity."""
         active = self.connection_limiter.get_active_count()
         status = self.metrics.get_summary() if self.metrics else {}
-        health = self.health_checker.last_status
+        health_results = dict(self.health_checker.last_check_results)
+        healthy = all(health_results.values()) if health_results else True
         if self.encoded_region_cache is not None:
             status['encoded_region_cache'] = self.encoded_region_cache.stats
         status['adaptive_streaming_enabled'] = self.enable_adaptive_streaming
+        status['capture_backend'] = getattr(self.screen_capture, 'get_backend_name', lambda: 'unknown')()
+        status['health_checks'] = health_results
+        status['clipboard'] = {
+            'enabled': self.clipboard_enabled,
+            'direction': self.clipboard_direction,
+            'max_bytes': self.clipboard_max_bytes,
+            'encoding': self.clipboard_encoding,
+        }
+        status['observability'] = {
+            'prometheus_enabled': self.prometheus_exporter is not None,
+            'prometheus_host': self.prometheus_host,
+            'prometheus_port': self.prometheus_port,
+        }
         status.update({
             'version': __version__,
             'active_connections': active,
             'max_connections': self.max_connections,
             'ready': active < self.max_connections and not self.shutdown_handler.is_shutting_down(),
             'saturated': active >= self.max_connections,
-            'healthy': health.is_healthy if health is not None else True,
+            'healthy': healthy,
         })
         return status
 

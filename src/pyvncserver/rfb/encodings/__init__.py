@@ -5,7 +5,7 @@ from .h264 import H264Encoder
 from .jpeg import JPEGEncoder
 from .manager import EncoderManager, encoding_name, format_encoding_list
 from .tight import TightEncoder
-from vnc_lib.encodings import CopyRectEncoder, HextileEncoder, RREEncoder, RawEncoder, ZRLEEncoder, ZlibEncoder
+from pyvncserver._core.encodings import CopyRectEncoder, HextileEncoder, RREEncoder, RawEncoder, ZRLEEncoder, ZlibEncoder
 
 __all__ = [
     "CopyRectEncoder",

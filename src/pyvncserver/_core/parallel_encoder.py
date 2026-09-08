@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from queue import Queue, Empty
 import threading
 
-from vnc_lib.encodings import EncodingNotSuitable
+from pyvncserver._core.encodings import EncodingNotSuitable
 
 # Type aliases
 PixelData: TypeAlias = bytes

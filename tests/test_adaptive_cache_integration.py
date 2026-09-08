@@ -4,9 +4,9 @@ import logging
 
 from pyvncserver.runtime.adaptive import EncodedRegionCache
 from pyvncserver.session.runtime import SessionRuntimeMixin
-from vnc_lib.encodings import EncoderManager
-from vnc_lib.parallel_encoder import ParallelEncoder
-from vnc_lib.server_utils import NetworkProfile
+from pyvncserver._core.encodings import EncoderManager
+from pyvncserver._core.parallel_encoder import ParallelEncoder
+from pyvncserver._core.server_utils import NetworkProfile
 
 
 class _Runtime(SessionRuntimeMixin):

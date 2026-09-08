@@ -3,14 +3,14 @@
 import socket
 import time
 
-from vnc_lib.encodings import format_encoding_list
-from vnc_lib.desktop_resize import DesktopSizeHandler, Screen
-from vnc_lib.exceptions import (
+from pyvncserver._core.encodings import format_encoding_list
+from pyvncserver._core.desktop_resize import DesktopSizeHandler, Screen
+from pyvncserver._core.exceptions import (
     VNCError, ProtocolError, AuthenticationError, ConnectionError as VNCConnectionError,
 )
-from vnc_lib.io_utils import recv_exact
-from vnc_lib.protocol import RFBProtocol
-from vnc_lib.server_utils import NetworkProfile, PerformanceThrottler
+from pyvncserver._core.io_utils import recv_exact
+from pyvncserver._core.protocol import RFBProtocol
+from pyvncserver._core.server_utils import NetworkProfile, PerformanceThrottler
 from pyvncserver.session_state import ClientSessionState
 from pyvncserver.runtime.adaptive import AdaptiveStreamController
 
@@ -1035,18 +1035,33 @@ class SessionLoopMixin:
 
                     case protocol.MSG_CLIENT_CUT_TEXT:
                         text = protocol.parse_client_cut_text(client_socket)
+                        clipboard_accepts_client = (
+                            getattr(self, 'clipboard_enabled', True)
+                            and getattr(self, 'clipboard_direction', 'both')
+                            in {'both', 'client-to-server'}
+                        )
                         if view_only_session:
                             self.logger.info(
                                 "Ignoring client cut text from read-only client %s",
                                 client_id,
                             )
+                        elif not clipboard_accepts_client:
+                            self.logger.info(
+                                "Ignoring client cut text due to clipboard policy (%d chars)",
+                                len(text),
+                            )
                         else:
                             # Clipboard contents may contain credentials or other
                             # sensitive data. Log metadata only, never the text.
                             self.logger.info(
-                                "Client cut text received (%d chars)",
+                                "Client cut text received (%d chars, encoding=%s)",
                                 len(text),
+                                getattr(self, 'clipboard_encoding', 'latin-1'),
                             )
+                            if conn_metrics:
+                                conn_metrics.bytes_received += len(
+                                    text.encode(getattr(self, 'clipboard_encoding', 'latin-1'), errors='replace')
+                                )
 
                     case _:
                         self.logger.warning(f"Unknown message type: {msg_type}")

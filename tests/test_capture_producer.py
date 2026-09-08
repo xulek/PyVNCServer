@@ -1,8 +1,8 @@
 """Generation-aware shared capture producer tests."""
 
 from pyvncserver.platform.producer import CaptureProducer, FrameSnapshot, NATIVE_BGR0
-from vnc_lib.capture_backends import CaptureFrame, CaptureMetadata
-from vnc_lib.screen_capture import CaptureResult
+from pyvncserver._core.capture_backends import CaptureFrame, CaptureMetadata
+from pyvncserver._core.screen_capture import CaptureResult
 
 
 class _FakeCapture:

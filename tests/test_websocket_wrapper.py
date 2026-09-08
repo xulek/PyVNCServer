@@ -5,7 +5,7 @@ Tests for WebSocket wrapper and adapter behavior.
 import socket
 import struct
 
-from vnc_lib.websocket_wrapper import (
+from pyvncserver._core.websocket_wrapper import (
     WebSocketOpcode,
     WebSocketWrapper,
     WebSocketVNCAdapter,

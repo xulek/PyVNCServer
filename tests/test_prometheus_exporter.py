@@ -3,7 +3,7 @@
 import pytest
 import time
 
-from vnc_lib.prometheus_exporter import (
+from pyvncserver._core.prometheus_exporter import (
     MetricsRegistry, VNCMetricsCollector, PrometheusExporter,
     MetricType, MetricValue, Metric
 )
@@ -401,3 +401,68 @@ class TestPrometheusExporter:
 
     # Note: We skip actual HTTP tests as they require network access
     # and a running server, which can be flaky in CI environments
+
+
+def test_prometheus_status_health_and_readiness_endpoints():
+    import json
+    import urllib.error
+    import urllib.request
+
+    state = {
+        'healthy': True,
+        'ready': False,
+        'uptime_seconds': 12.5,
+        'active_connections': 2,
+        'total_connections': 5,
+        'failed_auth_attempts': 1,
+    }
+    exporter = PrometheusExporter(
+        host='127.0.0.1', port=0, status_provider=lambda: state
+    )
+    exporter.start()
+    try:
+        with urllib.request.urlopen(exporter.health_url, timeout=2) as response:
+            assert response.status == 200
+            assert response.read() == b'OK\n'
+
+        try:
+            urllib.request.urlopen(exporter.readiness_url, timeout=2)
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 503
+            assert exc.read() == b'NOT READY\n'
+        else:
+            raise AssertionError('readiness should be 503')
+
+        with urllib.request.urlopen(exporter.status_url, timeout=2) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+            assert payload['active_connections'] == 2
+            assert payload['ready'] is False
+
+        with urllib.request.urlopen(exporter.url, timeout=2) as response:
+            metrics = response.read().decode('utf-8')
+            assert 'vnc_connections_active 2.0' in metrics
+            assert 'vnc_server_ready 0.0' in metrics
+    finally:
+        exporter.stop()
+
+
+def test_multiple_exporters_keep_status_providers_isolated():
+    import urllib.error
+    import urllib.request
+
+    healthy = PrometheusExporter(host='127.0.0.1', port=0, status_provider=lambda: {'healthy': True, 'ready': True})
+    unhealthy = PrometheusExporter(host='127.0.0.1', port=0, status_provider=lambda: {'healthy': False, 'ready': False})
+    healthy.start()
+    unhealthy.start()
+    try:
+        with urllib.request.urlopen(healthy.health_url, timeout=2) as response:
+            assert response.status == 200
+        try:
+            urllib.request.urlopen(unhealthy.health_url, timeout=2)
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 503
+        else:
+            raise AssertionError('unhealthy exporter must return 503')
+    finally:
+        healthy.stop()
+        unhealthy.stop()

@@ -7,12 +7,12 @@ import socket
 import threading
 import logging
 
-from vnc_lib.capture_backends import CaptureMetadata, CaptureMoveRect
-from vnc_lib.cursor import CursorData
-from vnc_lib.encodings import CopyRectEncoder, EncoderManager, RREEncoder, RawEncoder, ZRLEEncoder
-from vnc_lib.protocol import RFBProtocol
-from vnc_lib.server_utils import NetworkProfile
-from vnc_lib.screen_capture import CaptureResult
+from pyvncserver._core.capture_backends import CaptureMetadata, CaptureMoveRect
+from pyvncserver._core.cursor import CursorData
+from pyvncserver._core.encodings import CopyRectEncoder, EncoderManager, RREEncoder, RawEncoder, ZRLEEncoder
+from pyvncserver._core.protocol import RFBProtocol
+from pyvncserver._core.server_utils import NetworkProfile
+from pyvncserver._core.screen_capture import CaptureResult
 from pyvncserver import VNCServerV3
 
 
@@ -229,7 +229,7 @@ def test_capture_frame_uses_captureframe_api_when_available():
 
     class _FrameCapture:
         def capture_frame(self, _pixel_format):
-            from vnc_lib.capture_backends import CaptureFrame
+            from pyvncserver._core.capture_backends import CaptureFrame
 
             return CaptureFrame(
                 result=CaptureResult(b"abc", None, 2, 3, 0.001),

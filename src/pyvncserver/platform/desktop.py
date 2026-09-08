@@ -1,4 +1,4 @@
-from vnc_lib.desktop_resize import (
+from pyvncserver._core.desktop_resize import (
     DesktopSizeHandler,
     Screen,
     create_dual_screen_layout,

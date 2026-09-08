@@ -8,7 +8,7 @@ import logging
 import hmac
 from typing import Optional
 
-from vnc_lib.io_utils import recv_exact
+from pyvncserver._core.io_utils import recv_exact
 
 try:
     from Crypto.Cipher import DES

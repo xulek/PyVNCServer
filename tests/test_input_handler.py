@@ -5,7 +5,7 @@ Tests for input handler latency-related behavior.
 import types
 import sys
 
-from vnc_lib.input_handler import InputHandler
+from pyvncserver._core.input_handler import InputHandler
 
 
 def test_input_handler_disables_pyautogui_delays(monkeypatch):

@@ -7,7 +7,7 @@ from pyvncserver.runtime.adaptive import (
     AdaptiveStreamController,
     EncodedRegionCache,
 )
-from vnc_lib.server_utils import PerformanceThrottler
+from pyvncserver._core.server_utils import PerformanceThrottler
 
 
 def test_controller_reduces_fps_under_sustained_pressure():

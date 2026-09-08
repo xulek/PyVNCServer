@@ -5,7 +5,7 @@ Python 3.13 compatible
 
 import unittest
 import time
-from vnc_lib.metrics import (
+from pyvncserver._core.metrics import (
     ConnectionMetrics, ServerMetrics, PerformanceMonitor, format_bytes, format_duration
 )
 

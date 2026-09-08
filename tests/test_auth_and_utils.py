@@ -6,8 +6,8 @@ Comprehensive coverage of auth.py and server_utils.py
 import pytest
 import time
 from unittest.mock import Mock, MagicMock, patch
-from vnc_lib.auth import VNCAuth, NoAuth, CRYPTO_AVAILABLE
-from vnc_lib.server_utils import (
+from pyvncserver._core.auth import VNCAuth, NoAuth, CRYPTO_AVAILABLE
+from pyvncserver._core.server_utils import (
     GracefulShutdown, HealthChecker, ConnectionPool,
     PerformanceThrottler, HealthStatus
 )
@@ -135,7 +135,7 @@ class TestVNCAuth:
 
     def test_recv_exact_helper(self):
         """Test recv_exact helper function"""
-        from vnc_lib.io_utils import recv_exact
+        from pyvncserver._core.io_utils import recv_exact
         mock_socket = MockSocket(b"Hello, World!")
 
         data = recv_exact(mock_socket, 5)
@@ -146,7 +146,7 @@ class TestVNCAuth:
 
     def test_recv_exact_insufficient_data(self):
         """Test recv_exact with insufficient data"""
-        from vnc_lib.io_utils import recv_exact
+        from pyvncserver._core.io_utils import recv_exact
         mock_socket = MockSocket(b"Short")
 
         data = recv_exact(mock_socket, 100)

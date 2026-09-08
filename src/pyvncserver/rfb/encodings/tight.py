@@ -1,4 +1,4 @@
-from vnc_lib.tight_encoding import TightCompressionControl, TightEncoder
+from pyvncserver._core.tight_encoding import TightCompressionControl, TightEncoder
 
 __all__ = ["TightCompressionControl", "TightEncoder"]
 

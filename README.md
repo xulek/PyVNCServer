@@ -8,11 +8,11 @@ RFB 3.8 · UltraVNC interoperability · Tight / ZRLE / Hextile / Zlib · WebSock
 
 <p>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-3.6.0-6f42c1">
+  <img alt="Version" src="https://img.shields.io/badge/version-4.0.0-6f42c1">
   <img alt="RFB" src="https://img.shields.io/badge/RFB-3.8-1f6feb">
   <img alt="UltraVNC" src="https://img.shields.io/badge/UltraVNC-tested-2ea44f">
   <img alt="WebSocket" src="https://img.shields.io/badge/WebSocket-noVNC-ff9800">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-389%20passed-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-417%20passed-2ea44f">
   <a href="https://xulek.github.io/PyVNCServer/"><img alt="Documentation" src="https://img.shields.io/badge/docs-GitHub%20Pages-0ea5e9?logo=materialformkdocs&logoColor=white"></a>
 </p>
 
@@ -47,6 +47,9 @@ Highlights:
 - **VeNCrypt 0.2** with X509None/X509Vnc and optional TLSNone/TLSVnc compatibility modes.
 - Optional legacy direct TLS transport.
 - Metrics, health checks and session instrumentation.
+- **Operational CLI** with `doctor`, config lifecycle, capture benchmark and local release checks.
+- Optional **Prometheus/health/readiness/status HTTP endpoint** for production deployments.
+- Configurable **clipboard direction, byte limits and opt-in UTF-8 interoperability mode**.
 - Test suite covering protocol, encoders, WebSocket handling, security, capture and end-to-end RFB communication.
 
 For the complete guides, configuration reference, architecture and troubleshooting documentation, see **https://xulek.github.io/PyVNCServer/**.
@@ -221,8 +224,6 @@ PyVNCServer 3.4 adds protocol support aimed especially at modern viewers and noV
 
 ContinuousUpdates runs inside the existing per-client session thread, so Tight/Zlib encoder state remains ordered. ExtendedDesktopSize now uses the correct **16-byte SCREEN record** and immediately advertises the current screen layout when negotiated.
 
-For details see `docs/MODERN_RFB.md` and `V3_4_RELEASE_NOTES.md`.
-
 ---
 
 ## Encoding support
@@ -282,8 +283,6 @@ monitor_index = 0
 When enabled with `capture_backend = "auto"`, PyVNCServer prefers MSS monitor `0`, which represents the virtual desktop spanning all displays. Physical monitor coordinates are normalized to the RFB framebuffer origin and reported through ExtendedDesktopSize.
 
 DXCam still captures one DXGI output per camera; use MSS/auto for a combined multi-monitor framebuffer.
-
-See `docs/MULTI_MONITOR.md`.
 
 ---
 
@@ -493,17 +492,43 @@ src/pyvncserver/
 │   ├── security.py            per-IP limits and auth throttling
 │   ├── connection_limiter.py
 │   └── connection_registry.py
-├── rfb/                       public protocol facade
+├── rfb/                       structured RFB subpackage
 ├── observability/             metrics / logging / profiling facades
+├── plugins/                   capture / encoding / security plugin contracts
+├── capture.py                 stable capture facade
+├── encodings.py               stable encoding facade
+├── protocol.py                stable protocol facade
+├── security.py                stable security facade
+├── errors.py                  stable exception facade
 ├── config.py                  validated TOML configuration
-└── cli.py                     command-line entry point
-
-src/vnc_lib/                    compatibility implementation layer
+├── cli.py                     command-line entry point
+└── _core/                     private implementation detail
 ```
 
-`vnc_lib` is retained for compatibility with existing imports while the public package surface is exposed under `pyvncserver`.
+---
 
-More detail: [architecture documentation](https://xulek.github.io/PyVNCServer/architecture/).
+### Observability
+
+```toml
+[observability]
+prometheus_enabled = true
+prometheus_host = "127.0.0.1"
+prometheus_port = 9100
+```
+
+This exposes `/metrics`, `/healthz`, `/readyz` and `/status`. The observability listener is disabled by default.
+
+### Clipboard policy
+
+```toml
+[clipboard]
+enabled = true
+direction = "both"
+max_bytes = 1048576
+encoding = "latin-1"
+```
+
+`utf-8` can be enabled explicitly when both endpoints agree on it; Latin-1 remains the compatibility default.
 
 ---
 
@@ -541,10 +566,10 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-Current 3.6.0 verification result:
+Current 4.0.0 verification result:
 
 ```text
-389 passed, 13 skipped
+417 passed, 13 skipped
 ```
 
 The skipped cases in the recorded verification environment are legacy/auth compatibility cases and do not affect Tight/RRE tests.
@@ -562,7 +587,10 @@ The suite includes coverage for:
 - capture producer behavior,
 - framebuffer/session logic,
 - packaging exports,
-- end-to-end RFB loopback communication.
+- end-to-end RFB loopback communication,
+- 4.0 package-boundary enforcement,
+- capture/encoding/security plugin integration,
+- encrypted-transport fail-closed behavior for security plugins.
 
 ### Syntax/bytecode check
 
@@ -581,8 +609,6 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 python -m compileall -q src tests
 ```
-
-The v3.6 package retains the real VeNCrypt/TLS end-to-end coverage and additionally tests adaptive pacing, CPU/network pressure classification, encoding reordering, Tight/JPEG tuning, region merging, shared cache safety and cache reuse across sequential and parallel encoder paths.
 
 ---
 
@@ -651,12 +677,12 @@ python -m twine check dist/*
 - Classic VNC authentication remains an 8-byte legacy password mechanism; use it inside VeNCrypt X509Vnc when possible.
 - Browser use requires a separately served noVNC frontend/static HTTP endpoint.
 - VeNCrypt is negotiated on raw RFB/TCP. Browser WebSocket deployments should use WSS/direct TLS or a TLS-terminating reverse proxy.
-- `vnc_lib` remains as a compatibility layer and can be progressively folded into the `pyvncserver` package structure.
+- The private `pyvncserver._core` namespace is not a public API; use the documented 4.x facades instead.
 
 ---
 
 <div align="center">
 
-**PyVNCServer 3.6.0** · Python 3.11+ · RFB 3.8 · [Documentation](https://xulek.github.io/PyVNCServer/)
+**PyVNCServer 4.0.0** · Python 3.11+ · RFB 3.8 · [Documentation](https://xulek.github.io/PyVNCServer/)
 
 </div>

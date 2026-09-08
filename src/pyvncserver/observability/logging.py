@@ -1,4 +1,4 @@
-from vnc_lib.structured_logging import (
+from pyvncserver._core.structured_logging import (
     AuditLogger,
     CorrelationContext,
     LogContext,

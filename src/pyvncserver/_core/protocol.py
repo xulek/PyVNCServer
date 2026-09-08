@@ -8,10 +8,10 @@ import logging
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Iterable, Any
 
-from vnc_lib.exceptions import ConnectionError, ProtocolError
-from vnc_lib.types import is_valid_pixel_format
-from vnc_lib.io_utils import recv_exact
-from vnc_lib.vencrypt import VeNCryptServer
+from pyvncserver._core.exceptions import ConnectionError, ProtocolError
+from pyvncserver._core.types import is_valid_pixel_format
+from pyvncserver._core.io_utils import recv_exact
+from pyvncserver._core.vencrypt import VeNCryptServer
 
 
 @dataclass(slots=True)
@@ -132,7 +132,8 @@ class RFBProtocol:
     DEFAULT_MAX_CLIENT_CUT_TEXT = 16 * 1024 * 1024  # 16 MiB
 
     def __init__(self, max_set_encodings: int | None = None,
-                 max_client_cut_text: int | None = None):
+                 max_client_cut_text: int | None = None,
+                 clipboard_encoding: str = "latin-1"):
         self.version = (3, 8)  # Default to highest supported version
         self.logger = logging.getLogger(__name__)
         self.max_set_encodings = (
@@ -145,6 +146,7 @@ class RFBProtocol:
             if max_client_cut_text is not None
             else self.DEFAULT_MAX_CLIENT_CUT_TEXT
         )
+        self.clipboard_encoding = clipboard_encoding
         self.use_last_rect = False
 
     def negotiate_version(self, client_socket) -> Tuple[int, int]:
@@ -213,7 +215,8 @@ class RFBProtocol:
                            read_only_password: Optional[str] = None,
                            allow_tight_security: bool = True,
                            vencrypt_server: VeNCryptServer | None = None,
-                           require_encrypted_transport: bool = False) -> SecurityHandshakeResult:
+                           require_encrypted_transport: bool = False,
+                           extra_security_plugins: Dict[int, Any] | None = None) -> SecurityHandshakeResult:
         """
         Negotiate security type (RFC 6143 Section 7.1.2)
 
@@ -226,6 +229,23 @@ class RFBProtocol:
             security_types: list[int] = []
             if vencrypt_server is not None and vencrypt_server.available_subtypes(has_vnc_auth):
                 security_types.append(self.SECURITY_VENCRYPT)
+
+            plugin_map = dict(extra_security_plugins or {})
+            for security_type, plugin in sorted(plugin_map.items()):
+                try:
+                    available = bool(plugin.is_available(has_vnc_auth))
+                except Exception as exc:
+                    self.logger.warning(
+                        "Security plugin %s availability check failed: %s",
+                        security_type,
+                        exc,
+                    )
+                    continue
+                if not available:
+                    continue
+                if require_encrypted_transport and not bool(getattr(plugin, "encrypted", False)):
+                    continue
+                security_types.append(int(security_type))
 
             if not require_encrypted_transport:
                 security_types.append(primary_security_type)
@@ -268,6 +288,34 @@ class RFBProtocol:
 
             if selected_type == self.SECURITY_TIGHT and allow_tight_security and not require_encrypted_transport:
                 return self._negotiate_tight_security(client_socket, has_vnc_auth)
+
+            if selected_type in plugin_map and selected_type in security_types:
+                plugin = plugin_map[selected_type]
+                if require_encrypted_transport and not bool(getattr(plugin, "encrypted", False)):
+                    client_socket.sendall(struct.pack(">I", 1))
+                    raise ConnectionError(
+                        f"Client selected unencrypted security plugin while encryption is required: {selected_type}"
+                    )
+                result = plugin.negotiate(client_socket, has_vnc_auth)
+                if require_encrypted_transport and not bool(result.encrypted):
+                    failure_socket = result.transport_socket or client_socket
+                    try:
+                        failure_socket.sendall(struct.pack(">I", 1))
+                    except Exception:
+                        pass
+                    raise ConnectionError(
+                        f"Security plugin {selected_type} did not establish the required encrypted transport"
+                    )
+                return SecurityHandshakeResult(
+                    security_type=selected_type,
+                    auth_type=int(result.auth_type),
+                    needs_auth=bool(result.needs_auth),
+                    tight_enabled=False,
+                    send_security_result_on_success=bool(result.send_security_result_on_success),
+                    send_security_result_on_failure=bool(result.send_security_result_on_failure),
+                    transport_socket=result.transport_socket,
+                    encrypted=bool(result.encrypted),
+                )
 
             if selected_type != primary_security_type or require_encrypted_transport:
                 self.logger.warning(f"Client selected unsupported security type: {selected_type}")
@@ -653,7 +701,7 @@ class RFBProtocol:
         if not text_data:
             raise ConnectionError("Failed to receive ClientCutText data")
 
-        return text_data.decode('latin-1', errors='replace')
+        return text_data.decode(self.clipboard_encoding, errors='replace')
 
     def send_framebuffer_update(self, client_socket, rectangles: list):
         """
@@ -712,7 +760,7 @@ class RFBProtocol:
 
     def send_server_cut_text(self, client_socket, text: str):
         """Send ServerCutText message (RFC 6143 Section 7.6.3)"""
-        text_bytes = text.encode('latin-1', errors='replace')
+        text_bytes = text.encode(self.clipboard_encoding, errors='replace')
         msg = struct.pack(">BxxxI", self.MSG_SERVER_CUT_TEXT, len(text_bytes)) + text_bytes
         client_socket.sendall(msg)
 

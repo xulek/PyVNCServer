@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pyvncserver import DEFAULT_CONFIG_PATH, VNCServer, VNCServerV3, load_config_file
+from pyvncserver import ClipboardSettings, DEFAULT_CONFIG_PATH, DoctorReport, VNCServer, VNCServerV3, load_config_file
 from pyvncserver.cli import build_parser
 from pyvncserver.features.websocket import WebSocketWrapper
 from pyvncserver.platform.capture import ScreenCapture
@@ -14,6 +14,8 @@ def test_packaged_exports_are_available():
     assert ScreenCapture is not None
     assert WebSocketWrapper is not None
     assert NetworkProfile.LAN.value == "lan"
+    assert ClipboardSettings().direction == "both"
+    assert DoctorReport is not None
 
 
 def test_default_toml_config_loads():

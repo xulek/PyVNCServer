@@ -12,6 +12,7 @@ Uses Python 3.13 features:
 
 import time
 import threading
+import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Protocol
 import sys
@@ -247,6 +248,11 @@ class VNCMetricsCollector:
             MetricType.COUNTER,
             'Total number of failed VNC connections'
         )
+        self._registry.register(
+            'vnc_failed_auth_attempts_total',
+            MetricType.COUNTER,
+            'Total failed VNC authentication attempts'
+        )
 
         # Bandwidth metrics
         self._registry.register(
@@ -372,26 +378,56 @@ class VNCMetricsCollector:
 
 
 class PrometheusHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for Prometheus metrics endpoint."""
+    """HTTP request handler for metrics, health, readiness and status."""
 
-    # Class variable to hold the registry
     registry: MetricsRegistry | None = None
+    status_provider: Callable[[], dict] | None = None
 
     def do_GET(self) -> None:
         """Handle GET requests."""
         if self.path == '/metrics':
             self.send_metrics()
-        elif self.path == '/health' or self.path == '/':
+        elif self.path in {'/health', '/healthz', '/'}:
             self.send_health()
+        elif self.path == '/readyz':
+            self.send_ready()
+        elif self.path == '/status':
+            self.send_status()
         else:
             self.send_error(404, "Not Found")
 
+    def _sync_status_metrics(self) -> None:
+        if not self.registry:
+            return
+        status = self._status()
+        mappings = {
+            'vnc_server_uptime_seconds': status.get('uptime_seconds', 0.0),
+            'vnc_connections_active': status.get('active_connections', 0),
+            'vnc_connections_total': status.get('total_connections', 0),
+            'vnc_failed_auth_attempts_total': status.get('failed_auth_attempts', 0),
+            'vnc_adaptive_target_fps': status.get('avg_adaptive_target_fps', 0.0),
+            'vnc_adaptive_pressure': status.get('avg_adaptive_pressure', 0.0),
+            'vnc_adaptive_overloaded_connections': status.get('overloaded_connections', 0),
+            'vnc_server_ready': 1.0 if status.get('ready', False) else 0.0,
+            'vnc_server_healthy': 1.0 if status.get('healthy', False) else 0.0,
+        }
+        for name, value in mappings.items():
+            self.registry.set_gauge(name, float(value), help_text=f'PyVNCServer runtime metric: {name}')
+        cache = status.get('encoded_region_cache') or {}
+        if isinstance(cache, dict):
+            for key in ('entries', 'bytes', 'hits', 'misses', 'evictions'):
+                if key in cache:
+                    self.registry.set_gauge(
+                        f'vnc_encoded_region_cache_{key}', float(cache[key]),
+                        help_text=f'Encoded-region cache {key}',
+                    )
+
     def send_metrics(self) -> None:
-        """Send metrics in Prometheus format."""
+        """Send live metrics in Prometheus format."""
         if not self.registry:
             self.send_error(500, "Metrics registry not initialized")
             return
-
+        self._sync_status_metrics()
         metrics_text = self.registry.to_prometheus_format()
 
         self.send_response(200)
@@ -400,14 +436,44 @@ class PrometheusHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(metrics_text.encode('utf-8'))
 
+    def _status(self) -> dict:
+        provider = type(self).status_provider
+        if provider is None:
+            return {'healthy': True, 'ready': True}
+        try:
+            return dict(provider())
+        except Exception as exc:
+            return {'healthy': False, 'ready': False, 'status_error': str(exc)}
+
     def send_health(self) -> None:
-        """Send health check response."""
-        response = "OK\n"
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/plain')
+        """Return liveness as plain text for probes."""
+        status = self._status()
+        healthy = bool(status.get('healthy', False))
+        response = ('OK' if healthy else 'UNHEALTHY') + '\n'
+        self.send_response(200 if healthy else 503)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
         self.send_header('Content-Length', str(len(response)))
         self.end_headers()
         self.wfile.write(response.encode('utf-8'))
+
+    def send_ready(self) -> None:
+        """Return readiness/capacity separately from liveness."""
+        status = self._status()
+        ready = bool(status.get('ready', False))
+        response = ('READY' if ready else 'NOT READY') + '\n'
+        self.send_response(200 if ready else 503)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(response)))
+        self.end_headers()
+        self.wfile.write(response.encode('utf-8'))
+
+    def send_status(self) -> None:
+        payload = json.dumps(self._status(), sort_keys=True).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def log_message(self, format: str, *args) -> None:
         """Override to reduce logging noise."""
@@ -424,13 +490,14 @@ class PrometheusExporter:
     """
 
     __slots__ = ('_registry', '_collector', '_server', '_thread',
-                 '_host', '_port', '_running')
+                 '_host', '_port', '_running', '_status_provider')
 
     def __init__(
         self,
         host: str = '127.0.0.1',
         port: int = 9100,
-        registry: MetricsRegistry | None = None
+        registry: MetricsRegistry | None = None,
+        status_provider: Callable[[], dict] | None = None,
     ):
         self._host = host
         self._port = port
@@ -439,16 +506,18 @@ class PrometheusExporter:
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._running = False
+        self._status_provider = status_provider
 
-        # Set the registry for the handler
-        PrometheusHandler.registry = self._registry
 
     def start(self) -> None:
         """Start the Prometheus metrics HTTP server."""
         if self._running:
             return
 
-        self._server = HTTPServer((self._host, self._port), PrometheusHandler)
+        handler_type = type('BoundPrometheusHandler', (PrometheusHandler,), {})
+        handler_type.registry = self._registry
+        handler_type.status_provider = self._status_provider
+        self._server = HTTPServer((self._host, self._port), handler_type)
         # Set socket timeout so handle_request doesn't block forever
         self._server.socket.settimeout(1.0)
         self._running = True
@@ -500,9 +569,25 @@ class PrometheusExporter:
         return self._running
 
     @property
+    def bound_port(self) -> int:
+        return int(self._server.server_port) if self._server is not None else int(self._port)
+
+    @property
     def url(self) -> str:
         """Get the metrics endpoint URL."""
-        return f"http://{self._host}:{self._port}/metrics"
+        return f"http://{self._host}:{self.bound_port}/metrics"
+
+    @property
+    def health_url(self) -> str:
+        return f"http://{self._host}:{self.bound_port}/healthz"
+
+    @property
+    def readiness_url(self) -> str:
+        return f"http://{self._host}:{self.bound_port}/readyz"
+
+    @property
+    def status_url(self) -> str:
+        return f"http://{self._host}:{self.bound_port}/status"
 
     def __enter__(self) -> Self:
         """Context manager entry."""

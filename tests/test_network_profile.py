@@ -1,7 +1,7 @@
 """Tests for NetworkProfile detection and LAN optimization features"""
 
 import pytest
-from vnc_lib.server_utils import NetworkProfile, detect_network_profile
+from pyvncserver._core.server_utils import NetworkProfile, detect_network_profile
 
 
 class TestNetworkProfile:

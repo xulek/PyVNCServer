@@ -396,7 +396,7 @@ class ReusableConnectionPool:
         return False
 
 
-# Backward compatibility for the legacy vnc_lib API. New code should use
+# Compatibility alias retained inside the private 4.x core. New code should use
 # ReusableConnectionPool; server admission control is ConnectionLimiter.
 ConnectionPool = ReusableConnectionPool
 

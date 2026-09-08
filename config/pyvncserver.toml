@@ -120,3 +120,14 @@ tight_disable_for_ultravnc = false
 [logging]
 log_level = "INFO"
 log_file = ""
+
+[clipboard]
+enabled = true
+direction = "both"
+max_bytes = 1048576
+encoding = "latin-1"
+
+[observability]
+prometheus_enabled = false
+prometheus_host = "127.0.0.1"
+prometheus_port = 9100

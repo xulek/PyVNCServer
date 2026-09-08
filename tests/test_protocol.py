@@ -7,8 +7,8 @@ import pytest
 import struct
 import socket
 from unittest.mock import Mock, MagicMock
-from vnc_lib.protocol import RFBProtocol
-from vnc_lib.exceptions import ProtocolError
+from pyvncserver._core.protocol import RFBProtocol
+from pyvncserver._core.exceptions import ProtocolError
 
 
 class MockSocket:
@@ -484,7 +484,7 @@ class TestHelperMethods:
 
     def test_recv_exact(self):
         """Test receiving exactly n bytes"""
-        from vnc_lib.io_utils import recv_exact
+        from pyvncserver._core.io_utils import recv_exact
         mock_socket = MockSocket(b"Hello, World!")
 
         data = recv_exact(mock_socket, 5)
@@ -495,7 +495,7 @@ class TestHelperMethods:
 
     def test_recv_exact_insufficient_data(self):
         """Test recv_exact with insufficient data"""
-        from vnc_lib.io_utils import recv_exact
+        from pyvncserver._core.io_utils import recv_exact
         mock_socket = MockSocket(b"Short")
 
         data = recv_exact(mock_socket, 100)

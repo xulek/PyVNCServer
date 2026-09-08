@@ -11,9 +11,9 @@ import threading
 import pytest
 
 from pyvncserver.config import ServerSettings
-from vnc_lib.exceptions import ConfigurationError, ConnectionError, ProtocolError
-from vnc_lib.protocol import RFBProtocol
-from vnc_lib.vencrypt import (
+from pyvncserver._core.exceptions import ConfigurationError, ConnectionError, ProtocolError
+from pyvncserver._core.protocol import RFBProtocol
+from pyvncserver._core.vencrypt import (
     VeNCryptServer,
     VENCRYPT_SUBTYPE_TLS_NONE,
     VENCRYPT_SUBTYPE_TLS_VNC,

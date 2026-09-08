@@ -8,9 +8,9 @@ import logging
 import threading
 import time
 
-from vnc_lib.capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
-from vnc_lib.change_detector import AdaptiveChangeDetector
-from vnc_lib.screen_capture import CaptureResult, ScreenCapture
+from pyvncserver._core.capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
+from pyvncserver._core.change_detector import AdaptiveChangeDetector
+from pyvncserver._core.screen_capture import CaptureResult, ScreenCapture
 
 
 NATIVE_BGR0 = {

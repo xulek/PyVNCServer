@@ -6,13 +6,13 @@ Python 3.13 compatible
 import unittest
 import struct
 import zlib
-from vnc_lib.encodings import (
+from pyvncserver._core.encodings import (
     RawEncoder, RREEncoder, HextileEncoder, ZlibEncoder, ZRLEEncoder,
     EncoderManager, EncodingNotSuitable, encoding_name, format_encoding_list
 )
-from vnc_lib.tight_encoding import TightEncoder
+from pyvncserver._core.tight_encoding import TightEncoder
 try:
-    from vnc_lib.jpeg_encoding import JPEGEncoder
+    from pyvncserver._core.jpeg_encoding import JPEGEncoder
     JPEG_TESTS_AVAILABLE = True
 except Exception:
     JPEG_TESTS_AVAILABLE = False

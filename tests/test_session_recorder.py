@@ -5,10 +5,10 @@ import tempfile
 import time
 from pathlib import Path
 
-from vnc_lib.session_recorder import (
+from pyvncserver._core.session_recorder import (
     SessionRecorder, SessionPlayer, SessionEvent, EventType
 )
-from vnc_lib.types import Rectangle
+from pyvncserver._core.types import Rectangle
 
 
 class TestSessionRecorder:

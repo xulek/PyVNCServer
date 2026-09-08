@@ -1,4 +1,4 @@
-from vnc_lib.performance_monitor import (
+from pyvncserver._core.performance_monitor import (
     MemoryProfiler,
     PerformanceCollector,
     PerformanceSample,

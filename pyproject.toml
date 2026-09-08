@@ -21,7 +21,7 @@ performance = [
     "dxcam>=0.3.0; platform_system == 'Windows'",
 ]
 h264 = ["av>=12.0"]
-dev = ["pytest>=8.0", "cryptography>=43"]
+dev = ["pytest>=8.0", "cryptography>=43", "mypy>=1.13", "ruff>=0.8"]
 
 [project.scripts]
 pyvncserver = "pyvncserver.cli:main"
@@ -34,7 +34,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-pyvncserver = ["default_config.toml"]
+pyvncserver = ["default_config.toml", "py.typed"]
 
 [tool.setuptools.dynamic]
 version = {attr = "pyvncserver._version.__version__"}
@@ -43,3 +43,32 @@ version = {attr = "pyvncserver._version.__version__"}
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
+
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = ["src/pyvncserver/_core"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_configs = true
+show_error_codes = true
+exclude = ["^src/pyvncserver/_core/"]
+
+[[tool.mypy.overrides]]
+module = [
+    "pyvncserver.app.*",
+    "pyvncserver.session.*",
+    "pyvncserver.runtime.*",
+    "pyvncserver.observability.*",
+    "pyvncserver.features.*",
+    "pyvncserver.platform.*",
+    "pyvncserver.rfb.*",
+]
+ignore_errors = true

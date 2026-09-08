@@ -11,8 +11,8 @@ import socket
 from typing import Iterable, Optional
 from enum import IntEnum
 
-from vnc_lib.exceptions import ConnectionError, ProtocolError
-from vnc_lib.io_utils import recv_exact
+from pyvncserver._core.exceptions import ConnectionError, ProtocolError
+from pyvncserver._core.io_utils import recv_exact
 
 
 class WebSocketOpcode(IntEnum):

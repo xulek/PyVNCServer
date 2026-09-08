@@ -176,6 +176,7 @@ class HealthChecker:
         self.health_checks: dict[str, Callable[[], bool]] = {}
         self.last_check_time: float = 0.0
         self.last_status: HealthStatus | None = None
+        self.last_check_results: dict[str, bool] = {}
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -235,16 +236,20 @@ class HealthChecker:
         all_healthy = True
         failed_checks: list[str] = []
 
+        results: dict[str, bool] = {}
         for name, check_func in self.health_checks.items():
             try:
-                is_healthy = check_func()
+                is_healthy = bool(check_func())
+                results[name] = is_healthy
                 if not is_healthy:
                     all_healthy = False
                     failed_checks.append(name)
             except Exception as e:
                 self.logger.error(f"Health check '{name}' failed: {e}")
+                results[name] = False
                 all_healthy = False
                 failed_checks.append(name)
+        self.last_check_results = results
 
         if not all_healthy:
             self.logger.warning(f"Health check failed: {', '.join(failed_checks)}")
@@ -365,7 +370,7 @@ class ConnectionLimiter:
 
 # Backward-compatible name retained for callers that imported ConnectionPool.
 # New code should use ConnectionLimiter to avoid confusion with the reusable
-# socket pool in vnc_lib.connection_pool.
+# socket pool in pyvncserver._core.connection_pool.
 ConnectionPool = ConnectionLimiter
 
 

@@ -8,7 +8,7 @@ from typing import Any, Mapping
 import ipaddress
 import tomllib
 
-from vnc_lib.exceptions import ConfigurationError
+from pyvncserver._core.exceptions import ConfigurationError
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("default_config.toml")
@@ -48,6 +48,16 @@ class WebSocketSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ClipboardSettings:
+    """Clipboard policy and size limits."""
+
+    enabled: bool = True
+    direction: str = "both"
+    max_bytes: int = 1024 * 1024
+    encoding: str = "latin-1"
+
+
+@dataclass(frozen=True, slots=True)
 class ServerSettings:
     """Typed core settings plus a compatibility mapping for tuning options."""
 
@@ -68,6 +78,7 @@ class ServerSettings:
     input_control_policy: str = "single-controller"
     security: SecuritySettings = field(default_factory=SecuritySettings)
     websocket: WebSocketSettings = field(default_factory=WebSocketSettings)
+    clipboard: ClipboardSettings = field(default_factory=ClipboardSettings)
     extra: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -110,6 +121,12 @@ class ServerSettings:
             auth_failure_window_seconds=float(data.get("auth_failure_window_seconds", 30.0)),
             auth_backoff_max_seconds=float(data.get("auth_backoff_max_seconds", 2.0)),
         )
+        clipboard = ClipboardSettings(
+            enabled=bool(data.get("clipboard_enabled", True)),
+            direction=str(data.get("clipboard_direction", "both")).strip().lower(),
+            max_bytes=int(data.get("clipboard_max_bytes", 1024 * 1024)),
+            encoding=str(data.get("clipboard_encoding", "latin-1")).strip().lower(),
+        )
         websocket = WebSocketSettings(
             allowed_origins=tuple(origin.strip() for origin in origins if origin.strip()),
             detect_timeout=float(data.get("websocket_detect_timeout", 0.5)),
@@ -133,6 +150,7 @@ class ServerSettings:
             "websocket_allowed_origins", "websocket_detect_timeout",
             "websocket_max_handshake_bytes", "websocket_max_payload_bytes",
             "websocket_max_buffer_bytes", "websocket_max_message_bytes",
+            "clipboard_enabled", "clipboard_direction", "clipboard_max_bytes", "clipboard_encoding",
         }
         extra = {key: value for key, value in data.items() if key not in known}
 
@@ -154,6 +172,7 @@ class ServerSettings:
             input_control_policy=str(data.get("input_control_policy", "single-controller")).strip().lower(),
             security=security,
             websocket=websocket,
+            clipboard=clipboard,
             extra=extra,
         )
         settings.validate()
@@ -315,6 +334,23 @@ class ServerSettings:
                 "security.require_encrypted_transport requires tls_enabled or vencrypt_enabled"
             )
 
+        if self.clipboard.direction not in {"both", "client-to-server", "server-to-client", "disabled"}:
+            raise ConfigurationError(
+                "clipboard.direction must be both, client-to-server, server-to-client, or disabled"
+            )
+        if self.clipboard.max_bytes < 1 or self.clipboard.max_bytes > 16 * 1024 * 1024:
+            raise ConfigurationError("clipboard.max_bytes must be between 1 and 16777216")
+        if self.clipboard.encoding not in {"latin-1", "utf-8"}:
+            raise ConfigurationError("clipboard.encoding must be 'latin-1' or 'utf-8'")
+
+        if bool(self.extra.get("observability_prometheus_enabled", False)):
+            try:
+                observability_port = int(self.extra.get("observability_prometheus_port", 9100))
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError("observability.prometheus_port must be an integer") from exc
+            if not 1 <= observability_port <= 65535:
+                raise ConfigurationError("observability.prometheus_port must be between 1 and 65535")
+
         if self.websocket.max_message_bytes < self.websocket.max_payload_bytes:
             raise ConfigurationError(
                 "websocket.max_message_bytes must be >= websocket.max_payload_bytes"
@@ -367,6 +403,10 @@ class ServerSettings:
             "websocket_max_payload_bytes": self.websocket.max_payload_bytes,
             "websocket_max_buffer_bytes": self.websocket.max_buffer_bytes,
             "websocket_max_message_bytes": self.websocket.max_message_bytes,
+            "clipboard_enabled": self.clipboard.enabled,
+            "clipboard_direction": self.clipboard.direction,
+            "clipboard_max_bytes": self.clipboard.max_bytes,
+            "clipboard_encoding": self.clipboard.encoding,
         })
         return values
 
@@ -417,7 +457,7 @@ def _flatten_toml_settings(data: dict[str, Any]) -> dict[str, Any]:
         if isinstance(section, dict):
             flat.update(section)
 
-    for section_name in ("lan", "websocket", "adaptive"):
+    for section_name in ("lan", "websocket", "adaptive", "clipboard", "observability"):
         section = data.get(section_name, {})
         if not isinstance(section, dict):
             continue

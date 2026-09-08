@@ -3,7 +3,7 @@
 import pytest
 import struct
 
-from vnc_lib.clipboard import (
+from pyvncserver._core.clipboard import (
     ClipboardManager, ClipboardData, ClipboardHistory,
     ClipboardFormat, sanitize_clipboard_text
 )
@@ -340,3 +340,24 @@ class TestClipboardUtilities:
         assert '\r' not in sanitized
         assert sanitized.count('\n') == 3
 
+
+
+def test_clipboard_direction_blocks_client_updates():
+    manager = ClipboardManager(direction='server-to-client')
+    text = b'blocked'
+    message = bytes([6, 0, 0, 0]) + struct.pack('!I', len(text)) + text
+    manager.handle_client_cut_text(message)
+    assert manager.get_client_clipboard_text() is None
+
+
+def test_clipboard_direction_blocks_server_updates():
+    manager = ClipboardManager(direction='client-to-server')
+    assert manager.set_server_clipboard('blocked') is None
+
+
+def test_clipboard_utf8_roundtrip():
+    manager = ClipboardManager(encoding='utf-8')
+    message = manager.set_server_clipboard('zażółć gęślą')
+    assert message is not None
+    payload = message[8:]
+    assert payload.decode('utf-8') == 'zażółć gęślą'

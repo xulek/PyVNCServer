@@ -6,9 +6,9 @@ import ctypes
 from dataclasses import dataclass
 import logging
 
-import vnc_lib.dxgi_metadata as dxgi_metadata
-from vnc_lib.capture_backends import CaptureMoveRect, DXCamCaptureBackend
-from vnc_lib.dxgi_metadata import DXGIFrameMetadata, DXGIMetadataHook, DXGIMetadataReader
+import pyvncserver._core.dxgi_metadata as dxgi_metadata
+from pyvncserver._core.capture_backends import CaptureMoveRect, DXCamCaptureBackend
+from pyvncserver._core.dxgi_metadata import DXGIFrameMetadata, DXGIMetadataHook, DXGIMetadataReader
 
 
 class _FakeReader:

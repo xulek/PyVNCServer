@@ -5,16 +5,16 @@ Tests: CopyRect encoding, desktop resize, exception groups, generics
 
 import pytest
 import struct
-from vnc_lib.encodings import CopyRectEncoder, EncoderManager
-from vnc_lib.desktop_resize import (
+from pyvncserver._core.encodings import CopyRectEncoder, EncoderManager
+from pyvncserver._core.desktop_resize import (
     Screen, DesktopSizeHandler,
     create_single_screen_layout, create_dual_screen_layout
 )
-from vnc_lib.exceptions import (
+from pyvncserver._core.exceptions import (
     VNCError, ProtocolError, AuthenticationError,
     ExceptionCollector, categorize_exceptions
 )
-from vnc_lib.metrics import SlidingWindow
+from pyvncserver._core.metrics import SlidingWindow
 
 
 class TestCopyRectEncoding:

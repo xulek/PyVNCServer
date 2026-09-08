@@ -1,4 +1,4 @@
-from vnc_lib.encodings import Encoder
+from pyvncserver._core.encodings import Encoder
 
 __all__ = ["Encoder"]
 

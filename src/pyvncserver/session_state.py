@@ -5,11 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from vnc_lib.change_detector import AdaptiveChangeDetector
-from vnc_lib.cursor import CursorEncoder, SystemCursorCapture
-from vnc_lib.encodings import EncoderManager
-from vnc_lib.metrics import ConnectionMetrics
-from vnc_lib.server_utils import NetworkProfile
+from pyvncserver._core.change_detector import AdaptiveChangeDetector
+from pyvncserver._core.cursor import CursorEncoder, SystemCursorCapture
+from pyvncserver._core.encodings import EncoderManager
+from pyvncserver._core.metrics import ConnectionMetrics
+from pyvncserver._core.server_utils import NetworkProfile
 
 
 @dataclass(slots=True)

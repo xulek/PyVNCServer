@@ -44,7 +44,8 @@ class ScreenCapture:
 
     def __init__(self, scale_factor: float = 1.0, monitor: int = 0,
                  backend_preference: str = "auto",
-                 capture_all_monitors: bool = False):
+                 capture_all_monitors: bool = False,
+                 backend_factories: dict[str, Any] | None = None):
         """
         Initialize screen capture
 
@@ -63,6 +64,7 @@ class ScreenCapture:
         self._backend: BaseCaptureBackend | None = None
         self._backend_registry: dict[str, BaseCaptureBackend] = {}
         self._backend_failures: dict[str, int] = {}
+        self._plugin_backend_factories = dict(backend_factories or {})
 
         # Try to load dxcam (DXGI Desktop Duplication backend)
         self._dxcam_available = False
@@ -217,17 +219,25 @@ class ScreenCapture:
                 self._pil_available = False
 
     def _build_backend_registry(self):
-        """Build backend adapters once imports/availability probes are ready."""
+        """Build built-in and per-server plugin backend adapters."""
         self._backend_registry = {
             "dxcam": DXCamCaptureBackend(self),
             "mss": MSSCaptureBackend(self),
             "pil": PILCaptureBackend(self),
         }
+        for name, factory in getattr(self, "_plugin_backend_factories", {}).items():
+            normalized = str(name).strip().lower()
+            if not normalized or normalized in self._backend_registry or normalized == "auto":
+                raise ValueError(f"invalid or duplicate capture backend plugin name: {name!r}")
+            backend = factory(self)
+            if not hasattr(backend, "healthcheck") or not hasattr(backend, "build_metadata"):
+                raise TypeError(f"capture backend plugin {normalized!r} does not implement the backend contract")
+            self._backend_registry[normalized] = backend
         self._backend_failures = {name: 0 for name in self._backend_registry}
 
     def _apply_backend_preference(self):
         """Honor explicit backend preference without hiding fallback behavior."""
-        if self.backend_preference not in {"auto", "dxcam", "mss", "pil"}:
+        if self.backend_preference != "auto" and self.backend_preference not in self._backend_registry:
             self.logger.warning(
                 "Unknown capture backend preference '%s'; using auto",
                 self.backend_preference,
@@ -246,6 +256,18 @@ class ScreenCapture:
             self.logger.info(
                 "capture_all_monitors=true: using MSS virtual desktop capture"
             )
+            return
+
+        if self.backend_preference not in {"auto", "dxcam", "mss", "pil"}:
+            backend = self._backend_registry[self.backend_preference]
+            if backend.healthcheck():
+                self._set_active_backend(self.backend_preference)
+                self.logger.info("Using plugin capture backend '%s'", self.backend_preference)
+            else:
+                self.logger.warning(
+                    "capture_backend='%s' requested, but the plugin backend is unavailable or unhealthy",
+                    self.backend_preference,
+                )
             return
 
         if self.backend_preference == "dxcam":
@@ -311,7 +333,9 @@ class ScreenCapture:
             "mss": ["pil"],
             "pil": [],
         }
-        return order_map.get(failed_backend, [])
+        if failed_backend in order_map:
+            return order_map[failed_backend]
+        return [name for name in ("dxcam", "mss", "pil") if name in self._backend_registry]
 
     def _switch_to_fallback_backend(self, failed_backend: str, reason: str) -> bool:
         """Switch to the next healthy backend after a runtime failure."""

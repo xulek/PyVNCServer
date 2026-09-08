@@ -4,14 +4,14 @@ import socket
 import struct
 import time
 
-from vnc_lib.capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
-from vnc_lib.cursor import CursorEncoder, SystemCursorCapture
-from vnc_lib.encodings import EncoderManager, EncodingNotSuitable, encoding_name
-from vnc_lib.io_utils import recv_exact
-from vnc_lib.protocol import RFBProtocol
-from vnc_lib.screen_capture import ScreenCapture
-from vnc_lib.server_utils import NetworkProfile
-from vnc_lib.types import is_valid_pixel_format
+from pyvncserver._core.capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
+from pyvncserver._core.cursor import CursorEncoder, SystemCursorCapture
+from pyvncserver._core.encodings import EncoderManager, EncodingNotSuitable, encoding_name
+from pyvncserver._core.io_utils import recv_exact
+from pyvncserver._core.protocol import RFBProtocol
+from pyvncserver._core.screen_capture import ScreenCapture
+from pyvncserver._core.server_utils import NetworkProfile
+from pyvncserver._core.types import is_valid_pixel_format
 from pyvncserver.platform.producer import FrameSnapshot
 
 

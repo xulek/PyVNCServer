@@ -6,8 +6,8 @@ import logging
 import threading
 from types import SimpleNamespace
 
-from vnc_lib.capture_backends import CaptureFrame
-from vnc_lib.screen_capture import ScreenCapture, CaptureResult
+from pyvncserver._core.capture_backends import CaptureFrame
+from pyvncserver._core.screen_capture import ScreenCapture, CaptureResult
 
 
 def _capture_without_init() -> ScreenCapture:

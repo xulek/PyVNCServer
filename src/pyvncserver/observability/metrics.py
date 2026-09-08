@@ -1,4 +1,4 @@
-from vnc_lib.metrics import ConnectionMetrics, PerformanceMonitor, ServerMetrics, SlidingWindow, format_bytes, format_duration
+from pyvncserver._core.metrics import ConnectionMetrics, PerformanceMonitor, ServerMetrics, SlidingWindow, format_bytes, format_duration
 
 __all__ = [
     "ConnectionMetrics",

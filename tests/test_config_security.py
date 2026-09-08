@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from pyvncserver.config import ServerSettings, load_config_file
-from vnc_lib.exceptions import ConfigurationError
+from pyvncserver._core.exceptions import ConfigurationError
 
 
 def test_missing_config_fails_closed(tmp_path: Path):

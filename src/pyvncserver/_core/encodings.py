@@ -1603,7 +1603,8 @@ class EncoderManager:
 
     def __init__(self, enable_tight: bool = True, enable_h264: bool = False,
                  enable_jpeg: bool = True, disable_tight_for_ultravnc: bool = False,
-                 enable_copyrect: bool = False, enable_zrle: bool = False):
+                 enable_copyrect: bool = False, enable_zrle: bool = False,
+                 extra_encoders: dict[int, Encoder] | None = None):
         self.logger = logging.getLogger(__name__)
         self.encoders: dict[int, Encoder] = {
             0: RawEncoder(),
@@ -1619,7 +1620,7 @@ class EncoderManager:
 
         if enable_tight:
             try:
-                from vnc_lib.tight_encoding import TightEncoder
+                from pyvncserver._core.tight_encoding import TightEncoder
                 self.encoders[7] = TightEncoder()
                 self.logger.info("Tight encoding enabled")
             except ImportError as e:
@@ -1627,7 +1628,7 @@ class EncoderManager:
 
         if enable_jpeg:
             try:
-                from vnc_lib.jpeg_encoding import JPEGEncoder
+                from pyvncserver._core.jpeg_encoding import JPEGEncoder
                 self.encoders[21] = JPEGEncoder()
                 self.logger.info("JPEG encoding enabled")
             except ImportError as e:
@@ -1635,6 +1636,15 @@ class EncoderManager:
 
         if enable_h264:
             self.logger.info("H.264 encoding enabled (per-client initialization)")
+
+        for encoding_id, encoder in (extra_encoders or {}).items():
+            normalized = int(encoding_id)
+            if normalized in self.encoders:
+                raise ValueError(f"encoding id is already registered: {normalized}")
+            if not callable(getattr(encoder, "encode", None)):
+                raise TypeError(f"encoder plugin {normalized} does not implement encode()")
+            self.encoders[normalized] = encoder
+            self.logger.info("Plugin rectangle encoding enabled: %s", normalized)
 
         self._disable_tight_for_ultravnc = disable_tight_for_ultravnc
 

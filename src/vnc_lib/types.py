@@ -221,3 +221,4 @@ class SecurityTypes:
     NONE: SecurityType = 1
     VNC_AUTH: SecurityType = 2
     TIGHT: SecurityType = 16
+    VENCRYPT: SecurityType = 19

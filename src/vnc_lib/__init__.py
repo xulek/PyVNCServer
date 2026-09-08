@@ -6,6 +6,7 @@ from pyvncserver._version import __version__
 
 from .protocol import RFBProtocol
 from .auth import VNCAuth, NoAuth
+from .vencrypt import VeNCryptServer, VeNCryptResult
 from .input_handler import InputHandler
 from .screen_capture import ScreenCapture, CaptureResult
 from .capture_backends import CaptureFrame, CaptureMetadata, CaptureMoveRect
@@ -68,7 +69,7 @@ except ImportError:
     pass
 
 __all__ = [
-    'RFBProtocol', 'VNCAuth', 'NoAuth', 'InputHandler',
+    'RFBProtocol', 'VNCAuth', 'NoAuth', 'VeNCryptServer', 'VeNCryptResult', 'InputHandler',
     'ScreenCapture', 'CaptureResult', 'CaptureFrame', 'CaptureMetadata',
     'CaptureMoveRect',
     'RawEncoder', 'RREEncoder', 'HextileEncoder', 'ZRLEEncoder',

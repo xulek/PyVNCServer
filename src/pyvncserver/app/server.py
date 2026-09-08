@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from vnc_lib.protocol import RFBProtocol
+from vnc_lib.vencrypt import VeNCryptServer, parse_minimum_tls_version
 from vnc_lib.io_utils import recv_exact
 from vnc_lib.auth import VNCAuth, CRYPTO_AVAILABLE
 from vnc_lib.input_handler import InputHandler
@@ -104,11 +105,38 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
         self.tls_context: ssl.SSLContext | None = None
         if self.settings.security.tls_enabled:
             self.tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            self.tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            self.tls_context.minimum_version = parse_minimum_tls_version(
+                self.settings.security.tls_minimum_version
+            )
+            self.tls_context.options |= getattr(ssl, "OP_NO_COMPRESSION", 0)
             self.tls_context.load_cert_chain(
                 self.settings.security.tls_cert_file,
                 self.settings.security.tls_key_file,
             )
+
+        self.vencrypt_server: VeNCryptServer | None = None
+        if self.settings.security.vencrypt_enabled:
+            self.vencrypt_server = VeNCryptServer(
+                cert_file=self.settings.security.tls_cert_file,
+                key_file=self.settings.security.tls_key_file,
+                subtype_names=self.settings.security.vencrypt_subtypes,
+                allow_anonymous_tls=self.settings.security.vencrypt_allow_anonymous_tls,
+                allow_no_auth_with_password=(
+                    self.settings.security.vencrypt_allow_no_auth_with_password
+                ),
+                minimum_tls_version=self.settings.security.tls_minimum_version,
+                logger=self.logger,
+            )
+            try:
+                self.vencrypt_subtypes = self.vencrypt_server.validate_configuration(
+                    has_vnc_auth=bool(self.password or self.read_only_password)
+                )
+            except (ValueError, ssl.SSLError, OSError, VNCConnectionError) as exc:
+                raise ConfigurationError(
+                    f"Invalid VeNCrypt configuration: {exc}"
+                ) from exc
+        else:
+            self.vencrypt_subtypes = ()
 
         # Features
         self.enable_region_detection = self.config.get('enable_region_detection', True)
@@ -353,13 +381,26 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                 "Server is running without VNC authentication on loopback only. "
                 "Use a password before binding to a non-loopback interface."
             )
-        elif self.tls_context is None and self.host not in {'127.0.0.1', '::1', 'localhost'}:
+        elif (
+            self.tls_context is None
+            and self.vencrypt_server is None
+            and self.host not in {'127.0.0.1', '::1', 'localhost'}
+        ):
             self.logger.warning(
                 "Classic VNC authentication protects the password challenge but does not "
-                "encrypt framebuffer/input traffic. Consider TLS, SSH, or a VPN."
+                "encrypt framebuffer/input traffic. Consider VeNCrypt, TLS, SSH, or a VPN."
             )
         if self.tls_context is not None:
-            self.logger.info("TLS transport enabled (minimum TLS 1.2)")
+            self.logger.info(
+                "Legacy direct TLS transport enabled (minimum TLS %s)",
+                self.settings.security.tls_minimum_version,
+            )
+        if self.vencrypt_server is not None:
+            self.logger.info(
+                "VeNCrypt 0.2 enabled: subtypes=%s, require_encrypted_transport=%s",
+                ",".join(str(value) for value in self.vencrypt_subtypes),
+                self.settings.security.require_encrypted_transport,
+            )
         self._log_capture_probe()
 
     def _load_config(self, config_file: str | Path) -> dict:
@@ -609,6 +650,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                 conn_metrics = self.metrics.register_connection(client_id)
 
             # Optional WebSocket support (for browser/noVNC clients)
+            is_websocket_transport = False
             if self.enable_websocket:
                 try:
                     from vnc_lib.websocket_wrapper import (
@@ -628,6 +670,7 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                             allowed_origins=self.websocket_allowed_origins,
                             max_buffer_bytes=self.websocket_max_buffer_bytes,
                         )
+                        is_websocket_transport = True
                         with self._client_registry_lock:
                             self._all_client_sockets[client_id] = client_socket
                 except Exception as e:
@@ -651,7 +694,19 @@ class VNCServerV3(SessionRuntimeMixin, SessionLoopMixin):
                     self.password,
                     read_only_password=self.read_only_password,
                     allow_tight_security=self.enable_tight_security,
+                    vencrypt_server=(
+                        None if is_websocket_transport else self.vencrypt_server
+                    ),
+                    require_encrypted_transport=(
+                        self.settings.security.require_encrypted_transport
+                        and self.tls_context is None
+                    ),
                 )
+
+            if security.transport_socket is not None:
+                client_socket = security.transport_socket
+                with self._client_registry_lock:
+                    self._all_client_sockets[client_id] = client_socket
 
             # Step 3: Authentication
             view_only_session = False

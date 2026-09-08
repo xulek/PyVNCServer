@@ -23,9 +23,20 @@ input_control_policy = "single-controller"
 password = ""
 read_only_password = ""
 allow_insecure_no_auth = false
+# Legacy direct TLS wrapper. Prefer VeNCrypt for standards-based RFB TLS negotiation.
 tls_enabled = false
 tls_cert_file = ""
 tls_key_file = ""
+tls_minimum_version = "1.2"
+
+# VeNCrypt 0.2 (RFB security type 19). Empty subtypes = automatic:
+# X509Vnc when a VNC password is configured, otherwise X509None.
+vencrypt_enabled = false
+vencrypt_subtypes = []
+vencrypt_allow_anonymous_tls = false
+vencrypt_allow_no_auth_with_password = false
+require_encrypted_transport = false
+
 auth_max_failures = 5
 auth_failure_window_seconds = 30.0
 auth_backoff_max_seconds = 2.0

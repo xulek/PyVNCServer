@@ -24,6 +24,12 @@ class SecuritySettings:
     tls_enabled: bool = False
     tls_cert_file: str = ""
     tls_key_file: str = ""
+    tls_minimum_version: str = "1.2"
+    vencrypt_enabled: bool = False
+    vencrypt_subtypes: tuple[str, ...] = ()
+    vencrypt_allow_anonymous_tls: bool = False
+    vencrypt_allow_no_auth_with_password: bool = False
+    require_encrypted_transport: bool = False
     auth_max_failures: int = 5
     auth_failure_window_seconds: float = 30.0
     auth_backoff_max_seconds: float = 2.0
@@ -81,6 +87,12 @@ class ServerSettings:
         else:
             origins = tuple(str(item) for item in origins or ())
 
+        vencrypt_subtypes_raw = data.get("vencrypt_subtypes", ())
+        if isinstance(vencrypt_subtypes_raw, str):
+            vencrypt_subtypes = (vencrypt_subtypes_raw,)
+        else:
+            vencrypt_subtypes = tuple(str(item) for item in vencrypt_subtypes_raw or ())
+
         security = SecuritySettings(
             password=str(data.get("password", "")),
             read_only_password=str(data.get("read_only_password", "")),
@@ -88,6 +100,12 @@ class ServerSettings:
             tls_enabled=bool(data.get("tls_enabled", False)),
             tls_cert_file=str(data.get("tls_cert_file", "")).strip(),
             tls_key_file=str(data.get("tls_key_file", "")).strip(),
+            tls_minimum_version=str(data.get("tls_minimum_version", "1.2")).strip(),
+            vencrypt_enabled=bool(data.get("vencrypt_enabled", False)),
+            vencrypt_subtypes=tuple(item.strip() for item in vencrypt_subtypes if item.strip()),
+            vencrypt_allow_anonymous_tls=bool(data.get("vencrypt_allow_anonymous_tls", False)),
+            vencrypt_allow_no_auth_with_password=bool(data.get("vencrypt_allow_no_auth_with_password", False)),
+            require_encrypted_transport=bool(data.get("require_encrypted_transport", False)),
             auth_max_failures=int(data.get("auth_max_failures", 5)),
             auth_failure_window_seconds=float(data.get("auth_failure_window_seconds", 30.0)),
             auth_backoff_max_seconds=float(data.get("auth_backoff_max_seconds", 2.0)),
@@ -108,7 +126,9 @@ class ServerSettings:
             "max_connections_per_ip", "max_unauthenticated_connections",
             "handshake_timeout", "client_socket_timeout",
             "input_control_policy", "password", "read_only_password", "allow_insecure_no_auth",
-            "tls_enabled", "tls_cert_file", "tls_key_file",
+            "tls_enabled", "tls_cert_file", "tls_key_file", "tls_minimum_version",
+            "vencrypt_enabled", "vencrypt_subtypes", "vencrypt_allow_anonymous_tls",
+            "vencrypt_allow_no_auth_with_password", "require_encrypted_transport",
             "auth_max_failures", "auth_failure_window_seconds", "auth_backoff_max_seconds",
             "websocket_allowed_origins", "websocket_detect_timeout",
             "websocket_max_handshake_bytes", "websocket_max_payload_bytes",
@@ -205,10 +225,79 @@ class ServerSettings:
             raise ConfigurationError(
                 "security.password and security.read_only_password must be different"
             )
-        if self.security.tls_enabled:
+        if self.security.tls_minimum_version not in {"1.2", "1.3"}:
+            raise ConfigurationError("security.tls_minimum_version must be '1.2' or '1.3'")
+
+        if self.security.tls_enabled and self.security.vencrypt_enabled:
+            raise ConfigurationError(
+                "security.tls_enabled (legacy direct TLS) and security.vencrypt_enabled "
+                "cannot be enabled at the same time"
+            )
+
+        allowed_vencrypt_subtypes = {
+            "tls-none", "tlsnone", "tls-vnc", "tlsvnc",
+            "x509-none", "x509none", "x509-vnc", "x509vnc",
+        }
+        normalized_subtypes = tuple(
+            item.strip().lower().replace("_", "-")
+            for item in self.security.vencrypt_subtypes
+        )
+        invalid_subtypes = [
+            item for item in normalized_subtypes if item not in allowed_vencrypt_subtypes
+        ]
+        if invalid_subtypes:
+            raise ConfigurationError(
+                "Unsupported security.vencrypt_subtypes: " + ", ".join(invalid_subtypes)
+            )
+        anonymous_requested = any(item.startswith("tls") for item in normalized_subtypes)
+        x509_requested = any(item.startswith("x509") for item in normalized_subtypes)
+
+        if self.security.vencrypt_enabled:
+            # Empty subtype list means automatic X509Vnc/X509None selection.
+            needs_x509_identity = not normalized_subtypes or x509_requested
+            if needs_x509_identity:
+                if not self.security.tls_cert_file or not self.security.tls_key_file:
+                    raise ConfigurationError(
+                        "VeNCrypt X509 subtypes require tls_cert_file and tls_key_file"
+                    )
+            if anonymous_requested and not self.security.vencrypt_allow_anonymous_tls:
+                raise ConfigurationError(
+                    "TLSNone/TLSVnc require security.vencrypt_allow_anonymous_tls=true"
+                )
+
+            if normalized_subtypes:
+                has_vnc_auth = bool(
+                    self.security.password or self.security.read_only_password
+                )
+                usable_subtypes = []
+                for subtype in normalized_subtypes:
+                    requires_vnc = subtype in {"tls-vnc", "tlsvnc", "x509-vnc", "x509vnc"}
+                    no_auth = subtype in {"tls-none", "tlsnone", "x509-none", "x509none"}
+                    if requires_vnc and not has_vnc_auth:
+                        continue
+                    if (
+                        no_auth
+                        and has_vnc_auth
+                        and not self.security.vencrypt_allow_no_auth_with_password
+                    ):
+                        continue
+                    usable_subtypes.append(subtype)
+                if not usable_subtypes:
+                    raise ConfigurationError(
+                        "security.vencrypt_subtypes contains no subtype usable with "
+                        "the current VNC authentication policy"
+                    )
+
+        if self.security.tls_enabled or (
+            self.security.vencrypt_enabled
+            and (
+                not normalized_subtypes
+                or x509_requested
+            )
+        ):
             if not self.security.tls_cert_file or not self.security.tls_key_file:
                 raise ConfigurationError(
-                    "security.tls_enabled requires tls_cert_file and tls_key_file"
+                    "TLS/X509 security requires tls_cert_file and tls_key_file"
                 )
             if not Path(self.security.tls_cert_file).is_file():
                 raise ConfigurationError(
@@ -218,6 +307,13 @@ class ServerSettings:
                 raise ConfigurationError(
                     f"TLS key file not found: {self.security.tls_key_file}"
                 )
+
+        if self.security.require_encrypted_transport and not (
+            self.security.tls_enabled or self.security.vencrypt_enabled
+        ):
+            raise ConfigurationError(
+                "security.require_encrypted_transport requires tls_enabled or vencrypt_enabled"
+            )
 
         if self.websocket.max_message_bytes < self.websocket.max_payload_bytes:
             raise ConfigurationError(
@@ -256,6 +352,12 @@ class ServerSettings:
             "tls_enabled": self.security.tls_enabled,
             "tls_cert_file": self.security.tls_cert_file,
             "tls_key_file": self.security.tls_key_file,
+            "tls_minimum_version": self.security.tls_minimum_version,
+            "vencrypt_enabled": self.security.vencrypt_enabled,
+            "vencrypt_subtypes": list(self.security.vencrypt_subtypes),
+            "vencrypt_allow_anonymous_tls": self.security.vencrypt_allow_anonymous_tls,
+            "vencrypt_allow_no_auth_with_password": self.security.vencrypt_allow_no_auth_with_password,
+            "require_encrypted_transport": self.security.require_encrypted_transport,
             "auth_max_failures": self.security.auth_max_failures,
             "auth_failure_window_seconds": self.security.auth_failure_window_seconds,
             "auth_backoff_max_seconds": self.security.auth_backoff_max_seconds,

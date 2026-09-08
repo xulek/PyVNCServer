@@ -13,6 +13,7 @@ from .exceptions import (
 from .messages import EncodingTypes, MessageTypes, SecurityTypes
 from .pixel_format import PixelFormat, is_valid_pixel_format
 from .protocol import RFBProtocol
+from .security import VeNCryptResult, VeNCryptServer
 
 __all__ = [
     "AuthenticationError",
@@ -28,6 +29,8 @@ __all__ = [
     "ScreenCaptureError",
     "SecurityTypes",
     "VNCAuth",
+    "VeNCryptResult",
+    "VeNCryptServer",
     "VNCError",
     "is_valid_pixel_format",
 ]

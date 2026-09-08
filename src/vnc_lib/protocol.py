@@ -6,11 +6,12 @@ Handles protocol version negotiation, security, and message parsing
 import struct
 import logging
 from dataclasses import dataclass
-from typing import Tuple, Optional, Dict, Iterable
+from typing import Tuple, Optional, Dict, Iterable, Any
 
 from vnc_lib.exceptions import ConnectionError, ProtocolError
 from vnc_lib.types import is_valid_pixel_format
 from vnc_lib.io_utils import recv_exact
+from vnc_lib.vencrypt import VeNCryptServer
 
 
 @dataclass(slots=True)
@@ -21,6 +22,9 @@ class SecurityHandshakeResult:
     tight_enabled: bool
     send_security_result_on_success: bool
     send_security_result_on_failure: bool
+    transport_socket: Any | None = None
+    vencrypt_subtype: int | None = None
+    encrypted: bool = False
 
 
 @dataclass(slots=True)
@@ -66,6 +70,7 @@ class RFBProtocol:
     SECURITY_NONE = 1
     SECURITY_VNC_AUTH = 2
     SECURITY_TIGHT = 16
+    SECURITY_VENCRYPT = 19
 
     TIGHT_VENDOR_STANDARD = b"STDV"
     TIGHT_AUTH_SIG_VNC = b"VNCAUTH_"
@@ -206,7 +211,9 @@ class RFBProtocol:
 
     def negotiate_security(self, client_socket, password: Optional[str],
                            read_only_password: Optional[str] = None,
-                           allow_tight_security: bool = True) -> SecurityHandshakeResult:
+                           allow_tight_security: bool = True,
+                           vencrypt_server: VeNCryptServer | None = None,
+                           require_encrypted_transport: bool = False) -> SecurityHandshakeResult:
         """
         Negotiate security type (RFC 6143 Section 7.1.2)
 
@@ -216,9 +223,18 @@ class RFBProtocol:
         primary_security_type = self.SECURITY_VNC_AUTH if has_vnc_auth else self.SECURITY_NONE
 
         if self.version >= (3, 7):
-            security_types = [primary_security_type]
-            if allow_tight_security:
-                security_types.append(self.SECURITY_TIGHT)
+            security_types: list[int] = []
+            if vencrypt_server is not None and vencrypt_server.available_subtypes(has_vnc_auth):
+                security_types.append(self.SECURITY_VENCRYPT)
+
+            if not require_encrypted_transport:
+                security_types.append(primary_security_type)
+                if allow_tight_security:
+                    security_types.append(self.SECURITY_TIGHT)
+
+            if not security_types:
+                raise ConnectionError("No usable RFB security types are configured")
+
             client_socket.sendall(struct.pack("B", len(security_types)))
             for st in security_types:
                 client_socket.sendall(struct.pack("B", st))
@@ -229,10 +245,31 @@ class RFBProtocol:
                 raise ConnectionError("Client disconnected during security negotiation")
 
             selected_type = struct.unpack("B", selected)[0]
-            if selected_type == self.SECURITY_TIGHT and allow_tight_security:
+            if selected_type == self.SECURITY_VENCRYPT and vencrypt_server is not None:
+                result = vencrypt_server.negotiate(
+                    client_socket,
+                    has_vnc_auth=has_vnc_auth,
+                )
+                return SecurityHandshakeResult(
+                    security_type=self.SECURITY_VENCRYPT,
+                    auth_type=(
+                        self.SECURITY_VNC_AUTH
+                        if result.needs_auth
+                        else self.SECURITY_NONE
+                    ),
+                    needs_auth=result.needs_auth,
+                    tight_enabled=False,
+                    send_security_result_on_success=True,
+                    send_security_result_on_failure=True,
+                    transport_socket=result.socket,
+                    vencrypt_subtype=result.subtype,
+                    encrypted=True,
+                )
+
+            if selected_type == self.SECURITY_TIGHT and allow_tight_security and not require_encrypted_transport:
                 return self._negotiate_tight_security(client_socket, has_vnc_auth)
 
-            if selected_type != primary_security_type:
+            if selected_type != primary_security_type or require_encrypted_transport:
                 self.logger.warning(f"Client selected unsupported security type: {selected_type}")
                 # Send security result: failed
                 client_socket.sendall(struct.pack(">I", 1))
@@ -250,6 +287,10 @@ class RFBProtocol:
                 send_security_result_on_failure=True,
             )
         else:
+            if require_encrypted_transport:
+                raise ConnectionError(
+                    "Encrypted transport is required but RFB 3.3 cannot negotiate VeNCrypt"
+                )
             # RFB 003.003: just send security type as 32-bit value
             client_socket.sendall(struct.pack(">I", primary_security_type))
             self.logger.info(f"Security type sent (RFB 003.003): {primary_security_type}")

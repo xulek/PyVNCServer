@@ -378,3 +378,76 @@ allow_client_resize = false
         server.shutdown_handler.shutdown()
         thread.join(timeout=5.0)
         assert not thread.is_alive()
+
+
+def test_real_server_vencrypt_x509_none_full_handshake(tmp_path, monkeypatch, tls_identity):
+    """VeNCrypt X509None upgrades the real server socket before SecurityResult."""
+    import ssl
+
+    monkeypatch.setattr(server_module, "ScreenCapture", _FakeCapture)
+    monkeypatch.setattr(server_module, "InputHandler", _FakeInputHandler)
+
+    cert, key = tls_identity
+    port = _free_tcp_port()
+    config = tmp_path / "server-vencrypt.toml"
+    config.write_text(
+        f'''[server]\nhost = "127.0.0.1"\nport = {port}\nframe_rate = 30\nlan_frame_rate = 30\nnetwork_profile_override = "auto"\nmax_connections = 2\nmax_connections_per_ip = 2\nmax_unauthenticated_connections = 2\nhandshake_timeout = 3.0\nclient_socket_timeout = 3.0\n\n[security]\nvencrypt_enabled = true\nvencrypt_subtypes = ["x509-none"]\ntls_cert_file = "{cert.as_posix()}"\ntls_key_file = "{key.as_posix()}"\nrequire_encrypted_transport = true\n\n[features]\nenable_metrics = false\nenable_health_checks = false\nenable_capture_producer = false\nenable_parallel_encoding = false\nenable_region_detection = false\nenable_websocket = false\nenable_tight_extensions = false\nenable_tight_encoding = false\nenable_jpeg_encoding = false\nenable_zrle_encoding = false\nenable_copyrect_encoding = false\n''',
+        encoding="utf-8",
+    )
+
+    server = server_module.VNCServerV3(config)
+    thread = threading.Thread(target=server.start, name="test-vnc-vencrypt")
+    thread.start()
+
+    client = socket.create_connection(("127.0.0.1", port), timeout=3.0)
+    client.settimeout(3.0)
+    try:
+        version = _recv_exact(client, 12)
+        assert version == b"RFB 003.008\n"
+        client.sendall(version)
+
+        count = _recv_exact(client, 1)[0]
+        security_types = _recv_exact(client, count)
+        assert security_types == b"\x13"  # encryption is required
+        client.sendall(b"\x13")
+
+        assert _recv_exact(client, 2) == b"\x00\x02"
+        client.sendall(b"\x00\x02")
+        assert _recv_exact(client, 1) == b"\x00"
+        subtype_count = _recv_exact(client, 1)[0]
+        assert subtype_count == 1
+        assert struct.unpack(">I", _recv_exact(client, 4))[0] == 260
+        client.sendall(struct.pack(">I", 260))
+        assert _recv_exact(client, 1) == b"\x01"
+
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        tls_context.check_hostname = False
+        tls_context.verify_mode = ssl.CERT_NONE
+        tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        client = tls_context.wrap_socket(client, server_hostname="localhost")
+        client.settimeout(3.0)
+
+        # SecurityResult is sent inside the encrypted channel.
+        assert _recv_exact(client, 4) == b"\x00\x00\x00\x00"
+        client.sendall(b"\x01")
+        width, height = struct.unpack(">HH", _recv_exact(client, 4))
+        assert (width, height) == (2, 2)
+        _recv_exact(client, 16)
+        name_length = struct.unpack(">I", _recv_exact(client, 4))[0]
+        assert b"PyVNCServer" in _recv_exact(client, name_length)
+
+        client.sendall(struct.pack(">BBHHHH", 3, 0, 0, 0, 2, 2))
+        message_type, rectangle_count = struct.unpack(">BxH", _recv_exact(client, 4))
+        assert message_type == 0
+        assert rectangle_count >= 1
+        x, y, rw, rh, encoding = struct.unpack(">HHHHi", _recv_exact(client, 12))
+        assert (x, y, rw, rh, encoding) == (0, 0, 2, 2, 0)
+        assert len(_recv_exact(client, rw * rh * 4)) == 16
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+        server.shutdown_handler.shutdown()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()

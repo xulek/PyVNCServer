@@ -8,11 +8,11 @@ RFB 3.8 · UltraVNC interoperability · Tight / ZRLE / Hextile / Zlib · WebSock
 
 <p>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-3.4.0-6f42c1">
+  <img alt="Version" src="https://img.shields.io/badge/version-3.5.0-6f42c1">
   <img alt="RFB" src="https://img.shields.io/badge/RFB-3.8-1f6feb">
   <img alt="UltraVNC" src="https://img.shields.io/badge/UltraVNC-tested-2ea44f">
   <img alt="WebSocket" src="https://img.shields.io/badge/WebSocket-noVNC-ff9800">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-350%20passed-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-370%20passed-2ea44f">
   <a href="https://xulek.github.io/PyVNCServer/"><img alt="Documentation" src="https://img.shields.io/badge/docs-GitHub%20Pages-0ea5e9?logo=materialformkdocs&logoColor=white"></a>
 </p>
 
@@ -43,7 +43,8 @@ Highlights:
 - Keyboard, pointer and clipboard handling.
 - Read-only authentication mode.
 - Per-IP connection and authentication throttling.
-- Optional TLS transport.
+- **VeNCrypt 0.2** with X509None/X509Vnc and optional TLSNone/TLSVnc compatibility modes.
+- Optional legacy direct TLS transport.
 - Metrics, health checks and session instrumentation.
 - Test suite covering protocol, encoders, WebSocket handling, security, capture and end-to-end RFB communication.
 
@@ -59,7 +60,8 @@ For the complete guides, configuration reference, architecture and troubleshooti
 | **Standard RFB 3.8 clients** | ✅ Supported | Client must advertise at least one encoding implemented by the server |
 | **noVNC / browser clients** | ✅ Supported transport | noVNC is tracked as `web/noVNC`; enable WebSocket and configure an Origin allowlist |
 | **Raw TCP VNC** | ✅ Supported | Default transport |
-| **TLS-wrapped VNC** | ✅ Optional | Requires certificate and private key configuration |
+| **VeNCrypt 0.2** | ✅ Protocol + real TLS tested | Security type `19`; X509None/X509Vnc recommended |
+| **Legacy TLS-wrapped VNC** | ✅ Optional | Pre-RFB TLS wrapper retained for compatibility |
 
 > [!NOTE]
 > `Tight` encoding and `Tight security/capability negotiation` are different concepts. Tight capability negotiation does **not** provide transport encryption by itself.
@@ -315,16 +317,52 @@ Classic VNC authentication:
 - effectively uses only the first **8 password bytes**,
 - authenticates the client but does **not encrypt framebuffer, keyboard or pointer traffic**.
 
-For untrusted networks, use TLS, SSH tunnelling or a VPN.
+For untrusted networks, prefer **VeNCrypt X509Vnc**, SSH tunnelling or a VPN.
 
-### TLS
+### VeNCrypt 0.2 (recommended)
+
+VeNCrypt is negotiated as normal RFB security type `19`; TLS begins only after the client selects a VeNCrypt subtype.
+
+Recommended password-authenticated configuration:
+
+```toml
+[security]
+password = "secret"
+
+vencrypt_enabled = true
+vencrypt_subtypes = ["x509-vnc"]
+tls_cert_file = "server.crt"
+tls_key_file = "server.key"
+tls_minimum_version = "1.2"
+require_encrypted_transport = true
+```
+
+Supported v3.5 subtypes:
+
+| VeNCrypt subtype | ID | User authentication | Server identity |
+| --- | ---: | --- | --- |
+| X509None | `260` | none | X.509 certificate |
+| X509Vnc | `261` | classic VNC auth inside TLS | X.509 certificate |
+| TLSNone | `257` | none | anonymous TLS |
+| TLSVnc | `258` | classic VNC auth inside TLS | anonymous TLS |
+
+`TLSNone` / `TLSVnc` are legacy anonymous-TLS compatibility modes and are disabled unless `vencrypt_allow_anonymous_tls = true`.
+
+If a VNC password exists, PyVNCServer will not offer a `*None` subtype unless `vencrypt_allow_no_auth_with_password = true` is explicitly set. This prevents accidentally turning encryption into an authentication bypass.
+
+### Legacy direct TLS
+
+The old pre-RFB TLS wrapper remains available:
 
 ```toml
 [security]
 tls_enabled = true
 tls_cert_file = "server.crt"
 tls_key_file = "server.key"
+tls_minimum_version = "1.2"
 ```
+
+`tls_enabled` and `vencrypt_enabled` are intentionally mutually exclusive.
 
 ### Authentication throttling
 
@@ -487,10 +525,10 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-Current 3.4.0 verification result:
+Current 3.5.0 verification result:
 
 ```text
-350 passed, 13 skipped
+370 passed, 13 skipped
 ```
 
 The skipped cases in the recorded verification environment are legacy/auth compatibility cases and do not affect Tight/RRE tests.
@@ -528,7 +566,7 @@ python -m pytest -q
 python -m compileall -q src tests
 ```
 
-The v3.4 package includes end-to-end TCP tests for ContinuousUpdates/Fence and ExtendedDesktopSize in addition to the existing encoding and DXGI regressions.
+The v3.5 package additionally includes real TLS socket tests for VeNCrypt X509/TLS subtypes and an end-to-end `VNCServerV3 → VeNCrypt → TLS → SecurityResult → ServerInit → framebuffer` test.
 
 ---
 
@@ -594,14 +632,15 @@ python -m twine check dist/*
 - Fence `SyncNext` is parsed but not implemented as a deferred barrier.
 - LastRect is implemented but disabled by default for conservative compatibility.
 - H.264 is an optional extension path and requires compatible client-side support.
-- Classic VNC authentication is legacy authentication, not encrypted transport.
+- Classic VNC authentication remains an 8-byte legacy password mechanism; use it inside VeNCrypt X509Vnc when possible.
 - Browser use requires a separately served noVNC frontend/static HTTP endpoint.
+- VeNCrypt is negotiated on raw RFB/TCP. Browser WebSocket deployments should use WSS/direct TLS or a TLS-terminating reverse proxy.
 - `vnc_lib` remains as a compatibility layer and can be progressively folded into the `pyvncserver` package structure.
 
 ---
 
 <div align="center">
 
-**PyVNCServer 3.4.0** · Python 3.11+ · RFB 3.8 · [Documentation](https://xulek.github.io/PyVNCServer/)
+**PyVNCServer 3.5.0** · Python 3.11+ · RFB 3.8 · [Documentation](https://xulek.github.io/PyVNCServer/)
 
 </div>
